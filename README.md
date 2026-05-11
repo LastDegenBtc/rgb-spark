@@ -71,14 +71,14 @@ forwards bytes but never holds funds. Unilateral exit to L1 needs
 nothing the user doesn't already have.
 
 This is the opposite end of the trust-spectrum from the **custodial
-PPwallet** at [`spark-spike`](https://github.com/lastDegen/spark-spike)
+PPwallet** at [`ppwallet`](https://github.com/LastDegenBtc/ppwallet)
 (`wallet.pprgb.app`), which keeps RGB allocations server-side for
 interop with the industry RGB ecosystem (Bitmask, rgb-lib). The two
 products are intentionally parallel and serve different users.
 
 ## Origin
 
-Phase 0 / 1A / 1B engineering was authored in `spark-spike` and
+Phase 0 / 1A / 1B engineering was authored in `ppwallet` and
 extracted here at SHA `ee3b0fa` on 2026-05-11, once it became clear
 the self-custody product needed its own repo, its own roadmap, and
 brand-neutral naming (no `pp` prefix) for the RGB-WG conversation.

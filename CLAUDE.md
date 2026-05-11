@@ -5,7 +5,7 @@ Guidance for Claude Code working in this repo.
 ## What this repo is
 
 `rgb-spark` is the brand-neutral, self-custody **RGB-on-Spark**
-reference wallet. It's the sibling of `spark-spike` (custodial
+reference wallet. It's the sibling of `ppwallet` (custodial
 PPwallet at `wallet.pprgb.app`); the two are intentionally distinct
 products with opposite trust models, not stages of one migration.
 
@@ -36,7 +36,7 @@ npm run lint
 
 **`npm run build` is guarded** — refuses to run unless `CONFIRM_PROD_BUILD=1`
 is set. The guard is installed before there's even a prod wired up
-because the same mistake that hit `spark-spike` on 2026-05-11 will
+because the same mistake that hit `ppwallet` on 2026-05-11 will
 happen again the day this repo *does* have a prod. See
 `feedback_prod_build_guard.md` in the agent memory.
 
@@ -66,7 +66,7 @@ cargo build --target wasm32-unknown-unknown # WASM compile-only sanity
 ## Repo discipline
 
 - Don't propose carriers, leaf-tweaks, or custodial fallbacks — those
-  are the `spark-spike` product, not this one.
+  are the `ppwallet` product, not this one.
 - Don't pull `bitmask-core` or any other RGB-on-L1 transport into the
   browser. Spark replaces the transport layer; that's the whole point.
 - Don't add the `pp` brand to anything; this repo is positioned as
@@ -78,6 +78,6 @@ cargo build --target wasm32-unknown-unknown # WASM compile-only sanity
 
 ## Origin
 
-Phase 0–1B engineering was authored in `spark-spike` (`wallet.pprgb.app`,
-custodial) and extracted to this repo at `spark-spike@ee3b0fa` on
+Phase 0–1B engineering was authored in `ppwallet` (`wallet.pprgb.app`,
+custodial) and extracted to this repo at `ppwallet@ee3b0fa` on
 2026-05-11.
