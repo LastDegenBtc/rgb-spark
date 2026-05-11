@@ -5,7 +5,9 @@ import {
   initSparkWallet,
   getBalance,
   disposeSparkWallet,
+  listSparkLeaves,
   type WalletInitResult,
+  type SparkLeafRow,
 } from './lib/sparkWallet'
 import { ensureSparkCoreReady, type SparkCore } from './lib/sparkCore'
 import {
@@ -26,21 +28,47 @@ type BootState =
   | { kind: 'ready'; parsed: ParsedLogin; wallet: WalletInitResult; balanceSats: bigint | 'pending' | 'error' }
   | { kind: 'error'; message: string }
 
-// Operator pubkey is still a placeholder pinned to vector v1. The real
-// Spark SE operator (aggregated FROST key) is fetched from a Spark transfer
-// event — that's step 9c. For now, only u_base reflects real identity.
+// "Demo" operator pubkey — pinned to scoping vector v1. Used only by the
+// legacy demo mode (v2 envelope, identityPubkey as u_base). Real Spark
+// transfers surface the aggregated FROST operator via TreeNode (step 9c).
 const DEMO_OPERATOR = '02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27'
 
 const COMPRESSED_PUBKEY_HEX_RE = /^0[23][0-9a-f]{64}$/i
 
-interface ConsignmentEnvelope {
-  v: 2
-  sender: string                    // sender's npub (informational; relay doesn't verify)
-  senderIdentityPubkey?: string     // claimed Spark identityPubkey (33-byte compressed hex)
-  createdAt: string
-  kind: 'spark-utk-proof'
-  proofHex: string                  // SparkUtkProofJs.encode()
+// 32-byte all-zeros message — the Spark-UTK relation for a vanilla leaf (no
+// RGB commitment injected at creation) collapses to msg=0. The stock SDK
+// can't yet inject a non-zero msg; chunk-α-bis covers that fork.
+const ZERO_MSG_HEX = '0'.repeat(64)
+
+interface LeafReference {
+  id: string
+  treeId: string
+  value: number
+  network: string
+  // Per-leaf 33-byte compressed verifying key. Receiver re-derives this from
+  // (proof.uBase, ZERO_MSG, proof.operator) and compares — match means the
+  // proof is mathematically bound to a real leaf the SE knows about.
+  verifyingPublicKey: string
 }
+
+type ConsignmentEnvelope =
+  | {
+      v: 2
+      sender: string
+      senderIdentityPubkey?: string
+      createdAt: string
+      kind: 'spark-utk-proof'
+      proofHex: string
+    }
+  | {
+      v: 3
+      sender: string
+      senderIdentityPubkey?: string
+      createdAt: string
+      kind: 'spark-utk-proof'
+      proofHex: string
+      leafReference: LeafReference
+    }
 
 function App() {
   const [secret, setSecret] = useState('')
@@ -174,13 +202,22 @@ interface SentRecord {
   envelope: ConsignmentEnvelope
 }
 
+type LeafVerification =
+  | { kind: 'none' }                                       // v2 envelope, no leaf to verify against
+  | { kind: 'ok'; derivedVerifyingKey: string }            // match
+  | { kind: 'mismatch'; expected: string; got: string }    // derived ≠ leaf.verifyingPublicKey
+  | { kind: 'error'; message: string }                     // derive call threw
+
 interface DecodedConsignment {
   raw: string                  // hex of the raw bytes received
   envelope?: ConsignmentEnvelope
   proofUBase?: string
   proofOperator?: string
+  leafVerification?: LeafVerification
   parseError?: string
 }
+
+type LabMode = 'demo' | 'leaf'
 
 function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdentityPubkey: string }) {
   const [core, setCore] = useState<SparkCore | null>(null)
@@ -196,6 +233,34 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
   const [inbox, setInbox] = useState<ConsignmentMeta[]>([])
   const [inboxErr, setInboxErr] = useState<string | null>(null)
   const [decoded, setDecoded] = useState<Record<string, DecodedConsignment>>({})
+
+  // ----- leaves (chunk-α: real-Spark-leaf-backed proofs) -----
+  const [mode, setMode] = useState<LabMode>('demo')
+  const [leaves, setLeaves] = useState<SparkLeafRow[]>([])
+  const [leavesErr, setLeavesErr] = useState<string | null>(null)
+  const [leavesLoading, setLeavesLoading] = useState(false)
+  const [selectedLeafId, setSelectedLeafId] = useState<string>('')
+
+  const refreshLeaves = useCallback(async () => {
+    setLeavesLoading(true)
+    setLeavesErr(null)
+    try {
+      const list = await listSparkLeaves()
+      setLeaves(list)
+      // Clear selection if it now points at a leaf that's gone.
+      setSelectedLeafId((prev) => (prev && list.some((l) => l.id === prev) ? prev : (list[0]?.id ?? '')))
+    } catch (e) {
+      setLeavesErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLeavesLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void refreshLeaves()
+  }, [refreshLeaves])
+
+  const selectedLeaf = leaves.find((l) => l.id === selectedLeafId) ?? null
 
   useEffect(() => {
     ensureSparkCoreReady()
@@ -229,27 +294,59 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
     try {
       const t = target.trim()
       if (!t) throw new Error('target npub is empty')
-      // 9a: u_base = the sender's Spark identityPubkey. Operator is still
-      // a placeholder pending 9c (real Spark transfer → real leaf data).
-      const uBase = myIdentityPubkey.toLowerCase()
-      if (!COMPRESSED_PUBKEY_HEX_RE.test(uBase)) {
-        throw new Error(
-          `wallet.identityPubkey is not a 33-byte compressed pubkey ` +
-          `(got ${uBase.length / 2} bytes, starts with ${uBase.slice(0, 2)}). ` +
-          `SparkUtkProofJs needs 02/03-prefixed 66-hex.`,
-        )
+
+      let envelope: ConsignmentEnvelope
+      if (mode === 'leaf') {
+        if (!selectedLeaf) throw new Error('no leaf selected — fund the wallet or switch to demo mode')
+        const uBase = selectedLeaf.ownerSigningPublicKey.toLowerCase()
+        const operator = selectedLeaf.operatorPublicKey.toLowerCase()
+        if (!COMPRESSED_PUBKEY_HEX_RE.test(uBase)) {
+          throw new Error(`leaf.ownerSigningPublicKey is not a 33-byte compressed pubkey: ${uBase}`)
+        }
+        if (!COMPRESSED_PUBKEY_HEX_RE.test(operator)) {
+          throw new Error(`leaf.operatorPublicKey is not a 33-byte compressed pubkey: ${operator}`)
+        }
+        const proof = new core.SparkUtkProofJs(uBase, operator)
+        const proofHex = proof.encode()
+        proof.free()
+        envelope = {
+          v: 3,
+          sender: myNpub,
+          senderIdentityPubkey: myIdentityPubkey.toLowerCase(),
+          createdAt: new Date().toISOString(),
+          kind: 'spark-utk-proof',
+          proofHex,
+          leafReference: {
+            id: selectedLeaf.id,
+            treeId: selectedLeaf.treeId,
+            value: selectedLeaf.value,
+            network: selectedLeaf.network,
+            verifyingPublicKey: selectedLeaf.verifyingPublicKey.toLowerCase(),
+          },
+        }
+      } else {
+        // demo mode: u_base = identityPubkey (wallet-wide), operator = pinned vector v1
+        const uBase = myIdentityPubkey.toLowerCase()
+        if (!COMPRESSED_PUBKEY_HEX_RE.test(uBase)) {
+          throw new Error(
+            `wallet.identityPubkey is not a 33-byte compressed pubkey ` +
+            `(got ${uBase.length / 2} bytes, starts with ${uBase.slice(0, 2)}). ` +
+            `SparkUtkProofJs needs 02/03-prefixed 66-hex.`,
+          )
+        }
+        const proof = new core.SparkUtkProofJs(uBase, DEMO_OPERATOR)
+        const proofHex = proof.encode()
+        proof.free()
+        envelope = {
+          v: 2,
+          sender: myNpub,
+          senderIdentityPubkey: uBase,
+          createdAt: new Date().toISOString(),
+          kind: 'spark-utk-proof',
+          proofHex,
+        }
       }
-      const proof = new core.SparkUtkProofJs(uBase, DEMO_OPERATOR)
-      const proofHex = proof.encode()
-      proof.free()
-      const envelope: ConsignmentEnvelope = {
-        v: 2,
-        sender: myNpub,
-        senderIdentityPubkey: uBase,
-        createdAt: new Date().toISOString(),
-        kind: 'spark-utk-proof',
-        proofHex,
-      }
+
       const bytes = new TextEncoder().encode(JSON.stringify(envelope))
       const meta = await postConsignment(t, bytes)
       setSentLog((log) => [{ to: t, meta, envelope }, ...log].slice(0, 10))
@@ -272,13 +369,28 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
         const text = new TextDecoder().decode(bytes)
         const env = JSON.parse(text) as ConsignmentEnvelope
         const proof = core.SparkUtkProofJs.decode(env.proofHex)
+        const proofUBase = proof.uBase
+        const proofOperator = proof.operator
+        proof.free()
+        let leafVerification: LeafVerification = { kind: 'none' }
+        if (env.v === 3 && env.leafReference) {
+          try {
+            const derived = core.deriveVerifyingKey(proofUBase, ZERO_MSG_HEX, proofOperator).toLowerCase()
+            const claimed = env.leafReference.verifyingPublicKey.toLowerCase()
+            leafVerification = derived === claimed
+              ? { kind: 'ok', derivedVerifyingKey: derived }
+              : { kind: 'mismatch', expected: claimed, got: derived }
+          } catch (e) {
+            leafVerification = { kind: 'error', message: e instanceof Error ? e.message : String(e) }
+          }
+        }
         entry = {
           raw: rawHex,
           envelope: env,
-          proofUBase: proof.uBase,
-          proofOperator: proof.operator,
+          proofUBase,
+          proofOperator,
+          leafVerification,
         }
-        proof.free()
       } catch (e) {
         entry.parseError = e instanceof Error ? e.message : String(e)
       }
@@ -306,19 +418,29 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
     <div style={{ marginTop: 28, borderTop: '2px solid #333', paddingTop: 16 }}>
       <h2 style={{ margin: '0 0 6px 0' }}>Consignment Lab</h2>
       <p style={{ color: '#666', fontSize: 13, marginTop: 0 }}>
-        Two-tab demo: build a <code>SparkUtkProofJs</code> where{' '}
-        <code>u_base</code> = your Spark <code>identityPubkey</code>, wrap it
-        in a JSON envelope (npub + claimed identityPubkey + timestamp), POST
-        to relay, retrieve in another tab, <code>decode()</code>, check that
-        the proof is bound to the claimed identity.
+        Build a proof → POST → poll inbox → decode → verify. Pick a{' '}
+        <strong>mode</strong>, paste a <strong>target npub</strong>, hit{' '}
+        <strong>send</strong>.
       </p>
-      <p style={{ color: '#999', fontSize: 11, marginTop: -4 }}>
-        Caveat: the envelope is <em>not signed</em>. Anyone can claim any
-        identityPubkey. Real binding requires the sender to sign with their
-        nsec (step 9d). For now, treat the badge as "self-consistent" not
-        "cryptographically proven". Operator stays pinned to vector v1 — real
-        operator key comes from a Spark transfer event (step 9c).
-      </p>
+      <details style={{ marginTop: -2, marginBottom: 6 }}>
+        <summary style={{ fontSize: 12, color: '#888', cursor: 'pointer' }}>
+          what the two modes mean
+        </summary>
+        <ul style={{ color: '#666', fontSize: 12, marginTop: 4 }}>
+          <li>
+            <strong>demo</strong> (v2): <code>u_base</code> = wallet
+            <code> identityPubkey</code>, operator = scoping vector v1.
+            Self-consistent identity binding only. Works without funding.
+          </li>
+          <li>
+            <strong>real leaf</strong> (v3): <code>u_base</code> = leaf's
+            <code> ownerSigningPublicKey</code>, operator = leaf's aggregated
+            FROST key. Receiver re-derives <code>verifyingKey</code> from
+            <code> (uBase, msg=0, operator)</code> and matches against the
+            leaf's claimed key — math-airtight binding.
+          </li>
+        </ul>
+      </details>
 
       <div style={{ fontSize: 12, color: '#888' }}>
         relay health:{' '}
@@ -333,6 +455,74 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
           ? <span style={{ color: 'crimson' }}>{coreErr}</span>
           : core ? 'ready' : 'loading…'}
       </div>
+
+      <fieldset style={{ marginTop: 12, border: '1px solid #ddd', padding: '8px 12px' }}>
+        <legend style={{ fontSize: 12, color: '#666' }}>mode</legend>
+        <label style={{ marginRight: 16, fontSize: 13 }}>
+          <input
+            type="radio"
+            name="lab-mode"
+            value="demo"
+            checked={mode === 'demo'}
+            onChange={() => setMode('demo')}
+          />{' '}
+          demo · identityPubkey + vector-v1 operator
+        </label>
+        <label style={{ fontSize: 13 }}>
+          <input
+            type="radio"
+            name="lab-mode"
+            value="leaf"
+            checked={mode === 'leaf'}
+            onChange={() => setMode('leaf')}
+            disabled={leaves.length === 0}
+          />{' '}
+          real Spark leaf · per-leaf u_base + FROST operator
+        </label>
+
+        {mode === 'leaf' && (
+          <div style={{ marginTop: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <select
+                value={selectedLeafId}
+                onChange={(e) => setSelectedLeafId(e.target.value)}
+                style={{ flex: 1, fontFamily: 'monospace', fontSize: 12, padding: 4 }}
+                disabled={leaves.length === 0}
+              >
+                {leaves.length === 0 && <option value="">— no leaves —</option>}
+                {leaves.map((l) => (
+                  <option key={l.id} value={l.id}>
+                    {l.id.slice(0, 8)}… · {l.value} sats · {l.network} · status={l.status}
+                  </option>
+                ))}
+              </select>
+              <button onClick={() => void refreshLeaves()} disabled={leavesLoading} style={{ fontSize: 11 }}>
+                {leavesLoading ? '…' : 'refresh'}
+              </button>
+            </div>
+            {selectedLeaf && (
+              <details style={{ marginTop: 6 }}>
+                <summary style={{ fontSize: 11, color: '#666', cursor: 'pointer' }}>
+                  leaf hex details
+                </summary>
+                <div style={{ marginTop: 4, fontFamily: 'monospace', fontSize: 11, color: '#555', wordBreak: 'break-all' }}>
+                  <div>treeId: {selectedLeaf.treeId}</div>
+                  <div>ownerSigningPublicKey (u_base): {selectedLeaf.ownerSigningPublicKey}</div>
+                  <div>operatorPublicKey (FROST): {selectedLeaf.operatorPublicKey}</div>
+                  <div>verifyingPublicKey (target): {selectedLeaf.verifyingPublicKey}</div>
+                </div>
+              </details>
+            )}
+            {leavesErr && <div style={{ color: 'crimson', fontSize: 12, marginTop: 4 }}>{leavesErr}</div>}
+            {!leavesErr && leaves.length === 0 && !leavesLoading && (
+              <div style={{ color: '#888', fontSize: 12, marginTop: 4 }}>
+                no leaves found — fund the wallet (L1 deposit → claimDeposit, or receive a Spark transfer)
+                or stay in demo mode.
+              </div>
+            )}
+          </div>
+        )}
+      </fieldset>
 
       <fieldset style={{ marginTop: 12, border: '1px solid #ddd', padding: '8px 12px' }}>
         <legend style={{ fontSize: 12, color: '#666' }}>compose</legend>
@@ -352,14 +542,21 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
           </button>
         </div>
         <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center' }}>
-          <button onClick={() => void buildAndSend()} disabled={!core || sending || !target.trim()}>
-            {sending ? 'sending…' : 'Build SparkUtkProofJs and send →'}
+          <button
+            onClick={() => void buildAndSend()}
+            disabled={!core || sending || !target.trim() || (mode === 'leaf' && !selectedLeaf)}
+          >
+            {sending
+              ? 'sending…'
+              : mode === 'leaf'
+                ? 'Build proof from leaf and send →'
+                : 'Build demo proof and send →'}
           </button>
           {sendErr && <span style={{ color: 'crimson', fontSize: 12 }}>{sendErr}</span>}
         </div>
 
         {sentLog.length > 0 && (
-          <details style={{ marginTop: 10 }} open>
+          <details style={{ marginTop: 10 }}>
             <summary style={{ fontSize: 12, color: '#666', cursor: 'pointer' }}>
               sent log ({sentLog.length})
             </summary>
@@ -403,39 +600,115 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
           </div>
         ))}
       </fieldset>
+
+      <details style={{ marginTop: 10 }}>
+        <summary style={{ fontSize: 12, color: '#a06010', cursor: 'pointer' }}>
+          caveats · what this demo doesn't yet prove
+        </summary>
+        <ul style={{ margin: '6px 0 0 0', paddingLeft: 18, fontSize: 12, color: '#665030' }}>
+          <li>
+            <strong>msg = 0</strong>: real Spark-UTK requires injecting a non-zero
+            <code> msg </code>(= RGB Merkle commitment) at leaf creation, which
+            the stock SDK doesn't expose. The leaf-binding check here proves the
+            proof refers to a real Spark leaf, not yet that it carries RGB
+            state. SDK fork = chunk-α-bis.
+          </li>
+          <li>
+            <strong>envelope unsigned</strong>: anyone can claim any
+            <code> senderIdentityPubkey</code>. Real sender binding needs the
+            envelope signed with the nsec (step 9d).
+          </li>
+          <li>
+            <strong>no RGB validator yet</strong>: rgb-consensus state-transition
+            verification (issuance, transfer ops) is chunks β/γ.
+          </li>
+        </ul>
+      </details>
     </div>
   )
 }
 
 function DecodedView({ entry }: { entry: DecodedConsignment }) {
-  const claimed = entry.envelope?.senderIdentityPubkey?.toLowerCase()
+  const env = entry.envelope
+  const claimed = env?.senderIdentityPubkey?.toLowerCase()
   const got = entry.proofUBase?.toLowerCase()
   let bindingBadge: ReactNode = null
-  if (entry.envelope && got) {
+  if (env && got) {
     if (!claimed) {
       bindingBadge = <span style={{ color: '#888' }}>envelope has no senderIdentityPubkey (legacy v1)</span>
     } else if (claimed === got) {
       bindingBadge = <span style={{ color: 'seagreen' }}>OK · proof.u_base matches claimed Spark identity</span>
+    } else if (env.v === 3) {
+      // v3 binds u_base to the *leaf*, not the wallet identity — so a difference
+      // is expected. Don't mark it as MISMATCH; defer the trust badge to leaf
+      // verification below.
+      bindingBadge = <span style={{ color: '#888' }}>n/a · v3 binds u_base to the leaf, not the wallet identity</span>
     } else {
       bindingBadge = <span style={{ color: '#c80' }}>MISMATCH · proof.u_base ≠ envelope.senderIdentityPubkey</span>
     }
   }
+
+  const lv = entry.leafVerification
+  let leafBadge: ReactNode = null
+  if (env?.v === 3 && lv) {
+    if (lv.kind === 'ok') {
+      leafBadge = (
+        <span style={{ color: 'seagreen' }}>
+          OK · derived verifyingKey matches claimed Spark leaf (msg=0)
+        </span>
+      )
+    } else if (lv.kind === 'mismatch') {
+      leafBadge = (
+        <span style={{ color: '#c00' }}>
+          MISMATCH · derived ≠ claimed leaf.verifyingPublicKey
+        </span>
+      )
+    } else if (lv.kind === 'error') {
+      leafBadge = <span style={{ color: 'crimson' }}>derive error · {lv.message}</span>
+    }
+  }
+
   return (
     <div style={{ marginTop: 6, paddingLeft: 12, borderLeft: '3px solid #6c6', fontSize: 12, fontFamily: 'monospace' }}>
       {entry.parseError && <div style={{ color: 'crimson' }}>parse error: {entry.parseError}</div>}
-      {entry.envelope && (
+      {env && (
         <>
-          <div><span style={{ color: '#666' }}>sender (npub):</span> {entry.envelope.sender}</div>
-          {entry.envelope.senderIdentityPubkey && (
-            <div><span style={{ color: '#666' }}>senderIdentityPubkey:</span> {entry.envelope.senderIdentityPubkey}</div>
+          <div><span style={{ color: '#666' }}>envelope v:</span> {env.v}</div>
+          <div><span style={{ color: '#666' }}>sender (npub):</span> {env.sender}</div>
+          {env.senderIdentityPubkey && (
+            <div><span style={{ color: '#666' }}>senderIdentityPubkey:</span> {env.senderIdentityPubkey}</div>
           )}
-          <div><span style={{ color: '#666' }}>createdAt:</span> {entry.envelope.createdAt}</div>
-          <div><span style={{ color: '#666' }}>kind:</span> {entry.envelope.kind}</div>
+          <div><span style={{ color: '#666' }}>createdAt:</span> {env.createdAt}</div>
+          <div><span style={{ color: '#666' }}>kind:</span> {env.kind}</div>
           <div><span style={{ color: '#666' }}>proof.uBase:</span> {entry.proofUBase}</div>
           <div><span style={{ color: '#666' }}>proof.operator:</span> {entry.proofOperator}</div>
           <div style={{ marginTop: 4 }}>
             <span style={{ color: '#666' }}>identity binding:</span> {bindingBadge}
           </div>
+          {env.v === 3 && (
+            <>
+              <div style={{ marginTop: 6, color: '#666' }}>leafReference:</div>
+              <div style={{ paddingLeft: 8 }}>
+                <div>id: {env.leafReference.id}</div>
+                <div>treeId: {env.leafReference.treeId}</div>
+                <div>value: {env.leafReference.value} sats</div>
+                <div>network: {env.leafReference.network}</div>
+                <div>verifyingPublicKey: {env.leafReference.verifyingPublicKey}</div>
+                {lv?.kind === 'ok' && (
+                  <div>derivedVerifyingKey: {lv.derivedVerifyingKey}</div>
+                )}
+                {lv?.kind === 'mismatch' && (
+                  <>
+                    <div>derived: {lv.got}</div>
+                    <div>expected (claimed): {lv.expected}</div>
+                  </>
+                )}
+              </div>
+              <div style={{ marginTop: 4 }}>
+                <span style={{ color: '#666' }}>leaf binding:</span> {leafBadge}
+              </div>
+            </>
+          )}
         </>
       )}
       <details style={{ marginTop: 4 }}>

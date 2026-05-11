@@ -128,6 +128,49 @@ export async function transferToSpark(
   }
 }
 
+// ----- Leaves ----------------------------------------------------------------
+
+export interface SparkLeafRow {
+  id: string;
+  treeId: string;
+  value: number;
+  status: string;
+  network: string;
+  // Per-leaf signing pubkey — this is the leaf-scoped `u_base` candidate for
+  // a SparkUtkProof. NOT to be confused with the wallet-wide identityPubkey.
+  ownerSigningPublicKey: string;
+  // Aggregated FROST pubkey held by the SE operators responsible for this leaf.
+  // Goes into the proof's `operator` field.
+  operatorPublicKey: string;
+  // The leaf's own verifying key. For a vanilla (non-RGB) leaf with msg=0 the
+  // Spark-UTK relation collapses to:
+  //   verifyingPublicKey == ownerSigningPublicKey + operatorPublicKey
+  // which is what gives the receiver a math-checkable binding.
+  verifyingPublicKey: string;
+}
+
+function bytesToHex(u: Uint8Array | undefined): string {
+  if (!u || u.length === 0) return '';
+  let out = '';
+  for (let i = 0; i < u.length; i++) out += u[i].toString(16).padStart(2, '0');
+  return out;
+}
+
+export async function listSparkLeaves(): Promise<SparkLeafRow[]> {
+  if (!walletInstance) throw new Error('Wallet not initialized');
+  const leaves = await walletInstance.getLeaves(true);
+  return leaves.map((leaf) => ({
+    id: String(leaf.id),
+    treeId: String(leaf.treeId),
+    value: Number(leaf.value ?? 0),
+    status: String(leaf.status ?? ''),
+    network: String(leaf.network ?? ''),
+    ownerSigningPublicKey: bytesToHex(leaf.ownerSigningPublicKey as Uint8Array),
+    operatorPublicKey: bytesToHex(leaf.signingKeyshare?.publicKey as Uint8Array | undefined),
+    verifyingPublicKey: bytesToHex(leaf.verifyingPublicKey as Uint8Array),
+  }));
+}
+
 // ----- History ---------------------------------------------------------------
 
 export interface SparkTransferRow {
