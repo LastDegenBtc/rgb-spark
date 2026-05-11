@@ -1,10 +1,75 @@
 # 05 · Spark SDK leaf-data surface (step 9c recon)
 
 > **Status**: scoping notes for step 9c — binding `SparkUtkProof` to real
-> Spark leaves. Sources cited inline. Done 2026-05-11 from
+> Spark leaves. Sources cited inline. Initial pass 2026-05-11 from
 > `@buildonspark/spark-sdk@0.7.17` shipped with the frontend.
 
-## TL;DR
+## Correction · 2026-05-11 (after first MAINNET run)
+
+The original TL;DR below claimed that for `msg = 0`, the Spark-UTK relation
+collapses to `verifyingPublicKey == u_base + operator`, and that calling
+`deriveVerifyingKey(u_base, ZERO_MSG, operator)` is the right receiver-side
+check.
+
+**Both claims are wrong.** A first run against a real MAINNET leaf produced
+a mismatch:
+
+```
+leaf.ownerSigningPublicKey   = 023e3c385fa203ea407db3b6d1bb0a9345a2f42241c49df189a7a23f72d9e0ba2b
+leaf.signingKeyshare.pk      = 03c8f05195813ad6f0a8b3c41fa1fb6d0b34880c3e9121c80a2d02a6e2b64d9110
+leaf.verifyingPublicKey      = 0372f480dfdb70fd17884e7365ee5874340012dfadf967f6ca3317fc383026a656
+deriveVerifyingKey(uB, 0, op)= 03c036880803d326804f6e0f797cccbbfea53ff58c8c5c9e9cff2f734c2016bf1c  ← MISMATCH
+```
+
+Reason: `deriveVerifyingKey` applies the SparkUtk tweak unconditionally
+(`t = tagged_hash("Spark-RGB-UTK-v1", U_base ‖ msg)`). Even with `msg = 0`,
+`t` is the non-zero output of a tagged hash, so the SparkUtk-tweaked
+verifying key ≠ the vanilla Spark sum. The "collapse" only happens if the
+tweak is *skipped*, which is not what the Rust primitive does.
+
+### What Spark actually uses
+
+The SDK's own per-leaf check (`spark-wallet-…js:14868`) is:
+
+```js
+verifyKey(pubkey1, pubkey2, verifyingKey) {
+  return equalBytes(addPublicKeys(pubkey1, pubkey2), verifyingKey)
+}
+```
+
+with `addPublicKeys` being plain secp256k1 point addition (no tweak):
+
+```js
+function addPublicKeys(a, b) {
+  return secp256k1.Point.fromHex(a).add(secp256k1.Point.fromHex(b)).toBytes(true)
+}
+```
+
+Confirmed against the MAINNET leaf above:
+`addPublicKeys(ownerSigningPublicKey, signingKeyshare.publicKey)
+== verifyingPublicKey`. So **Spark vanilla leaves use straight point
+addition**, not any tagged-hash tweak.
+
+### Consequence for chunk-α
+
+The receiver-side check is one line, using a public SDK export:
+
+```ts
+import { addPublicKeys } from '@buildonspark/spark-sdk'
+
+const ok = bytesToHex(addPublicKeys(uBaseBytes, operatorBytes))
+        === leaf.verifyingPublicKey
+```
+
+No WASM rebuild, no fork, no SparkUtk primitive involved. Chunk-α proves
+*"the proof refers to a real Spark leaf the SE knows"* — which is a useful
+authenticity check, but it is **not** a Spark-UTK binding demo. The leaf's
+verifying key carries no RGB commitment because the SDK never injected a
+non-zero `msg` at leaf creation. Spark-UTK binding still requires injecting
+`U_tweaked` into the SE's keygen path → chunk-α-bis (SDK fork /
+monkey-patch).
+
+## TL;DR (original — superseded; left for historical context)
 
 Everything we need for an *airtight cryptographic demo* is already exposed
 by the SDK. `TreeNode` (the proto-level leaf object) carries:

@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, type ReactNode } from 'react'
 import { generateSecretKey, nip19 } from 'nostr-tools'
+import { addPublicKeys } from '@buildonspark/spark-sdk'
 import { parseLoginSecret, type ParsedLogin } from './lib/nostrKey'
 import {
   initSparkWallet,
@@ -35,10 +36,16 @@ const DEMO_OPERATOR = '02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285
 
 const COMPRESSED_PUBKEY_HEX_RE = /^0[23][0-9a-f]{64}$/i
 
-// 32-byte all-zeros message — the Spark-UTK relation for a vanilla leaf (no
-// RGB commitment injected at creation) collapses to msg=0. The stock SDK
-// can't yet inject a non-zero msg; chunk-α-bis covers that fork.
-const ZERO_MSG_HEX = '0'.repeat(64)
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2)
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16)
+  return out
+}
+function bytesToHex(u: Uint8Array): string {
+  let out = ''
+  for (let i = 0; i < u.length; i++) out += u[i].toString(16).padStart(2, '0')
+  return out
+}
 
 interface LeafReference {
   id: string
@@ -375,7 +382,13 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
         let leafVerification: LeafVerification = { kind: 'none' }
         if (env.v === 3 && env.leafReference) {
           try {
-            const derived = core.deriveVerifyingKey(proofUBase, ZERO_MSG_HEX, proofOperator).toLowerCase()
+            // Spark vanilla leaf invariant (matches SDK's own SparkWallet.verifyKey):
+            //   verifyingPublicKey === ownerSigningPublicKey + signingKeyshare.publicKey
+            // Pure secp256k1 point addition, no Spark-UTK tweak. The non-trivial
+            // tagged-hash tweak only kicks in once we inject msg ≠ 0 at leaf
+            // creation, which the stock SDK doesn't expose (chunk-α-bis).
+            const derivedBytes = addPublicKeys(hexToBytes(proofUBase), hexToBytes(proofOperator))
+            const derived = bytesToHex(derivedBytes).toLowerCase()
             const claimed = env.leafReference.verifyingPublicKey.toLowerCase()
             leafVerification = derived === claimed
               ? { kind: 'ok', derivedVerifyingKey: derived }
@@ -435,9 +448,12 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
           <li>
             <strong>real leaf</strong> (v3): <code>u_base</code> = leaf's
             <code> ownerSigningPublicKey</code>, operator = leaf's aggregated
-            FROST key. Receiver re-derives <code>verifyingKey</code> from
-            <code> (uBase, msg=0, operator)</code> and matches against the
-            leaf's claimed key — math-airtight binding.
+            FROST key. Receiver checks the Spark vanilla invariant
+            <code> u_base + operator == leaf.verifyingPublicKey</code>{' '}
+            (same primitive the SDK uses in <code>SparkWallet.verifyKey</code>).
+            Proves the proof material lives on a real Spark leaf the SE
+            recognizes. Does <em>not</em> yet prove Spark-UTK binding — that
+            needs msg ≠ 0 at leaf creation (chunk-α-bis).
           </li>
         </ul>
       </details>
@@ -607,16 +623,20 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
         </summary>
         <ul style={{ margin: '6px 0 0 0', paddingLeft: 18, fontSize: 12, color: '#665030' }}>
           <li>
-            <strong>msg = 0</strong>: real Spark-UTK requires injecting a non-zero
-            <code> msg </code>(= RGB Merkle commitment) at leaf creation, which
-            the stock SDK doesn't expose. The leaf-binding check here proves the
-            proof refers to a real Spark leaf, not yet that it carries RGB
-            state. SDK fork = chunk-α-bis.
+            <strong>Spark vanilla, not Spark-UTK</strong>: v3 verifies the
+            relation <code>u_base + operator == leaf.verifyingPublicKey</code>{' '}
+            — that's Spark's own leaf-key invariant (the SDK calls it
+            <code> SparkWallet.verifyKey</code>). It proves the proof refers
+            to a real Spark leaf, but the leaf does <em>not</em> yet carry an
+            RGB commitment. Real Spark-UTK requires the leaf's verifyingKey
+            to encode <code>U_tweaked = u_base + tagged_hash(tag, u_base ‖ msg) · G</code>{' '}
+            with <code>msg</code> = an RGB Merkle commitment. The stock SDK
+            doesn't expose that hook → SDK fork = chunk-α-bis.
           </li>
           <li>
             <strong>envelope unsigned</strong>: anyone can claim any
-            <code> senderIdentityPubkey</code>. Real sender binding needs the
-            envelope signed with the nsec (step 9d).
+            <code> senderIdentityPubkey</code> / leaf reference. Real binding
+            needs the envelope signed with the sender's nsec (step 9d).
           </li>
           <li>
             <strong>no RGB validator yet</strong>: rgb-consensus state-transition
@@ -654,13 +674,13 @@ function DecodedView({ entry }: { entry: DecodedConsignment }) {
     if (lv.kind === 'ok') {
       leafBadge = (
         <span style={{ color: 'seagreen' }}>
-          OK · derived verifyingKey matches claimed Spark leaf (msg=0)
+          OK · u_base + operator == leaf.verifyingPublicKey (Spark vanilla)
         </span>
       )
     } else if (lv.kind === 'mismatch') {
       leafBadge = (
         <span style={{ color: '#c00' }}>
-          MISMATCH · derived ≠ claimed leaf.verifyingPublicKey
+          MISMATCH · u_base + operator ≠ leaf.verifyingPublicKey
         </span>
       )
     } else if (lv.kind === 'error') {
@@ -695,11 +715,11 @@ function DecodedView({ entry }: { entry: DecodedConsignment }) {
                 <div>network: {env.leafReference.network}</div>
                 <div>verifyingPublicKey: {env.leafReference.verifyingPublicKey}</div>
                 {lv?.kind === 'ok' && (
-                  <div>derivedVerifyingKey: {lv.derivedVerifyingKey}</div>
+                  <div>computed (u_base + operator): {lv.derivedVerifyingKey}</div>
                 )}
                 {lv?.kind === 'mismatch' && (
                   <>
-                    <div>derived: {lv.got}</div>
+                    <div>computed (u_base + operator): {lv.got}</div>
                     <div>expected (claimed): {lv.expected}</div>
                   </>
                 )}
