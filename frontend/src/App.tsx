@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { generateSecretKey, nip19 } from 'nostr-tools'
 import { parseLoginSecret, type ParsedLogin } from './lib/nostrKey'
 import {
@@ -7,6 +7,16 @@ import {
   disposeSparkWallet,
   type WalletInitResult,
 } from './lib/sparkWallet'
+import { ensureSparkCoreReady, type SparkCore } from './lib/sparkCore'
+import {
+  postConsignment,
+  listConsignments,
+  fetchConsignment,
+  ackConsignment,
+  checkRelayHealth,
+  type ConsignmentMeta,
+  type RelayHealth,
+} from './lib/consignmentRelay'
 import './App.css'
 
 type Network = 'MAINNET' | 'REGTEST' | 'TESTNET'
@@ -15,6 +25,20 @@ type BootState =
   | { kind: 'loading'; stage: string }
   | { kind: 'ready'; parsed: ParsedLogin; wallet: WalletInitResult; balanceSats: bigint | 'pending' | 'error' }
   | { kind: 'error'; message: string }
+
+// Pinned demo values for the SparkUtkProofJs we ship through the relay.
+// scoping/03-test-vectors.md vector v1 — deterministic so a receiver can
+// eyeball that the round-trip didn't mutate the payload.
+const DEMO_U_BASE   = '034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa'
+const DEMO_OPERATOR = '02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27'
+
+interface ConsignmentEnvelope {
+  v: 1
+  sender: string         // sender's npub (informational; relay doesn't verify)
+  createdAt: string
+  kind: 'spark-utk-proof'
+  proofHex: string       // SparkUtkProofJs.encode()
+}
 
 function App() {
   const [secret, setSecret] = useState('')
@@ -55,10 +79,11 @@ function App() {
   const busy = state.kind === 'loading'
 
   return (
-    <section id="center" style={{ maxWidth: 760, margin: '2rem auto', padding: '0 1rem' }}>
+    <section id="center" style={{ maxWidth: 880, margin: '2rem auto', padding: '0 1rem' }}>
       <h1>rgb-spark · wallet boot</h1>
       <p style={{ color: '#666', marginTop: -8 }}>
-        Phase 1B / step 5 — Nostr seed → Spark wallet. No persistence: reload regenerates.
+        Phase 1B / step 5+6 — Nostr seed → Spark wallet → SparkUtkProofJs round-trip via relay.
+        No persistence: reload regenerates.
       </p>
 
       {state.kind !== 'ready' && (
@@ -114,11 +139,11 @@ function App() {
             <h2 style={{ margin: 0 }}>booted · {state.wallet.network}</h2>
             <button onClick={() => void reset()}>Reset</button>
           </div>
-          <KV label="login kind"        value={state.parsed.kind} />
-          <KV label="npub"              value={state.parsed.npub} mono />
-          <KV label="nsec (backup)"     value={state.parsed.nsec} mono masked />
-          <KV label="identityPubkey"    value={state.wallet.identityPubkey} mono />
-          <KV label="sparkAddress"      value={state.wallet.sparkAddress} mono />
+          <KV label="login kind"          value={state.parsed.kind} />
+          <KV label="npub"                value={state.parsed.npub} mono />
+          <KV label="nsec (backup)"       value={state.parsed.nsec} mono masked />
+          <KV label="identityPubkey"      value={state.wallet.identityPubkey} mono />
+          <KV label="sparkAddress"        value={state.wallet.sparkAddress} mono />
           <KV label="depositAddress (L1)" value={state.wallet.depositAddress} mono />
           <KV
             label="balance (sats)"
@@ -128,11 +153,263 @@ function App() {
               state.balanceSats.toString()
             }
           />
+
+          <ConsignmentLab myNpub={state.parsed.npub} />
         </div>
       )}
     </section>
   )
 }
+
+// ---- Consignment Lab --------------------------------------------------------
+
+interface SentRecord {
+  to: string
+  meta: ConsignmentMeta
+  envelope: ConsignmentEnvelope
+}
+
+interface DecodedConsignment {
+  raw: string                  // hex of the raw bytes received
+  envelope?: ConsignmentEnvelope
+  proofUBase?: string
+  proofOperator?: string
+  parseError?: string
+}
+
+function ConsignmentLab({ myNpub }: { myNpub: string }) {
+  const [core, setCore] = useState<SparkCore | null>(null)
+  const [coreErr, setCoreErr] = useState<string | null>(null)
+  const [health, setHealth] = useState<RelayHealth | null>(null)
+  const [healthErr, setHealthErr] = useState<string | null>(null)
+
+  const [target, setTarget] = useState('')
+  const [sending, setSending] = useState(false)
+  const [sentLog, setSentLog] = useState<SentRecord[]>([])
+  const [sendErr, setSendErr] = useState<string | null>(null)
+
+  const [inbox, setInbox] = useState<ConsignmentMeta[]>([])
+  const [inboxErr, setInboxErr] = useState<string | null>(null)
+  const [decoded, setDecoded] = useState<Record<string, DecodedConsignment>>({})
+
+  useEffect(() => {
+    ensureSparkCoreReady()
+      .then((c) => setCore(c))
+      .catch((e) => setCoreErr(e instanceof Error ? e.message : String(e)))
+    checkRelayHealth()
+      .then((h) => setHealth(h))
+      .catch((e) => setHealthErr(e instanceof Error ? e.message : String(e)))
+  }, [])
+
+  const refreshInbox = useCallback(async () => {
+    try {
+      const list = await listConsignments(myNpub)
+      setInbox(list)
+      setInboxErr(null)
+    } catch (e) {
+      setInboxErr(e instanceof Error ? e.message : String(e))
+    }
+  }, [myNpub])
+
+  useEffect(() => {
+    void refreshInbox()
+    const t = setInterval(() => { void refreshInbox() }, 5000)
+    return () => clearInterval(t)
+  }, [refreshInbox])
+
+  async function buildAndSend() {
+    if (!core) return
+    setSendErr(null)
+    setSending(true)
+    try {
+      const t = target.trim()
+      if (!t) throw new Error('target npub is empty')
+      const proof = new core.SparkUtkProofJs(DEMO_U_BASE, DEMO_OPERATOR)
+      const proofHex = proof.encode()
+      proof.free()
+      const envelope: ConsignmentEnvelope = {
+        v: 1,
+        sender: myNpub,
+        createdAt: new Date().toISOString(),
+        kind: 'spark-utk-proof',
+        proofHex,
+      }
+      const bytes = new TextEncoder().encode(JSON.stringify(envelope))
+      const meta = await postConsignment(t, bytes)
+      setSentLog((log) => [{ to: t, meta, envelope }, ...log].slice(0, 10))
+      // If sender is also recipient (testing in one tab), refresh inbox now.
+      if (t === myNpub) void refreshInbox()
+    } catch (e) {
+      setSendErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSending(false)
+    }
+  }
+
+  async function decodeRow(id: string) {
+    if (!core) return
+    try {
+      const bytes = await fetchConsignment(myNpub, id)
+      const rawHex = Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('')
+      let entry: DecodedConsignment = { raw: rawHex }
+      try {
+        const text = new TextDecoder().decode(bytes)
+        const env = JSON.parse(text) as ConsignmentEnvelope
+        const proof = core.SparkUtkProofJs.decode(env.proofHex)
+        entry = {
+          raw: rawHex,
+          envelope: env,
+          proofUBase: proof.uBase,
+          proofOperator: proof.operator,
+        }
+        proof.free()
+      } catch (e) {
+        entry.parseError = e instanceof Error ? e.message : String(e)
+      }
+      setDecoded((d) => ({ ...d, [id]: entry }))
+    } catch (e) {
+      setDecoded((d) => ({ ...d, [id]: { raw: '', parseError: e instanceof Error ? e.message : String(e) } }))
+    }
+  }
+
+  async function ackRow(id: string) {
+    try {
+      await ackConsignment(myNpub, id)
+      setDecoded((d) => {
+        const next = { ...d }
+        delete next[id]
+        return next
+      })
+      void refreshInbox()
+    } catch (e) {
+      setInboxErr(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  return (
+    <div style={{ marginTop: 28, borderTop: '2px solid #333', paddingTop: 16 }}>
+      <h2 style={{ margin: '0 0 6px 0' }}>Consignment Lab</h2>
+      <p style={{ color: '#666', fontSize: 13, marginTop: 0 }}>
+        Two-tab demo: build a <code>SparkUtkProofJs</code> with pinned vector-v1 keys,
+        wrap it in a JSON envelope (sender npub + timestamp), POST to relay, retrieve in
+        another tab, <code>decode()</code>, compare.
+      </p>
+
+      <div style={{ fontSize: 12, color: '#888' }}>
+        relay health:{' '}
+        {healthErr
+          ? <span style={{ color: 'crimson' }}>{healthErr}</span>
+          : health
+            ? `ok · ${health.npubs} npubs · ${health.pending} pending blobs`
+            : 'checking…'}
+        {' · '}
+        wasm:{' '}
+        {coreErr
+          ? <span style={{ color: 'crimson' }}>{coreErr}</span>
+          : core ? 'ready' : 'loading…'}
+      </div>
+
+      <fieldset style={{ marginTop: 12, border: '1px solid #ddd', padding: '8px 12px' }}>
+        <legend style={{ fontSize: 12, color: '#666' }}>compose</legend>
+        <label style={{ display: 'block', fontSize: 12, color: '#666' }}>
+          target npub (paste from another tab, or your own to self-test)
+        </label>
+        <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+          <input
+            type="text"
+            value={target}
+            onChange={(e) => setTarget(e.target.value)}
+            placeholder="npub1…"
+            style={{ flex: 1, fontFamily: 'monospace', fontSize: 12, padding: 6 }}
+          />
+          <button onClick={() => setTarget(myNpub)} type="button" style={{ fontSize: 11 }}>
+            use mine
+          </button>
+        </div>
+        <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center' }}>
+          <button onClick={() => void buildAndSend()} disabled={!core || sending || !target.trim()}>
+            {sending ? 'sending…' : 'Build SparkUtkProofJs and send →'}
+          </button>
+          {sendErr && <span style={{ color: 'crimson', fontSize: 12 }}>{sendErr}</span>}
+        </div>
+
+        {sentLog.length > 0 && (
+          <details style={{ marginTop: 10 }} open>
+            <summary style={{ fontSize: 12, color: '#666', cursor: 'pointer' }}>
+              sent log ({sentLog.length})
+            </summary>
+            <div style={{ fontFamily: 'monospace', fontSize: 11, marginTop: 6 }}>
+              {sentLog.map((s, i) => (
+                <div key={`${s.meta.id}-${i}`} style={{ padding: '4px 0', borderTop: i === 0 ? 'none' : '1px dashed #eee' }}>
+                  → <strong>{s.to.slice(0, 14)}…</strong>{' '}
+                  id <code>{s.meta.id.slice(0, 8)}</code> · {s.meta.size} B · {s.meta.receivedAt}<br/>
+                  proofHex: <code style={{ wordBreak: 'break-all' }}>{s.envelope.proofHex}</code>
+                </div>
+              ))}
+            </div>
+          </details>
+        )}
+      </fieldset>
+
+      <fieldset style={{ marginTop: 12, border: '1px solid #ddd', padding: '8px 12px' }}>
+        <legend style={{ fontSize: 12, color: '#666' }}>
+          inbox · poll 5s · {myNpub.slice(0, 14)}…
+        </legend>
+        {inboxErr && <pre style={{ color: 'crimson', fontSize: 12 }}>{inboxErr}</pre>}
+        {!inboxErr && inbox.length === 0 && (
+          <p style={{ color: '#888', fontSize: 12, margin: '6px 0' }}>empty</p>
+        )}
+        {inbox.map((m) => (
+          <div key={m.id} style={{ borderTop: '1px solid #eee', padding: '8px 0' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12, fontFamily: 'monospace' }}>
+              <span>
+                id <code>{m.id.slice(0, 8)}</code> · {m.size} B · {m.receivedAt}
+              </span>
+              <span style={{ display: 'flex', gap: 6 }}>
+                <button onClick={() => void decodeRow(m.id)} disabled={!core} style={{ fontSize: 11 }}>
+                  decode
+                </button>
+                <button onClick={() => void ackRow(m.id)} style={{ fontSize: 11 }}>
+                  ack
+                </button>
+              </span>
+            </div>
+            {decoded[m.id] && <DecodedView entry={decoded[m.id]!} />}
+          </div>
+        ))}
+      </fieldset>
+    </div>
+  )
+}
+
+function DecodedView({ entry }: { entry: DecodedConsignment }) {
+  return (
+    <div style={{ marginTop: 6, paddingLeft: 12, borderLeft: '3px solid #6c6', fontSize: 12, fontFamily: 'monospace' }}>
+      {entry.parseError && <div style={{ color: 'crimson' }}>parse error: {entry.parseError}</div>}
+      {entry.envelope && (
+        <>
+          <div><span style={{ color: '#666' }}>sender:</span> {entry.envelope.sender}</div>
+          <div><span style={{ color: '#666' }}>createdAt:</span> {entry.envelope.createdAt}</div>
+          <div><span style={{ color: '#666' }}>kind:</span> {entry.envelope.kind}</div>
+          <div><span style={{ color: '#666' }}>proof.uBase:</span> {entry.proofUBase}</div>
+          <div><span style={{ color: '#666' }}>proof.operator:</span> {entry.proofOperator}</div>
+          <div style={{ marginTop: 4 }}>
+            <span style={{ color: '#666' }}>match v1 vector:</span>{' '}
+            {entry.proofUBase === DEMO_U_BASE && entry.proofOperator === DEMO_OPERATOR
+              ? <span style={{ color: 'seagreen' }}>OK · byte-for-byte</span>
+              : <span style={{ color: '#c80' }}>different (non-default sender keys)</span>}
+          </div>
+        </>
+      )}
+      <details style={{ marginTop: 4 }}>
+        <summary style={{ color: '#666', cursor: 'pointer' }}>raw hex ({entry.raw.length / 2} B)</summary>
+        <div style={{ wordBreak: 'break-all' }}>{entry.raw}</div>
+      </details>
+    </div>
+  )
+}
+
+// ---- Small KV row -----------------------------------------------------------
 
 function KV({ label, value, mono, masked }: { label: string; value: string; mono?: boolean; masked?: boolean }) {
   const [revealed, setRevealed] = useState(false)
