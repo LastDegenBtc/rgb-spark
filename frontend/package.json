@@ -11,6 +11,10 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@buildonspark/spark-sdk": "^0.7.17",
+    "@scure/bip32": "^2.2.0",
+    "@scure/bip39": "^2.2.0",
+    "nostr-tools": "^2.23.3",
     "react": "^19.2.5",
     "react-dom": "^19.2.5"
   },

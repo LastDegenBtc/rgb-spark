@@ -1,0 +1,18 @@
+{
+  "name": "rgb-spark-relay",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Stateless mailbox relay for RGB consignments. Holds nothing of value — per-npub queue of opaque bytes, sender delivers, recipient polls then acks.",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^24.12.2",
+    "tsx": "^4.19.2",
+    "typescript": "~6.0.2"
+  }
+}
