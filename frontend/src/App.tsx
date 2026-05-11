@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, type ReactNode } from 'react'
 import { generateSecretKey, nip19 } from 'nostr-tools'
 import { parseLoginSecret, type ParsedLogin } from './lib/nostrKey'
 import {
@@ -26,18 +26,20 @@ type BootState =
   | { kind: 'ready'; parsed: ParsedLogin; wallet: WalletInitResult; balanceSats: bigint | 'pending' | 'error' }
   | { kind: 'error'; message: string }
 
-// Pinned demo values for the SparkUtkProofJs we ship through the relay.
-// scoping/03-test-vectors.md vector v1 — deterministic so a receiver can
-// eyeball that the round-trip didn't mutate the payload.
-const DEMO_U_BASE   = '034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa'
+// Operator pubkey is still a placeholder pinned to vector v1. The real
+// Spark SE operator (aggregated FROST key) is fetched from a Spark transfer
+// event — that's step 9c. For now, only u_base reflects real identity.
 const DEMO_OPERATOR = '02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27'
 
+const COMPRESSED_PUBKEY_HEX_RE = /^0[23][0-9a-f]{64}$/i
+
 interface ConsignmentEnvelope {
-  v: 1
-  sender: string         // sender's npub (informational; relay doesn't verify)
+  v: 2
+  sender: string                    // sender's npub (informational; relay doesn't verify)
+  senderIdentityPubkey?: string     // claimed Spark identityPubkey (33-byte compressed hex)
   createdAt: string
   kind: 'spark-utk-proof'
-  proofHex: string       // SparkUtkProofJs.encode()
+  proofHex: string                  // SparkUtkProofJs.encode()
 }
 
 function App() {
@@ -154,7 +156,10 @@ function App() {
             }
           />
 
-          <ConsignmentLab myNpub={state.parsed.npub} />
+          <ConsignmentLab
+            myNpub={state.parsed.npub}
+            myIdentityPubkey={state.wallet.identityPubkey}
+          />
         </div>
       )}
     </section>
@@ -177,7 +182,7 @@ interface DecodedConsignment {
   parseError?: string
 }
 
-function ConsignmentLab({ myNpub }: { myNpub: string }) {
+function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdentityPubkey: string }) {
   const [core, setCore] = useState<SparkCore | null>(null)
   const [coreErr, setCoreErr] = useState<string | null>(null)
   const [health, setHealth] = useState<RelayHealth | null>(null)
@@ -224,12 +229,23 @@ function ConsignmentLab({ myNpub }: { myNpub: string }) {
     try {
       const t = target.trim()
       if (!t) throw new Error('target npub is empty')
-      const proof = new core.SparkUtkProofJs(DEMO_U_BASE, DEMO_OPERATOR)
+      // 9a: u_base = the sender's Spark identityPubkey. Operator is still
+      // a placeholder pending 9c (real Spark transfer → real leaf data).
+      const uBase = myIdentityPubkey.toLowerCase()
+      if (!COMPRESSED_PUBKEY_HEX_RE.test(uBase)) {
+        throw new Error(
+          `wallet.identityPubkey is not a 33-byte compressed pubkey ` +
+          `(got ${uBase.length / 2} bytes, starts with ${uBase.slice(0, 2)}). ` +
+          `SparkUtkProofJs needs 02/03-prefixed 66-hex.`,
+        )
+      }
+      const proof = new core.SparkUtkProofJs(uBase, DEMO_OPERATOR)
       const proofHex = proof.encode()
       proof.free()
       const envelope: ConsignmentEnvelope = {
-        v: 1,
+        v: 2,
         sender: myNpub,
+        senderIdentityPubkey: uBase,
         createdAt: new Date().toISOString(),
         kind: 'spark-utk-proof',
         proofHex,
@@ -290,9 +306,18 @@ function ConsignmentLab({ myNpub }: { myNpub: string }) {
     <div style={{ marginTop: 28, borderTop: '2px solid #333', paddingTop: 16 }}>
       <h2 style={{ margin: '0 0 6px 0' }}>Consignment Lab</h2>
       <p style={{ color: '#666', fontSize: 13, marginTop: 0 }}>
-        Two-tab demo: build a <code>SparkUtkProofJs</code> with pinned vector-v1 keys,
-        wrap it in a JSON envelope (sender npub + timestamp), POST to relay, retrieve in
-        another tab, <code>decode()</code>, compare.
+        Two-tab demo: build a <code>SparkUtkProofJs</code> where{' '}
+        <code>u_base</code> = your Spark <code>identityPubkey</code>, wrap it
+        in a JSON envelope (npub + claimed identityPubkey + timestamp), POST
+        to relay, retrieve in another tab, <code>decode()</code>, check that
+        the proof is bound to the claimed identity.
+      </p>
+      <p style={{ color: '#999', fontSize: 11, marginTop: -4 }}>
+        Caveat: the envelope is <em>not signed</em>. Anyone can claim any
+        identityPubkey. Real binding requires the sender to sign with their
+        nsec (step 9d). For now, treat the badge as "self-consistent" not
+        "cryptographically proven". Operator stays pinned to vector v1 — real
+        operator key comes from a Spark transfer event (step 9c).
       </p>
 
       <div style={{ fontSize: 12, color: '#888' }}>
@@ -383,21 +408,33 @@ function ConsignmentLab({ myNpub }: { myNpub: string }) {
 }
 
 function DecodedView({ entry }: { entry: DecodedConsignment }) {
+  const claimed = entry.envelope?.senderIdentityPubkey?.toLowerCase()
+  const got = entry.proofUBase?.toLowerCase()
+  let bindingBadge: ReactNode = null
+  if (entry.envelope && got) {
+    if (!claimed) {
+      bindingBadge = <span style={{ color: '#888' }}>envelope has no senderIdentityPubkey (legacy v1)</span>
+    } else if (claimed === got) {
+      bindingBadge = <span style={{ color: 'seagreen' }}>OK · proof.u_base matches claimed Spark identity</span>
+    } else {
+      bindingBadge = <span style={{ color: '#c80' }}>MISMATCH · proof.u_base ≠ envelope.senderIdentityPubkey</span>
+    }
+  }
   return (
     <div style={{ marginTop: 6, paddingLeft: 12, borderLeft: '3px solid #6c6', fontSize: 12, fontFamily: 'monospace' }}>
       {entry.parseError && <div style={{ color: 'crimson' }}>parse error: {entry.parseError}</div>}
       {entry.envelope && (
         <>
-          <div><span style={{ color: '#666' }}>sender:</span> {entry.envelope.sender}</div>
+          <div><span style={{ color: '#666' }}>sender (npub):</span> {entry.envelope.sender}</div>
+          {entry.envelope.senderIdentityPubkey && (
+            <div><span style={{ color: '#666' }}>senderIdentityPubkey:</span> {entry.envelope.senderIdentityPubkey}</div>
+          )}
           <div><span style={{ color: '#666' }}>createdAt:</span> {entry.envelope.createdAt}</div>
           <div><span style={{ color: '#666' }}>kind:</span> {entry.envelope.kind}</div>
           <div><span style={{ color: '#666' }}>proof.uBase:</span> {entry.proofUBase}</div>
           <div><span style={{ color: '#666' }}>proof.operator:</span> {entry.proofOperator}</div>
           <div style={{ marginTop: 4 }}>
-            <span style={{ color: '#666' }}>match v1 vector:</span>{' '}
-            {entry.proofUBase === DEMO_U_BASE && entry.proofOperator === DEMO_OPERATOR
-              ? <span style={{ color: 'seagreen' }}>OK · byte-for-byte</span>
-              : <span style={{ color: '#c80' }}>different (non-default sender keys)</span>}
+            <span style={{ color: '#666' }}>identity binding:</span> {bindingBadge}
           </div>
         </>
       )}
