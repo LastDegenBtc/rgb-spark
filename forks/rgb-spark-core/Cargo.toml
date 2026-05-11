@@ -1,0 +1,36 @@
+[package]
+name = "rgb-spark-core"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "Browser-side Spark-UTK + RGB consignment primitives, compiled to WASM via wasm-bindgen."
+
+# cdylib for wasm-pack output; rlib so we can `cargo test` native too.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Spark-UTK keytweak primitives + CompressedPk live in our forked bp-core.
+bp-dbc = { version = "0.11.1-alpha.2", default-features = false }
+bp-consensus = { version = "0.11.1-alpha.2", default-features = false }
+commit_verify = { version = "0.11.1-alpha.2", default-features = false }
+strict_encoding = "~2.8.2"
+amplify = "~4.8.0"
+wasm-bindgen = "0.2"
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+
+# secp256k1 pulls rand → rand_core → getrandom 0.2 (different feature
+# name "js"); newer crates land on getrandom 0.3 ("wasm_js"). Both must
+# be wired for wasm32 — the dep graph has them as two distinct crates.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+
+# Same patch graph as wasm-sniff — pin the bp-core family + rgb-consensus
+# to our local forks so the SparkUtk additions are visible everywhere.
+[patch.crates-io]
+bp-consensus = { path = "../bp-core/consensus" }
+bp-dbc = { path = "../bp-core/dbc" }
+bp-seals = { path = "../bp-core/seals" }
+bp-core = { path = "../bp-core" }
+rgb-consensus = { path = "../rgb-consensus" }

@@ -1,0 +1,21 @@
+[package]
+name = "spark-utk-prototype"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+# This is an isolated scoping prototype, NOT part of any workspace.
+# It implements only the seal-closing math, with zero rgb-lib / bp-seals
+# coupling. Its purpose is to:
+#   1. Prove the crypto by emitting deterministic vectors
+#   2. Pin down the exact secp256k1 / sha2 API surface we'll need when we
+#      wire this into the bp-seals fork in Phase 1
+
+[dependencies]
+secp256k1 = { version = "0.29", features = ["std"] }
+sha2 = "0.10"
+hex = "0.4"
+
+[[bin]]
+name = "emit-vectors"
+path = "src/bin/emit-vectors.rs"

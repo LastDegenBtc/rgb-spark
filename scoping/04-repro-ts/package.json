@@ -1,0 +1,14 @@
+{
+  "name": "spark-utk-repro-ts",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "TS cross-language reproduction of the Spark-UTK Rust prototype, to verify byte-for-byte equality of the deterministic test vector.",
+  "scripts": {
+    "start": "node repro.mjs"
+  },
+  "dependencies": {
+    "@noble/secp256k1": "^2.1.0",
+    "@noble/hashes": "^1.5.0"
+  }
+}

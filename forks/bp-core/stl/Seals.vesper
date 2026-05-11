@@ -1,0 +1,27 @@
+{-
+  Description: Bitcoin TxO2 blind seals
+  Author: Dr Maxim Orlovsky <orlovsky@lnp-bp.org>
+  Copyright (C) 2024 LNP/BP Standards Association. All rights reserved.
+  License: Apache-2.0
+-}
+
+Seals vesper lexicon=types+commitments
+
+commitment SecretSeal, hasher SHA256, tagged urn:lnp-bp:seals:secret#2024-02-03
+  serialized BlindSealTxid
+
+commitment SecretSeal, hasher SHA256, tagged urn:lnp-bp:seals:secret#2024-02-03
+  serialized BlindSealTxPtr
+
+rec BlindSealTxid
+  bytes txid, len 32, aka Txid
+  is vout, U32, aka Vout
+  is blinding, U64
+
+rec BlindSealTxPtr
+  union txid, TxPtr
+    is witnessTx, Unit, tag 0
+    bytes txid, len 32, wrapped, aka Txid, tag 1
+  is vout, U32, aka Vout
+  is blinding, U64
+

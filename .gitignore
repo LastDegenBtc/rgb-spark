@@ -1,0 +1,4 @@
+# Build artifacts under any local prototype crate.
+scoping/**/target/
+
+# Per-subdir gitignores in forks/ and frontend/ cover the rest.

@@ -1,0 +1,28 @@
+[package]
+name = "wasm-sniff"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+# Throwaway crate to verify rgb-ops + rgb-schemas WASM-compile under our
+# patched bp-core family. Default features only (no electrum/esplora/fs).
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+rgb-consensus = { version = "0.11.1-rc.6", default-features = false }
+rgb-ops = { version = "0.11.1-rc.6", default-features = false }
+rgb-schemas = { version = "0.11.1-rc.5", default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+# Same patch as rgb-consensus — redirect the bp-core family to our local
+# fork so the SparkUtk variant is visible across the dep graph.
+[patch.crates-io]
+bp-consensus = { path = "../bp-core/consensus" }
+bp-dbc = { path = "../bp-core/dbc" }
+bp-seals = { path = "../bp-core/seals" }
+bp-core = { path = "../bp-core" }
+rgb-consensus = { path = "../rgb-consensus" }
