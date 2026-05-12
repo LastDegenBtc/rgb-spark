@@ -686,12 +686,14 @@ function SparkUtkMintViaTransfer() {
         <input
           value={msgHex}
           onChange={(e) => setMsgHex(e.target.value)}
-          placeholder="random 32-byte commitment"
+          placeholder="random 32-byte commitment, or issue an NIA contract below"
           style={{ flex: 1, fontFamily: 'monospace', fontSize: 12, padding: 6 }}
           disabled={busy}
         />
         <button onClick={randomMsg} disabled={busy}>random</button>
       </div>
+
+      <IssueNiaInline core={core} disabled={busy} onContractId={setMsgHex} />
 
       <div style={{ marginTop: 10 }}>
         <button
@@ -744,6 +746,114 @@ function SparkUtkMintViaTransfer() {
         </div>
       )}
     </section>
+  )
+}
+
+// ---- Issue NIA inline (chunk-β session 2) -----------------------------------
+//
+// Builds a Non-Inflatable Asset genesis via the wasm primitive and pipes
+// the 32-byte contractId back into the parent's msg field, binding the
+// next Spark-UTK mint to a real RGB issuance. The beneficiary txid is a
+// constant placeholder (all-0xab) — we care about the contractId, not the
+// L1 outpoint; in a real flow this would be a deposit/swap outpoint.
+
+const NIA_PLACEHOLDER_TXID = 'ab'.repeat(32) // 32 bytes of 0xab, valid hex
+
+function IssueNiaInline({
+  core,
+  disabled,
+  onContractId,
+}: {
+  core: SparkCore | null
+  disabled: boolean
+  onContractId: (id: string) => void
+}) {
+  const [ticker, setTicker] = useState('TEST')
+  const [name, setName] = useState('Test asset')
+  const [supply, setSupply] = useState('1000000')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [lastId, setLastId] = useState<string | null>(null)
+
+  async function issue() {
+    setErr(null)
+    setBusy(true)
+    try {
+      if (!core) throw new Error('WASM not ready')
+      const supplyTrim = supply.trim()
+      if (!/^\d+$/.test(supplyTrim)) throw new Error('supply must be a non-negative integer')
+      const supplyBig = BigInt(supplyTrim)
+      if (supplyBig <= 0n) throw new Error('supply must be > 0')
+
+      const tickerTrim = ticker.trim()
+      const nameTrim = name.trim()
+      if (!tickerTrim) throw new Error('ticker required')
+      if (!nameTrim) throw new Error('name required')
+
+      const nowSecs = BigInt(Math.floor(Date.now() / 1000))
+      const id = core.issueNiaContract(
+        tickerTrim,
+        nameTrim,
+        supplyBig,
+        NIA_PLACEHOLDER_TXID,
+        0,
+        nowSecs,
+      )
+      setLastId(id)
+      onContractId(id)
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const allDisabled = disabled || busy || !core
+
+  return (
+    <fieldset style={{ marginTop: 12, border: '1px solid #ddd', padding: '6px 10px' }}>
+      <legend style={{ fontSize: 12, color: '#666' }}>or issue an NIA contract & use its contractId as msg</legend>
+      <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginTop: 4 }}>
+        <label style={{ fontSize: 11, color: '#666' }}>ticker</label>
+        <input
+          value={ticker}
+          onChange={(e) => setTicker(e.target.value)}
+          placeholder="TEST"
+          style={{ width: 70, fontSize: 12, padding: 4, fontFamily: 'monospace' }}
+          disabled={allDisabled}
+        />
+        <label style={{ fontSize: 11, color: '#666' }}>name</label>
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Test asset"
+          style={{ flex: 1, minWidth: 100, fontSize: 12, padding: 4 }}
+          disabled={allDisabled}
+        />
+        <label style={{ fontSize: 11, color: '#666' }}>supply</label>
+        <input
+          value={supply}
+          onChange={(e) => setSupply(e.target.value)}
+          placeholder="1000000"
+          inputMode="numeric"
+          style={{ width: 100, fontSize: 12, padding: 4, fontFamily: 'monospace' }}
+          disabled={allDisabled}
+        />
+        <button onClick={() => void issue()} disabled={allDisabled}>
+          {busy ? 'issuing…' : 'issue & use as msg'}
+        </button>
+      </div>
+      {lastId && (
+        <div style={{ marginTop: 6, fontSize: 11, fontFamily: 'monospace', color: '#666', wordBreak: 'break-all' }}>
+          contractId: {lastId}
+        </div>
+      )}
+      {err && (
+        <pre style={{ color: 'crimson', whiteSpace: 'pre-wrap', marginTop: 4, fontSize: 11 }}>
+          {err}
+        </pre>
+      )}
+    </fieldset>
   )
 }
 
