@@ -36,8 +36,10 @@ import {
 import {
   runSellerFlow,
   runBuyerFlow,
+  resumeBuyerFlow,
   lockUnderHash,
   newPreimagePair,
+  queryPendingHtlcs,
   bytesToHex as htlcBytesToHex,
   type SwapState,
 } from './lib/htlcSwap'
@@ -856,26 +858,49 @@ function OrderRow({
         for (let i = 0; i < 32; i++) {
           paymentHashBytes[i] = parseInt(paymentHashHex.substr(i * 2, 2), 16)
         }
-        const allLeaves = await (wallet as unknown as {
-          getLeaves: (b?: boolean) => Promise<Array<{ id: string; value: number }>>
-        }).getLeaves(true)
-        // Pick a single leaf >= priceSats. v0: no aggregation.
-        const sufficient = allLeaves
-          .filter((l) => l.value >= so.order.priceSats)
-          .sort((a, b) => a.value - b.value)[0]
-        if (!sufficient) {
-          throw new Error(`no single leaf >= ${so.order.priceSats} sats (v0: no aggregation)`)
-        }
-        const satsLeaves = [sufficient] as unknown as Parameters<typeof lockUnderHash>[1]['leaves']
         const buyerExpiry = new Date(Date.now() + 30 * 60_000)
-        await runBuyerFlow(wallet, {
-          satsLeaves,
-          counterpartyPubkey: counterpartyPubkeyBytes,
-          paymentHash: paymentHashBytes,
-          expiryTime: buyerExpiry,
-          pollIntervalMs: 3_000,
-          onState: (s) => setSwapLog((p) => [...p, s]),
+
+        // Resumability: if we already locked sats under this paymentHash
+        // (e.g., a previous Run swap that the UI lost between locking and
+        // claiming because of a reload), skip the lock step entirely.
+        // Otherwise leaf-selection would refuse — the leaf sufficient for
+        // priceSats is the one already locked, hence missing from getLeaves.
+        const existingLocks = await queryPendingHtlcs(wallet, {
+          role: 'sender',
+          paymentHashes: [paymentHashBytes],
         })
+        const activeLock = existingLocks.find(
+          (r) => r.status === 'waiting' || r.status === 'shared',
+        )
+
+        if (activeLock) {
+          await resumeBuyerFlow(wallet, {
+            paymentHash: paymentHashBytes,
+            counterpartyPubkey: counterpartyPubkeyBytes,
+            expiryTime: buyerExpiry,
+            pollIntervalMs: 3_000,
+            onState: (s) => setSwapLog((p) => [...p, s]),
+          })
+        } else {
+          const allLeaves = await (wallet as unknown as {
+            getLeaves: (b?: boolean) => Promise<Array<{ id: string; value: number }>>
+          }).getLeaves(true)
+          const sufficient = allLeaves
+            .filter((l) => l.value >= so.order.priceSats)
+            .sort((a, b) => a.value - b.value)[0]
+          if (!sufficient) {
+            throw new Error(`no single leaf >= ${so.order.priceSats} sats (v0: no aggregation)`)
+          }
+          const satsLeaves = [sufficient] as unknown as Parameters<typeof lockUnderHash>[1]['leaves']
+          await runBuyerFlow(wallet, {
+            satsLeaves,
+            counterpartyPubkey: counterpartyPubkeyBytes,
+            paymentHash: paymentHashBytes,
+            expiryTime: buyerExpiry,
+            pollIntervalMs: 3_000,
+            onState: (s) => setSwapLog((p) => [...p, s]),
+          })
+        }
       }
     } catch (e) {
       setSwapLog((p) => [

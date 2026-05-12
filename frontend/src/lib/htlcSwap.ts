@@ -261,34 +261,53 @@ export async function revealAndClaim(
 // ----- Primitive 3: query revealed preimage (receiver-side) ----------------
 
 /**
- * After the counterparty reveals via `revealAndClaim`, the coordinator
- * exposes the preimage to this wallet (as the receiver-side of an active
- * HTLC under the same paymentHash) via `query_preimage`. Returns the
- * preimage bytes if available, or `null` if the preimage has not been
- * revealed yet (or the receiver pubkey doesn't match an active HTLC).
+ * Coordinator-side check: has my counterparty revealed the preimage for
+ * an HTLC under this paymentHash where they are the receiver of MY lock?
+ *
+ * Despite its name, the proto field `receiverIdentityPubkey` designates
+ * the receiver of an HTLC RELATIVE TO THE CALLER — i.e., the counterparty,
+ * not the local wallet. The coordinator authenticates the caller as
+ * sender (via gRPC auth identity), looks up `paymentHash → HTLC where
+ * sender = caller and receiver = receiverIdentityPubkey`, and returns
+ * the preimage if it has been revealed by that receiver.
+ *
+ * Returns null if the preimage hasn't been revealed yet, or if no HTLC
+ * matches the (caller-as-sender, counterparty-as-receiver, paymentHash)
+ * triple.
  *
  * Typical buyer polling loop in an atomic swap:
  *   while (status != claimed) {
- *     const p = await queryRevealedPreimage(wallet, paymentHash);
+ *     const p = await queryRevealedPreimage(wallet, H, sellerPubkey);
  *     if (p) { await revealAndClaim(wallet, p); break; }
  *     await sleep(POLL_INTERVAL);
  *   }
+ *
+ * Empirical cross-wallet smoke test 2026-05-12: passing `self` as
+ * `counterpartyPubkey` (the early reading of the proto field name)
+ * yielded `INVALID_ARGUMENT: authenticated identity X does not match
+ * transfer sender Y` because the coordinator was matching against a
+ * different HTLC than expected. Pass the counterparty's pubkey.
  */
 export async function queryRevealedPreimage(
   wallet: unknown,
   paymentHash: Uint8Array,
+  counterpartyPubkey: Uint8Array,
 ): Promise<Uint8Array | null> {
   if (paymentHash.length !== 32) {
     throw new Error(`paymentHash must be 32 bytes, got ${paymentHash.length}`);
   }
+  if (counterpartyPubkey.length !== 33) {
+    throw new Error(
+      `counterpartyPubkey must be 33-byte compressed pubkey, got ${counterpartyPubkey.length}`,
+    );
+  }
   const w = asInternals(wallet);
-  const identityPubkey = await w.config.signer.getIdentityPublicKey();
   const client = await w.lightningService.connectionManager.createSparkClient(
     w.lightningService.config.getCoordinatorAddress(),
   );
   const resp = await client.query_preimage({
     paymentHash,
-    receiverIdentityPubkey: identityPubkey,
+    receiverIdentityPubkey: counterpartyPubkey,
   });
   if (!resp.preimage || resp.preimage.length === 0) return null;
   if (resp.preimage.length !== 32) {
@@ -484,6 +503,10 @@ export async function runSellerFlow(
   params.onState({ ...state });
 
   // Phase 1: lock our asset to the counterparty.
+  // Resumability: catch ALREADY_EXISTS, which means a previous run already
+  // posted this lock (per the coordinator's per-(sender, paymentHash)
+  // uniqueness constraint — see reference_spark_htlc_primitive). Treat as
+  // a successful lock and continue to the awaiting-counterparty phase.
   state.phase = 'locking';
   state.message = `locking ${params.assetLeaves.length} leaf(es) under H to counterparty`;
   state.updatedAt = nowIso();
@@ -496,12 +519,19 @@ export async function runSellerFlow(
       expiryTime: params.expiryTime,
     });
   } catch (e) {
-    state.phase = 'failed';
-    state.cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
-    state.message = `lockUnderHash failed: ${state.cause}`;
-    state.updatedAt = nowIso();
-    params.onState({ ...state });
-    return { outcome: 'failed', state };
+    const errStr = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+    if (errStr.includes('ALREADY_EXISTS')) {
+      state.message = `lock already in place from a previous attempt — resuming`;
+      state.updatedAt = nowIso();
+      params.onState({ ...state });
+    } else {
+      state.phase = 'failed';
+      state.cause = errStr;
+      state.message = `lockUnderHash failed: ${state.cause}`;
+      state.updatedAt = nowIso();
+      params.onState({ ...state });
+      return { outcome: 'failed', state };
+    }
   }
 
   state.phase = 'locked';
@@ -574,6 +604,95 @@ export async function runSellerFlow(
 }
 
 /**
+ * Resume a buyer flow whose lock is already in place in the coordinator
+ * (e.g., a previous attempt completed the lock step before the UI was
+ * reloaded or the user re-clicked Run swap). Skips the leaf-selection +
+ * `lockUnderHash` call entirely — useful when the wallet's available
+ * leaves no longer include one sufficient for `priceSats` because the
+ * sufficient leaf IS the one already locked in the active HTLC.
+ *
+ * The caller is responsible for verifying via `queryPendingHtlcs` that a
+ * sender-role lock for this paymentHash is actually active before invoking
+ * this function. If no lock is in place, the polling loop will eventually
+ * time out at `expiryTime` and return `expired`.
+ */
+export async function resumeBuyerFlow(
+  wallet: unknown,
+  params: {
+    paymentHash: Uint8Array;
+    counterpartyPubkey: Uint8Array;
+    expiryTime: Date;
+    pollIntervalMs?: number;
+    onState: StateCallback;
+  },
+): Promise<FlowResult> {
+  const paymentHashHex = bytesToHex(params.paymentHash);
+  const pollInterval = params.pollIntervalMs ?? DEFAULT_POLL_MS;
+
+  const state: SwapState = {
+    phase: 'locked',
+    paymentHashHex,
+    message: 'resumed: existing lock confirmed in coordinator state',
+    updatedAt: nowIso(),
+    ourExpiry: params.expiryTime,
+  };
+  params.onState({ ...state });
+  state.phase = 'awaiting-counterparty';
+  params.onState({ ...state });
+
+  let revealed: Uint8Array | null = null;
+  while (Date.now() < params.expiryTime.getTime()) {
+    try {
+      revealed = await queryRevealedPreimage(wallet, params.paymentHash, params.counterpartyPubkey);
+    } catch (e) {
+      state.message = `query_preimage error (will retry): ${e instanceof Error ? e.message : String(e)}`;
+      state.updatedAt = nowIso();
+      params.onState({ ...state });
+      await sleep(pollInterval);
+      continue;
+    }
+    if (revealed) {
+      state.message = `seller revealed preimage`;
+      state.updatedAt = nowIso();
+      params.onState({ ...state });
+      break;
+    }
+    await sleep(pollInterval);
+  }
+
+  if (!revealed) {
+    state.phase = 'expired';
+    state.message = `our lock expired before seller revealed — sats refund automatically`;
+    state.updatedAt = nowIso();
+    params.onState({ ...state });
+    return { outcome: 'expired', state };
+  }
+
+  state.phase = 'revealing';
+  state.message = `claiming asset with discovered preimage`;
+  state.updatedAt = nowIso();
+  params.onState({ ...state });
+
+  try {
+    await revealAndClaim(wallet, revealed);
+  } catch (e) {
+    state.phase = 'failed';
+    state.cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+    state.message = `revealAndClaim failed: ${state.cause}`;
+    state.updatedAt = nowIso();
+    params.onState({ ...state });
+    return { outcome: 'failed', state };
+  }
+
+  state.phase = 'completed';
+  state.message = `swap completed — asset claimed from seller`;
+  state.revealedPreimageHex = bytesToHex(revealed);
+  state.updatedAt = nowIso();
+  params.onState({ ...state });
+  return { outcome: 'completed', state };
+}
+
+/**
  * Buyer-side flow. Given the seller's already-published `paymentHash`
  * (from the orderbook), locks our sats to the seller, polls until the
  * seller reveals the preimage, then claims the seller's asset.
@@ -610,6 +729,9 @@ export async function runBuyerFlow(
   params.onState({ ...state });
 
   // Phase 1: lock our sats to the seller.
+  // Resumability: same ALREADY_EXISTS handling as seller-side — see comment
+  // there. Lets the user re-click Run swap after a UI reload without
+  // double-locking.
   state.phase = 'locking';
   state.message = `locking ${params.satsLeaves.length} sat leaf(es) under H to seller`;
   state.updatedAt = nowIso();
@@ -622,12 +744,19 @@ export async function runBuyerFlow(
       expiryTime: params.expiryTime,
     });
   } catch (e) {
-    state.phase = 'failed';
-    state.cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
-    state.message = `lockUnderHash failed: ${state.cause}`;
-    state.updatedAt = nowIso();
-    params.onState({ ...state });
-    return { outcome: 'failed', state };
+    const errStr = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+    if (errStr.includes('ALREADY_EXISTS')) {
+      state.message = `lock already in place from a previous attempt — resuming`;
+      state.updatedAt = nowIso();
+      params.onState({ ...state });
+    } else {
+      state.phase = 'failed';
+      state.cause = errStr;
+      state.message = `lockUnderHash failed: ${state.cause}`;
+      state.updatedAt = nowIso();
+      params.onState({ ...state });
+      return { outcome: 'failed', state };
+    }
   }
 
   state.phase = 'locked';
@@ -642,7 +771,7 @@ export async function runBuyerFlow(
   let revealed: Uint8Array | null = null;
   while (Date.now() < params.expiryTime.getTime()) {
     try {
-      revealed = await queryRevealedPreimage(wallet, params.paymentHash);
+      revealed = await queryRevealedPreimage(wallet, params.paymentHash, params.counterpartyPubkey);
     } catch (e) {
       state.message = `query_preimage error (will retry): ${e instanceof Error ? e.message : String(e)}`;
       state.updatedAt = nowIso();

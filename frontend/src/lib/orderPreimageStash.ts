@@ -78,6 +78,17 @@ export function detachOrderSecrets(): void {
  */
 export function addOrderSecret(orderId: string, preimageHex: string): void {
   if (state.secrets.some((s) => s.orderId === orderId)) return;
+  // Loud-fail when called before `attachOrderSecrets` set currentNpub.
+  // Previously this silently no-op'd in writeRaw, leaving the secret
+  // in memory but not on disk — on next reload the order was unswappable
+  // ("no stored preimage" surfaced too late at swap-time). Failing fast
+  // here makes the bug obvious: any caller that places asks without the
+  // stash attached gets caught immediately.
+  if (!currentNpub) {
+    throw new Error(
+      'addOrderSecret: stash not attached to a wallet. Call attachOrderSecrets(npub) first.',
+    );
+  }
   state.secrets.push({
     orderId,
     preimageHex,
