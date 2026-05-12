@@ -19,9 +19,20 @@ import {
   claimL1Deposit,
   transferToSpark,
   mintViaSelfTransfer,
+  getSparkWallet,
   type WalletInitResult,
   type SparkLeafRow,
 } from './lib/sparkWallet'
+import {
+  probeHtlc,
+  probeHtlcReveal,
+  probeHtlcCrossExpiry,
+  pickSmallestLeaf,
+  type HtlcProbeResult,
+  type HtlcRevealProbeResult,
+  type HtlcCrossExpiryProbeResult,
+  type InvoiceShape,
+} from './lib/htlcProbe'
 import { RgbAwareSparkSigner, clearRgbIntent, listPathTweaks, getPathTweak } from './lib/rgbAwareSigner'
 import { attachPathTweakStorage, detachPathTweakStorage } from './lib/pathTweakStorage'
 import {
@@ -337,6 +348,7 @@ function App() {
             </summary>
             <div style={{ marginTop: 8 }}>
               <PathTweaksDebug />
+              <HtlcProbe />
               <ConsignmentLab
                 myNpub={state.parsed.npub}
                 myIdentityPubkey={state.wallet.identityPubkey}
@@ -435,6 +447,344 @@ function RgbStashPanel() {
                       </div>
                     )}
                   </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </fieldset>
+  )
+}
+
+// ---- HTLC probe (Phase 1C R&D session 0) -----------------------------------
+//
+// Click-and-see test: does Spark's swapNodesForPreimage accept a call
+// without a valid LN invoice? If yes, we have access to a generic HTLC
+// primitive usable for trustless P2P atomic swap (the missing piece per
+// feedback_trustless_is_non_negotiable). If no, the verbatim coordinator
+// error tells us exactly what's being validated, narrowing the search.
+
+function HtlcProbe() {
+  const [smallestLeaf, setSmallestLeaf] = useState<
+    { id: string; value: number } | null
+  >(null)
+  const [scanning, setScanning] = useState(false)
+  const [scanErr, setScanErr] = useState<string | null>(null)
+  const [probing, setProbing] = useState<InvoiceShape | 'reveal' | 'crossExpiry' | null>(null)
+  const [crossPhase, setCrossPhase] = useState<string | null>(null)
+  const [results, setResults] = useState<HtlcProbeResult[]>([])
+  const [revealResults, setRevealResults] = useState<HtlcRevealProbeResult[]>([])
+  const [crossResults, setCrossResults] = useState<HtlcCrossExpiryProbeResult[]>([])
+
+  const scanForLeaf = useCallback(async () => {
+    setScanning(true)
+    setScanErr(null)
+    try {
+      const wallet = getSparkWallet()
+      if (!wallet) throw new Error('wallet not initialized')
+      const leaf = await pickSmallestLeaf(wallet)
+      if (!leaf) {
+        setSmallestLeaf(null)
+        setScanErr('no leaves found — fund the wallet first')
+      } else {
+        setSmallestLeaf({ id: leaf.id, value: leaf.value })
+      }
+    } catch (e) {
+      setScanErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setScanning(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void scanForLeaf()
+  }, [scanForLeaf])
+
+  async function runCrossExpiryProbe() {
+    setProbing('crossExpiry')
+    setCrossPhase('starting')
+    try {
+      const wallet = getSparkWallet()
+      if (!wallet) throw new Error('wallet not initialized')
+      const leaf = await pickSmallestLeaf(wallet)
+      if (!leaf) throw new Error('no leaves available — fund the wallet first')
+      const result = await probeHtlcCrossExpiry(wallet, leaf, setCrossPhase)
+      setCrossResults((r) => [result, ...r].slice(0, 4))
+    } catch (e) {
+      setCrossResults((r) => [
+        {
+          leafId: '',
+          leafValueSats: 0,
+          recipientPubkeyHex: '',
+          paymentHashHex: '',
+          swapAccepted: false,
+          swapError: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+          elapsedMs: 0,
+          waitedMs: 0,
+        },
+        ...r,
+      ].slice(0, 4))
+    } finally {
+      setProbing(null)
+      setCrossPhase(null)
+    }
+  }
+
+  async function runRevealProbe() {
+    setProbing('reveal')
+    try {
+      const wallet = getSparkWallet()
+      if (!wallet) throw new Error('wallet not initialized')
+      const leaf = await pickSmallestLeaf(wallet)
+      if (!leaf) throw new Error('no leaves available — fund the wallet first')
+      const result = await probeHtlcReveal(wallet, leaf)
+      setRevealResults((r) => [result, ...r].slice(0, 4))
+    } catch (e) {
+      setRevealResults((r) => [
+        {
+          leafId: '',
+          leafValueSats: 0,
+          paymentHashHex: '',
+          preimageHex: '',
+          swapAccepted: false,
+          swapError: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+          elapsedMs: 0,
+        },
+        ...r,
+      ].slice(0, 4))
+    } finally {
+      setProbing(null)
+    }
+  }
+
+  async function runProbe(shape: InvoiceShape) {
+    setProbing(shape)
+    try {
+      const wallet = getSparkWallet()
+      if (!wallet) throw new Error('wallet not initialized')
+      const leaf = await pickSmallestLeaf(wallet)
+      if (!leaf) throw new Error('no leaves available — fund the wallet first')
+      const result = await probeHtlc(wallet, leaf, shape)
+      setResults((r) => [result, ...r].slice(0, 8))
+    } catch (e) {
+      // Top-level failure (e.g., wallet missing). Render as a synthetic result row.
+      setResults((r) => [
+        {
+          shape,
+          invoiceString: '',
+          leafId: '',
+          leafValueSats: 0,
+          paymentHashHex: '',
+          swapAccepted: false,
+          swapError: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+          elapsedMs: 0,
+        },
+        ...r,
+      ].slice(0, 8))
+    } finally {
+      setProbing(null)
+    }
+  }
+
+  return (
+    <fieldset style={{ marginTop: 10, border: '1px solid #ddd', padding: '8px 12px' }}>
+      <legend style={{ fontSize: 12, color: '#666' }}>HTLC probe · Phase 1C R&D</legend>
+      <div style={{ fontSize: 12, color: '#666', marginBottom: 8 }}>
+        Tests whether <code>swapNodesForPreimage</code> accepts a non-LN call.
+        Picks the smallest leaf; if probe succeeds, immediately unlocks with{' '}
+        <code>providePreimage</code>. Worst case if both fail: leaf locked
+        for ≤ 60 s.
+      </div>
+
+      <div style={{ fontSize: 12 }}>
+        target leaf:{' '}
+        {scanning ? (
+          'scanning…'
+        ) : scanErr ? (
+          <span style={{ color: 'crimson' }}>{scanErr}</span>
+        ) : smallestLeaf ? (
+          <>
+            <code>{smallestLeaf.id.slice(0, 10)}…</code> · {smallestLeaf.value}{' '}
+            sats
+          </>
+        ) : (
+          'unknown'
+        )}{' '}
+        <button onClick={() => void scanForLeaf()} disabled={scanning} style={{ fontSize: 11 }}>
+          {scanning ? '…' : 'rescan'}
+        </button>
+      </div>
+
+      <div style={{ marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button
+          onClick={() => void runProbe('empty')}
+          disabled={probing !== null || !smallestLeaf}
+        >
+          {probing === 'empty' ? 'probing…' : 'Probe empty invoice'}
+        </button>
+        <button
+          onClick={() => void runProbe('garbage')}
+          disabled={probing !== null || !smallestLeaf}
+        >
+          {probing === 'garbage' ? 'probing…' : 'Probe garbage invoice'}
+        </button>
+        <button
+          onClick={() => void runRevealProbe()}
+          disabled={probing !== null || !smallestLeaf}
+        >
+          {probing === 'reveal' ? 'probing…' : 'Probe reveal + read-back'}
+        </button>
+        <button
+          onClick={() => void runCrossExpiryProbe()}
+          disabled={probing !== null || !smallestLeaf}
+          title="Locks smallest leaf to a throwaway recipient for 60s; verifies auto-refund."
+        >
+          {probing === 'crossExpiry' ? 'probing…' : 'Probe cross-recv + expiry (~70s)'}
+        </button>
+      </div>
+      {crossPhase && (
+        <div style={{ marginTop: 6, fontSize: 11, color: '#666' }}>
+          phase: <em>{crossPhase}</em>
+        </div>
+      )}
+
+      {results.length > 0 && (
+        <div style={{ marginTop: 10, fontFamily: 'monospace', fontSize: 11 }}>
+          {results.map((r, i) => (
+            <div
+              key={i}
+              style={{
+                borderTop: i === 0 ? 'none' : '1px dashed #eee',
+                padding: '6px 0',
+                color: r.swapAccepted ? 'seagreen' : '#444',
+              }}
+            >
+              <div>
+                <strong>{r.shape}</strong> · {r.elapsedMs} ms ·{' '}
+                {r.swapAccepted ? '🟢 swap ACCEPTED' : '🔴 swap rejected'}
+              </div>
+              <div style={{ color: '#888' }}>
+                paymentHash: {r.paymentHashHex.slice(0, 16)}…
+              </div>
+              {r.swapAccepted && (
+                <div>
+                  unlock:{' '}
+                  {r.unlockAccepted
+                    ? '🟢 providePreimage OK'
+                    : `🔴 providePreimage failed (${r.unlockError ?? '?'})`}
+                </div>
+              )}
+              {r.swapError && (
+                <div style={{ wordBreak: 'break-all', color: '#a00' }}>
+                  error: {r.swapError}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {revealResults.length > 0 && (
+        <div style={{ marginTop: 10, paddingTop: 6, borderTop: '1px solid #ccc', fontFamily: 'monospace', fontSize: 11 }}>
+          <div style={{ fontWeight: 'bold', marginBottom: 4 }}>reveal probes:</div>
+          {revealResults.map((r, i) => (
+            <div
+              key={i}
+              style={{
+                borderTop: i === 0 ? 'none' : '1px dashed #eee',
+                padding: '6px 0',
+              }}
+            >
+              <div>
+                <strong>reveal</strong> · {r.elapsedMs} ms ·{' '}
+                {r.swapAccepted
+                  ? r.unlockAccepted
+                    ? '🟢 swap + unlock OK'
+                    : '🟡 swap OK, unlock failed'
+                  : '🔴 swap rejected'}
+              </div>
+              <div style={{ color: '#888' }}>
+                paymentHash: {r.paymentHashHex.slice(0, 16)}…
+              </div>
+              {r.swapError && (
+                <div style={{ color: '#a00', wordBreak: 'break-all' }}>swap error: {r.swapError}</div>
+              )}
+              {r.unlockError && (
+                <div style={{ color: '#a00', wordBreak: 'break-all' }}>unlock error: {r.unlockError}</div>
+              )}
+              {r.queryPreimageReturnedRaw !== undefined && (
+                <div style={{ color: r.queryPreimageReturnedSameP ? 'seagreen' : '#c80' }}>
+                  query_preimage: {r.queryPreimageReturnedSameP
+                    ? '🟢 returned matching P'
+                    : `⚠ returned ${r.queryPreimageReturnedRaw.slice(0, 16)}… vs expected ${r.preimageHex.slice(0, 16)}…`}
+                </div>
+              )}
+              {r.queryPreimageError && (
+                <div style={{ color: '#a00', wordBreak: 'break-all' }}>query_preimage error: {r.queryPreimageError}</div>
+              )}
+              {r.queryHtlcCount !== undefined && (
+                <div>
+                  query_htlc: count={r.queryHtlcCount}
+                  {r.queryHtlcStatus && <> · {r.queryHtlcStatus}</>}
+                </div>
+              )}
+              {r.queryHtlcError && (
+                <div style={{ color: '#a00', wordBreak: 'break-all' }}>query_htlc error: {r.queryHtlcError}</div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {crossResults.length > 0 && (
+        <div style={{ marginTop: 10, paddingTop: 6, borderTop: '1px solid #ccc', fontFamily: 'monospace', fontSize: 11 }}>
+          <div style={{ fontWeight: 'bold', marginBottom: 4 }}>cross-receiver + expiry probes:</div>
+          {crossResults.map((r, i) => {
+            const statusLabel = r.postExpiryStatus === 0 ? 'WAITING'
+              : r.postExpiryStatus === 1 ? 'PREIMAGE_SHARED'
+              : r.postExpiryStatus === 2 ? 'RETURNED'
+              : `unknown(${r.postExpiryStatus})`
+            return (
+              <div
+                key={i}
+                style={{
+                  borderTop: i === 0 ? 'none' : '1px dashed #eee',
+                  padding: '6px 0',
+                }}
+              >
+                <div>
+                  <strong>cross+expiry</strong> · {r.elapsedMs} ms ·{' '}
+                  {r.swapAccepted
+                    ? '🟢 cross-receiver lock accepted'
+                    : '🔴 cross-receiver lock rejected'}
+                </div>
+                {r.swapError && (
+                  <div style={{ color: '#a00', wordBreak: 'break-all' }}>swap error: {r.swapError}</div>
+                )}
+                {r.swapAccepted && (
+                  <>
+                    <div style={{ color: '#888' }}>
+                      recipient: {r.recipientPubkeyHex.slice(0, 16)}… (throwaway)
+                    </div>
+                    {r.postExpiryStatus !== undefined && (
+                      <div style={{ color: r.postExpiryStatus === 2 ? 'seagreen' : '#c80' }}>
+                        post-expiry status: {statusLabel}
+                        {r.postExpiryStatus === 2 ? ' 🟢' : ' ⚠'}
+                      </div>
+                    )}
+                    {r.postExpiryStatusError && (
+                      <div style={{ color: '#a00' }}>status query error: {r.postExpiryStatusError}</div>
+                    )}
+                    {r.leafBackInWallet !== undefined && (
+                      <div style={{ color: r.leafBackInWallet ? 'seagreen' : '#c80' }}>
+                        leaf back in wallet: {r.leafBackInWallet ? '🟢 yes' : '⚠ no'}
+                      </div>
+                    )}
+                    {r.leafBackError && (
+                      <div style={{ color: '#a00' }}>leaf check error: {r.leafBackError}</div>
+                    )}
+                  </>
                 )}
               </div>
             )
