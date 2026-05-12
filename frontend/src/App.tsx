@@ -16,10 +16,12 @@ import {
   getBalance,
   disposeSparkWallet,
   listSparkLeaves,
+  claimL1Deposit,
+  transferToSpark,
   type WalletInitResult,
   type SparkLeafRow,
 } from './lib/sparkWallet'
-import { RgbAwareSparkSigner } from './lib/rgbAwareSigner'
+import { RgbAwareSparkSigner, setRgbIntent, clearRgbIntent } from './lib/rgbAwareSigner'
 import { ensureSparkCoreReady, type SparkCore } from './lib/sparkCore'
 import {
   postConsignment,
@@ -277,11 +279,381 @@ function App() {
             </div>
           )}
 
+          <ClaimL1DepositVanilla />
+
+          <SendToSpark />
+
           <ConsignmentLab
             myNpub={state.parsed.npub}
             myIdentityPubkey={state.wallet.identityPubkey}
             myNostrPrivkeyHex={state.parsed.nostrPrivkeyHex}
           />
+
+          <SparkUtkMint />
+        </div>
+      )}
+    </section>
+  )
+}
+
+// ---- Claim L1 Deposit (vanilla, no RGB intent) ------------------------------
+//
+// Materializes an L1 deposit as a regular Spark leaf without applying any
+// Spark-UTK tweak. Used for two purposes: (a) sanity-test that the deposit
+// path itself works end-to-end on this wallet, (b) recover funds after a
+// failed UTK-at-claim attempt (see project_spark_deposit_owner_check.md —
+// the SE rejects tweaks during finalize_deposit_tree_creation, so the
+// intent-active claim aborts and the deposit must be re-claimed clean).
+
+function ClaimL1DepositVanilla() {
+  const [txid, setTxid] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [result, setResult] = useState<{ totalSats: number; leafCount: number } | null>(null)
+
+  async function claim() {
+    setErr(null)
+    setResult(null)
+    setBusy(true)
+    try {
+      clearRgbIntent()
+      const cleanTxid = txid.replace(/[^0-9a-fA-F]/g, '').toLowerCase()
+      if (cleanTxid.length !== 64) {
+        throw new Error(`txid must be 64 hex chars — got ${cleanTxid.length} after stripping non-hex`)
+      }
+      const c = await claimL1Deposit(cleanTxid)
+      setResult({ totalSats: c.totalSats, leafCount: c.leafCount })
+      setTxid('')
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <section style={{ marginTop: 24, borderTop: '1px solid #ddd', paddingTop: 12 }}>
+      <h2 style={{ margin: '0 0 4px' }}>Claim L1 deposit (no intent)</h2>
+      <p style={{ color: '#666', marginTop: 0, fontSize: 13 }}>
+        Materialize a confirmed L1 deposit as a vanilla Spark leaf — no
+        Spark-UTK tweak. Use this to recover funds after an aborted Mint, or
+        to seed a leaf for a later transfer-based UTK experiment.
+      </p>
+
+      <label style={{ display: 'block', fontSize: 12, marginTop: 8 }}>
+        funding txid (64 hex)
+      </label>
+      <input
+        value={txid}
+        onChange={(e) => setTxid(e.target.value)}
+        placeholder="txid of the confirmed L1 deposit"
+        style={{ width: '100%', fontFamily: 'monospace', fontSize: 12, padding: 6, boxSizing: 'border-box' }}
+        disabled={busy}
+      />
+
+      <div style={{ marginTop: 10 }}>
+        <button onClick={() => void claim()} disabled={busy || !txid.trim()}>
+          {busy ? 'claiming…' : 'Claim (no intent)'}
+        </button>
+      </div>
+
+      {err && (
+        <pre style={{ color: 'crimson', whiteSpace: 'pre-wrap', marginTop: 8, fontSize: 12 }}>
+          {err}
+        </pre>
+      )}
+
+      {result && (
+        <div style={{ marginTop: 10, padding: 8, background: '#e8f5e9', border: '1px solid #a5d6a7', fontSize: 13 }}>
+          claimed <b>{result.totalSats} sats</b> across <b>{result.leafCount}</b> leaf
+          {result.leafCount === 1 ? '' : 's'}. Balance should refresh; drain via Send to Spark if you want to evacuate.
+        </div>
+      )}
+    </section>
+  )
+}
+
+// ---- Send to Spark ----------------------------------------------------------
+//
+// Lets the user evacuate sats out of this wallet to any other Spark address
+// (e.g. back to a ppwallet sparkAddress) without going through L1. Useful
+// after dropping a few ksats into the depositAddress for testing — the leaves
+// remain spendable and can be drained at any time.
+
+function SendToSpark() {
+  const [receiver, setReceiver] = useState('')
+  const [amount, setAmount] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [transferId, setTransferId] = useState<string | null>(null)
+
+  async function send() {
+    setErr(null)
+    setTransferId(null)
+    setBusy(true)
+    try {
+      const r = receiver.trim()
+      if (!r) throw new Error('receiver sparkAddress is empty')
+      const sats = Number(amount)
+      if (!Number.isInteger(sats) || sats <= 0) {
+        throw new Error('amount must be a positive integer (sats)')
+      }
+      const id = await transferToSpark(sats, r)
+      setTransferId(id)
+      setAmount('')
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <section style={{ marginTop: 24, borderTop: '1px solid #ddd', paddingTop: 12 }}>
+      <h2 style={{ margin: '0 0 4px' }}>Send to Spark</h2>
+      <p style={{ color: '#666', marginTop: 0, fontSize: 13 }}>
+        Spark → Spark transfer (no L1 hop). Drain leaves to another wallet —
+        e.g. a ppwallet sparkAddress — after testing.
+      </p>
+
+      <label style={{ display: 'block', fontSize: 12, marginTop: 8 }}>
+        receiver sparkAddress
+      </label>
+      <input
+        value={receiver}
+        onChange={(e) => setReceiver(e.target.value)}
+        placeholder="sp1…"
+        style={{ width: '100%', fontFamily: 'monospace', fontSize: 12, padding: 6, boxSizing: 'border-box' }}
+        disabled={busy}
+      />
+
+      <label style={{ display: 'block', fontSize: 12, marginTop: 8 }}>
+        amount (sats)
+      </label>
+      <input
+        value={amount}
+        onChange={(e) => setAmount(e.target.value)}
+        placeholder="1000"
+        inputMode="numeric"
+        style={{ width: 160, fontFamily: 'monospace', fontSize: 12, padding: 6 }}
+        disabled={busy}
+      />
+
+      <div style={{ marginTop: 10 }}>
+        <button
+          onClick={() => void send()}
+          disabled={busy || !receiver.trim() || !amount.trim()}
+        >
+          {busy ? 'sending…' : 'Send'}
+        </button>
+      </div>
+
+      {err && (
+        <pre style={{ color: 'crimson', whiteSpace: 'pre-wrap', marginTop: 8, fontSize: 12 }}>
+          {err}
+        </pre>
+      )}
+
+      {transferId && (
+        <div style={{ marginTop: 10, padding: 8, background: '#e8f5e9', border: '1px solid #a5d6a7', fontSize: 13 }}>
+          sent · transferId{' '}
+          <code style={{ fontSize: 12 }}>{transferId}</code>
+        </div>
+      )}
+    </section>
+  )
+}
+
+// ---- Spark-UTK Mint (chunk-α-bis) -------------------------------------------
+//
+// Drives the RgbAwareSparkSigner end-to-end. User funds a depositAddress with
+// L1 sats (above the L1 dust limit — ~1000 sats is a safe round amount on
+// mainnet P2TR), supplies the txid + a 32-byte msg (the would-be RGB Merkle root),
+// and clicks Mint. The signer tweaks U_base → U_tweaked during claimDeposit so
+// the SE persists a leaf whose verifyingPublicKey = U_tweaked + operator —
+// i.e. cryptographically commits to msg. Receiver-side verification uses the
+// WASM deriveVerifyingKey(uBase, msg, operator) primitive, mirrored against
+// the same Rust vector v1 the JS tweak math is anchored to.
+
+interface MintResult {
+  leaf: SparkLeafRow
+  msgHex: string
+  expectedVerifyingKey: string
+  match: boolean
+  vanillaWouldMatch: boolean
+  totalSats: number
+  leafCount: number
+}
+
+function SparkUtkMint() {
+  const [core, setCore] = useState<SparkCore | null>(null)
+  const [coreErr, setCoreErr] = useState<string | null>(null)
+  const [txid, setTxid] = useState('')
+  const [msgHex, setMsgHex] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [result, setResult] = useState<MintResult | null>(null)
+
+  useEffect(() => {
+    ensureSparkCoreReady()
+      .then((c) => setCore(c))
+      .catch((e) => setCoreErr(e instanceof Error ? e.message : String(e)))
+  }, [])
+
+  function randomMsg() {
+    const b = new Uint8Array(32)
+    crypto.getRandomValues(b)
+    setMsgHex(bytesToHex(b))
+  }
+
+  async function mint() {
+    setErr(null)
+    setResult(null)
+    setBusy(true)
+    try {
+      if (!core) throw new Error('WASM not ready')
+      const cleanTxid = txid.replace(/[^0-9a-fA-F]/g, '').toLowerCase()
+      if (cleanTxid.length !== 64) {
+        throw new Error(`txid must be 64 hex chars — got ${cleanTxid.length} after stripping non-hex`)
+      }
+      const cleanMsg = msgHex.replace(/[^0-9a-fA-F]/g, '').toLowerCase()
+      if (cleanMsg.length !== 64) {
+        throw new Error(`msg must be 64 hex chars (32 bytes) — got ${cleanMsg.length} after stripping non-hex`)
+      }
+      const msgBytes = hexToBytes(cleanMsg)
+
+      const before = await listSparkLeaves()
+      const beforeIds = new Set(before.map((l) => l.id))
+
+      setRgbIntent(msgBytes)
+      let claim
+      try {
+        claim = await claimL1Deposit(cleanTxid)
+      } finally {
+        clearRgbIntent()
+      }
+
+      const after = await listSparkLeaves()
+      const newLeaves = after.filter((l) => !beforeIds.has(l.id))
+      if (newLeaves.length === 0) {
+        throw new Error('claimDeposit returned but no new leaf appeared in getLeaves()')
+      }
+      // If multiple leaves got created (unlikely for a single L1 utxo) we
+      // surface the first one; all should share the same msg since the intent
+      // was a single global value.
+      const leaf = newLeaves[0]
+
+      const uBase = leaf.ownerSigningPublicKey.toLowerCase()
+      const operator = leaf.operatorPublicKey.toLowerCase()
+      const realVk = leaf.verifyingPublicKey.toLowerCase()
+      const expectedVk = core.deriveVerifyingKey(uBase, cleanMsg, operator).toLowerCase()
+      const vanillaVk = bytesToHex(
+        (await import('@buildonspark/spark-sdk')).addPublicKeys(
+          hexToBytes(uBase),
+          hexToBytes(operator),
+        ),
+      ).toLowerCase()
+
+      setResult({
+        leaf,
+        msgHex: cleanMsg,
+        expectedVerifyingKey: expectedVk,
+        match: expectedVk === realVk,
+        vanillaWouldMatch: vanillaVk === realVk,
+        totalSats: claim.totalSats,
+        leafCount: claim.leafCount,
+      })
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <section style={{ marginTop: 32, borderTop: '1px solid #ddd', paddingTop: 16 }}>
+      <h2 style={{ margin: '0 0 4px' }}>Spark-UTK Mint</h2>
+      <p style={{ color: '#666', marginTop: 0, fontSize: 13 }}>
+        Fund the depositAddress above with an L1 amount above the dust limit
+        (~1000 sats is safe), wait 1 conf, paste the funding txid + a 32-byte
+        RGB commitment, then Mint. The new leaf's verifyingKey will commit to
+        msg cryptographically — provable client-side.
+      </p>
+
+      {coreErr && <pre style={{ color: 'crimson' }}>{coreErr}</pre>}
+
+      <label style={{ display: 'block', fontSize: 12, marginTop: 8 }}>
+        funding txid (64 hex)
+      </label>
+      <input
+        value={txid}
+        onChange={(e) => setTxid(e.target.value)}
+        placeholder="abcd…ef (txid of the L1 deposit)"
+        style={{ width: '100%', fontFamily: 'monospace', fontSize: 12, padding: 6, boxSizing: 'border-box' }}
+        disabled={busy}
+      />
+
+      <label style={{ display: 'block', fontSize: 12, marginTop: 8 }}>
+        msg (32 bytes / 64 hex) — would be the RGB Merkle root
+      </label>
+      <div style={{ display: 'flex', gap: 6 }}>
+        <input
+          value={msgHex}
+          onChange={(e) => setMsgHex(e.target.value)}
+          placeholder="random 32-byte commitment"
+          style={{ flex: 1, fontFamily: 'monospace', fontSize: 12, padding: 6 }}
+          disabled={busy}
+        />
+        <button onClick={randomMsg} disabled={busy}>random</button>
+      </div>
+
+      <div style={{ marginTop: 10 }}>
+        <button
+          onClick={() => void mint()}
+          disabled={busy || !core || !txid.trim() || !msgHex.trim()}
+        >
+          {busy ? 'minting…' : 'Mint with Spark-UTK intent'}
+        </button>
+      </div>
+
+      {err && (
+        <pre style={{ color: 'crimson', whiteSpace: 'pre-wrap', marginTop: 8, fontSize: 12 }}>
+          {err}
+        </pre>
+      )}
+
+      {result && (
+        <div style={{ marginTop: 14, padding: 10, border: '1px solid #ccc', background: '#fafafa' }}>
+          <div style={{ fontSize: 13, marginBottom: 6 }}>
+            claimed <b>{result.totalSats} sats</b> across <b>{result.leafCount}</b> leaf
+            {result.leafCount === 1 ? '' : 's'}.
+          </div>
+          <KV label="leaf.id"             value={result.leaf.id} mono />
+          <KV label="leaf.value"          value={String(result.leaf.value)} />
+          <KV label="u_base"              value={result.leaf.ownerSigningPublicKey} mono />
+          <KV label="operator"            value={result.leaf.operatorPublicKey} mono />
+          <KV label="msg"                 value={result.msgHex} mono />
+          <KV label="leaf.verifyingKey"   value={result.leaf.verifyingPublicKey} mono />
+          <KV label="expected (UTK)"      value={result.expectedVerifyingKey} mono />
+          <div
+            style={{
+              marginTop: 8,
+              padding: 6,
+              background: result.match ? '#e8f5e9' : '#ffebee',
+              border: `1px solid ${result.match ? '#a5d6a7' : '#ef9a9a'}`,
+              fontSize: 13,
+            }}
+          >
+            {result.match
+              ? 'OK · leaf.verifyingKey == deriveVerifyingKey(u_base, msg, operator) — Spark-UTK binding holds'
+              : 'FAIL · the leaf does NOT carry the Spark-UTK tweak for this msg'}
+          </div>
+          {!result.match && result.vanillaWouldMatch && (
+            <div style={{ marginTop: 6, padding: 6, background: '#fff8e1', border: '1px solid #ffe082', fontSize: 12 }}>
+              diagnosis: leaf is vanilla (addPublicKeys(u_base, operator) == verifyingKey).
+              The signer's tweak gate didn't fire — check setRgbIntent timing.
+            </div>
+          )}
         </div>
       )}
     </section>
