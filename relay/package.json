@@ -9,7 +9,10 @@
     "start": "tsx src/index.ts",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@noble/curves": "^2.2.0",
+    "nostr-tools": "^2.23.3"
+  },
   "devDependencies": {
     "@types/node": "^24.12.2",
     "tsx": "^4.19.2",

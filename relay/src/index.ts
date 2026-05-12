@@ -13,6 +13,13 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
+import {
+  placeOrder,
+  listOrders,
+  cancelOrder,
+  healthCounts as orderbookHealth,
+  type SignedOrder,
+} from './orderbook.js'
 
 const PORT = Number(process.env.PORT ?? 5180)
 const HOST = process.env.HOST ?? '0.0.0.0'
@@ -93,7 +100,64 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       ok: true,
       npubs: store.size,
       pending: [...store.values()].reduce((n, q) => n + q.length, 0),
+      orderbook: orderbookHealth(),
     })
+  }
+
+  // /order/:assetId or /order/:assetId/:orderId
+  const orderMatch = url.match(/^\/order\/([0-9a-fA-F]{64})(?:\/([0-9a-f-]{36}))?\/?$/)
+  if (orderMatch) {
+    const assetId = orderMatch[1]!
+    const orderId = orderMatch[2]
+
+    if (method === 'POST' && !orderId) {
+      let body: Buffer
+      try {
+        body = await readBody(req, MAX_BYTES)
+      } catch (e) {
+        const status = (e as { http?: number }).http ?? 400
+        return send(res, status, { error: status === 413 ? 'payload too large' : 'read error' })
+      }
+      if (body.length === 0) return send(res, 400, { error: 'empty body' })
+      let signed: SignedOrder
+      try {
+        signed = JSON.parse(body.toString('utf8')) as SignedOrder
+      } catch {
+        return send(res, 400, { error: 'body is not JSON' })
+      }
+      try {
+        const result = placeOrder(assetId, signed)
+        return send(res, 201, result)
+      } catch (e) {
+        const status = (e as { http?: number }).http ?? 400
+        return send(res, status, { error: (e as Error).message })
+      }
+    }
+
+    if (method === 'GET' && !orderId) {
+      const list = listOrders(assetId)
+      return send(res, 200, list)
+    }
+
+    if (method === 'DELETE' && orderId) {
+      // Caller passes their npub via Authorization header (`Authorization: Npub <npub>`).
+      // The relay checks the npub matches the order's posterNpub; this is a v0
+      // simplification — possession of the original signed order is the actual
+      // authority, but the relay already stores it server-side. Future hardening:
+      // sign a fresh cancellation envelope.
+      const auth = req.headers['authorization'] ?? ''
+      const m = /^Npub\s+(\S+)$/i.exec(typeof auth === 'string' ? auth : auth[0] ?? '')
+      if (!m) return send(res, 401, { error: 'Authorization: Npub <npub> header required' })
+      try {
+        cancelOrder(assetId, orderId, m[1]!)
+        return send(res, 204)
+      } catch (e) {
+        const status = (e as { http?: number }).http ?? 400
+        return send(res, status, { error: (e as Error).message })
+      }
+    }
+
+    return send(res, 405, { error: 'method not allowed on /order' })
   }
 
   // /consignment/:npub  or  /consignment/:npub/:id
