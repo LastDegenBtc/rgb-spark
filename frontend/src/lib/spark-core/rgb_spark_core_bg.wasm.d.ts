@@ -2,19 +2,24 @@
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
 export const __wbg_niaissuance_free: (a: number, b: number) => void;
+export const __wbg_niatransition_free: (a: number, b: number) => void;
 export const __wbg_sparkutkproofjs_free: (a: number, b: number) => void;
+export const buildNiaTransition: (a: number, b: number, c: number, d: bigint, e: number, f: number, g: number) => [number, number, number];
 export const deriveOutputXonly: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const deriveUTweaked: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const deriveVerifyingKey: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const issueNiaContract: (a: number, b: number, c: number, d: number, e: bigint, f: number, g: number, h: number, i: bigint) => [number, number, number];
 export const niaissuance_consignmentHex: (a: number) => [number, number];
 export const niaissuance_contractId: (a: number) => [number, number];
+export const niatransition_commitIdHex: (a: number) => [number, number];
+export const niatransition_transitionHex: (a: number) => [number, number];
 export const sparkutkproofjs_decode: (a: number, b: number) => [number, number, number];
 export const sparkutkproofjs_encode: (a: number) => [number, number, number, number];
 export const sparkutkproofjs_new: (a: number, b: number, c: number, d: number) => [number, number, number];
 export const sparkutkproofjs_operator: (a: number) => [number, number];
 export const sparkutkproofjs_uBase: (a: number) => [number, number];
 export const validateNiaConsignment: (a: number, b: number) => [number, number, number, number];
+export const validateNiaTransition: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const rustsecp256k1_v0_10_0_context_create: (a: number) => number;
 export const rustsecp256k1_v0_10_0_context_destroy: (a: number) => void;
 export const rustsecp256k1_v0_10_0_default_error_callback_fn: (a: number, b: number) => void;

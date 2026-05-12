@@ -20,6 +20,13 @@ export interface LeafReferenceField {
   value: number;
   network: string;
   verifyingPublicKey: string;
+  /** Optional Spark-UTK binding metadata (chunk-α onwards). The
+   *  canonicalizer drops `undefined` fields, so optionality is preserved
+   *  through the signature step. */
+  msgHex?: string;
+  consignmentHex?: string;
+  transitionHex?: string;
+  prevGenesisHex?: string;
 }
 
 /** Envelope fields that participate in the signature. Excludes senderSignature. */

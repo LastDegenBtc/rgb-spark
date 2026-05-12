@@ -12,6 +12,9 @@
 // asset at issuance time.
 
 use core::str::FromStr;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use amplify::confinement::Confined;
 use bc::CompressedPk;
@@ -21,13 +24,17 @@ use commit_verify::mpc::Commitment;
 // rgb-schemas → schemata.
 use dbc::keytweak::{self, SparkUtkProof};
 use rgbstd::containers::{Consignment, ConsignmentExt};
-use rgbstd::contract::{ContractBuilder, IssuerWrapper};
+use rgbstd::contract::{AllocatedState, ContractBuilder, IssuerWrapper, TransitionBuilder};
+use rgbstd::persistence::MemContract;
 use rgbstd::stl::{AssetSpec, ContractTerms, RicardianContract};
 use rgbstd::validation::{ResolveWitness, ValidationConfig, WitnessResolverError, WitnessStatus};
-use rgbstd::vm::WitnessOrd;
-use rgbstd::{Amount, ChainNet, GenesisSeal, Identity, Precision, Txid};
-use schemata::NonInflatableAsset;
-use strict_encoding::{StrictDeserialize, StrictSerialize};
+use rgbstd::vm::{ContractStateEvolve, OrdOpRef, WitnessOrd};
+use rgbstd::{
+    Amount, AssignmentType, BundleId, ChainNet, GenesisSeal, GraphSeal, Identity, Operation,
+    Opout, Precision, RevealedState, RevealedValue, Transition, Txid,
+};
+use schemata::{NonInflatableAsset, OS_ASSET};
+use strict_encoding::{StrictDeserialize, StrictDumb, StrictSerialize};
 use wasm_bindgen::prelude::*;
 
 // SparkUtkProof is two 33-byte pubkeys plus strict-encoding overhead;
@@ -272,6 +279,234 @@ pub fn validate_nia_consignment(consignment_hex: &str) -> Result<String, JsError
     Ok(hex::encode(valid.contract_id().to_byte_array()))
 }
 
+/// JS handle around the result of building a NIA `Transition`. Carries
+/// both the strict-encoded transition bytes and `transition.id()` — the
+/// 32-byte opid which the sender feeds into the receiver-side Spark-UTK
+/// mint as `msg`, so the new leaf is cryptographically bound to *this*
+/// specific RGB state-transition.
+#[wasm_bindgen]
+pub struct NiaTransition {
+    transition_hex: String,
+    commit_id_hex: String,
+}
+
+#[wasm_bindgen]
+impl NiaTransition {
+    #[wasm_bindgen(getter, js_name = transitionHex)]
+    pub fn transition_hex(&self) -> String { self.transition_hex.clone() }
+
+    #[wasm_bindgen(getter, js_name = commitIdHex)]
+    pub fn commit_id_hex(&self) -> String { self.commit_id_hex.clone() }
+}
+
+// Pulls the i-th `assetOwner` fungible assignment out of a NIA genesis
+// and returns its `RevealedValue` (which carries the `Amount` and a
+// blinding factor). Used by both `build_nia_transition` (to pass the
+// prior allocation as an input to TransitionBuilder) and
+// `validate_nia_transition` (to construct the `prev_state` map fed
+// into `Schema::validate_state`).
+fn genesis_asset_at(
+    genesis_consignment: &Consignment<false>,
+    no: u16,
+) -> Result<RevealedValue, JsError> {
+    let typed = genesis_consignment
+        .genesis()
+        .assignments
+        .get(&OS_ASSET)
+        .ok_or_else(|| JsError::new("genesis: missing OS_ASSET assignment"))?;
+    let fungibles = typed.as_fungible();
+    let entry = fungibles
+        .get(no as usize)
+        .ok_or_else(|| JsError::new(&format!("genesis: no OS_ASSET assignment at index {no}")))?;
+    let (_seal, value) = entry
+        .as_revealed()
+        .ok_or_else(|| JsError::new("genesis: OS_ASSET assignment is not revealed"))?;
+    Ok(*value)
+}
+
+/// Build a NIA `transfer` state transition consuming the `no`-th
+/// `assetOwner` assignment of a previously issued genesis, allocating
+/// `amount` units to a new beneficiary seal. Returns
+/// `{ transitionHex, commitIdHex }` where `commitIdHex` is the
+/// `transition.id()` to be used as `msg` for the receiver's Spark-UTK
+/// mint.
+///
+/// `genesis_hex`: strict-encoded `Consignment<false>` (genesis-only) as
+///                produced by `issueNiaContract`.
+/// `consume_index`: which `assetOwner` output of the genesis to spend
+///                  (`0` for the single-output case our `issueNiaContract`
+///                  produces today).
+/// `amount`: units to allocate to the beneficiary. Must equal the
+///           prior allocation's amount (`svs OS_ASSET` enforces
+///           conservation — no split/merge yet).
+/// `beneficiary_txid_hex` / `beneficiary_vout`: the L1 outpoint that
+///           formally "owns" the new RGB allocation. Placeholder-safe
+///           in the Spark flow — never resolved on chain.
+#[wasm_bindgen(js_name = buildNiaTransition)]
+pub fn build_nia_transition(
+    genesis_hex: &str,
+    consume_index: u16,
+    amount: u64,
+    beneficiary_txid_hex: &str,
+    beneficiary_vout: u32,
+) -> Result<NiaTransition, JsError> {
+    let bytes = hex::decode(genesis_hex).map_err(map_err("genesis hex decode"))?;
+    let confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(bytes)
+        .map_err(map_err("size limit"))?;
+    let genesis_consignment =
+        Consignment::<false>::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(confined)
+            .map_err(map_err("strict decode genesis"))?;
+
+    let prev_value = genesis_asset_at(&genesis_consignment, consume_index)?;
+    let prev_amount: Amount = prev_value.into();
+    if Amount::from(amount) != prev_amount {
+        return Err(JsError::new(&format!(
+            "amount {amount} != prev allocation {prev_amount}; split/merge not supported in this binding"
+        )));
+    }
+
+    let contract_id = genesis_consignment.contract_id();
+    let genesis_opid = genesis_consignment.genesis().id();
+
+    let txid = Txid::from_str(beneficiary_txid_hex)
+        .map_err(|e| JsError::new(&format!("beneficiary_txid parse: {e}")))?;
+    let beneficiary = GraphSeal::new_random(txid, beneficiary_vout);
+
+    let mut builder = TransitionBuilder::named_transition(
+        contract_id,
+        NonInflatableAsset::schema(),
+        "transfer",
+        NonInflatableAsset::types(),
+    )
+    .map_err(map_err("TransitionBuilder::named_transition"))?;
+
+    let opout = Opout::new(genesis_opid, OS_ASSET, consume_index);
+    builder = builder
+        .add_input(opout, AllocatedState::Amount(prev_value))
+        .map_err(map_err("add_input"))?;
+    builder = builder
+        .add_fungible_state("assetOwner", beneficiary, Amount::from(amount))
+        .map_err(map_err("add_fungible_state"))?;
+
+    let transition = builder
+        .complete_transition()
+        .map_err(map_err("complete_transition"))?;
+    let opid = transition.id();
+    let bytes = transition
+        .to_strict_serialized::<CONSIGNMENT_MAX_LEN>()
+        .map_err(map_err("strict encode transition"))?;
+
+    Ok(NiaTransition {
+        transition_hex: hex::encode(bytes.release()),
+        commit_id_hex: hex::encode(opid.to_byte_array()),
+    })
+}
+
+/// Validate a strict-encoded NIA `Transition` (hex) against its prior
+/// `Consignment<false>` (genesis, hex). Returns `transition.id()` as
+/// 32-byte hex — the value the receiver compares with `msgHex` to
+/// confirm the new leaf's Spark-UTK binding refers to *this* specific
+/// transition.
+///
+/// This is the Spark-native path: we run the rgb-consensus schema
+/// validator (typesystem checks + AluVM `svs OS_ASSET` conservation
+/// check) on the transition in isolation, with the input state map
+/// built deterministically from the genesis assignments. We do NOT
+/// go through `Validator::validate_bundles`, which would require a
+/// `ResolveWitness` impl pointing at an L1 commitment — Spark replaces
+/// the L1 transport, see [feedback_no_synthetic_l1_witness].
+#[wasm_bindgen(js_name = validateNiaTransition)]
+pub fn validate_nia_transition(
+    transition_hex: &str,
+    genesis_hex: &str,
+) -> Result<String, JsError> {
+    let tr_bytes = hex::decode(transition_hex).map_err(map_err("transition hex decode"))?;
+    let tr_confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(tr_bytes)
+        .map_err(map_err("transition size limit"))?;
+    let transition = Transition::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(tr_confined)
+        .map_err(map_err("strict decode transition"))?;
+
+    let g_bytes = hex::decode(genesis_hex).map_err(map_err("genesis hex decode"))?;
+    let g_confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(g_bytes)
+        .map_err(map_err("genesis size limit"))?;
+    let genesis_consignment =
+        Consignment::<false>::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(g_confined)
+            .map_err(map_err("strict decode genesis"))?;
+
+    let genesis = genesis_consignment.genesis();
+    let contract_id = genesis_consignment.contract_id();
+    let genesis_opid = genesis.id();
+
+    if transition.contract_id != contract_id {
+        return Err(JsError::new(&format!(
+            "transition.contract_id {} != genesis.contract_id {}",
+            transition.contract_id, contract_id
+        )));
+    }
+
+    let mut prev_state: BTreeMap<AssignmentType, Vec<RevealedState>> = BTreeMap::new();
+    for input in &transition.inputs {
+        if input.op != genesis_opid {
+            return Err(JsError::new(&format!(
+                "transition input opid {} does not match genesis opid {}; \
+                 only single-hop genesis→transition chains are supported here",
+                input.op, genesis_opid
+            )));
+        }
+        let typed = genesis
+            .assignments
+            .get(&input.ty)
+            .ok_or_else(|| JsError::new(&format!("genesis missing assignment type {}", input.ty)))?;
+        let revealed = typed
+            .to_revealed_assign_at(input.no, None)
+            .map_err(|_| JsError::new(&format!("genesis input out of range: {input}")))?;
+        let (_seal, state) = revealed
+            .into_revealed()
+            .ok_or_else(|| JsError::new(&format!("genesis input not revealed: {input}")))?;
+        prev_state.entry(input.ty).or_default().push(state);
+    }
+
+    let schema = NonInflatableAsset::schema();
+    let types = NonInflatableAsset::types();
+    let scripts = NonInflatableAsset::scripts();
+
+    let contract_state =
+        Rc::new(RefCell::new(MemContract::init((&schema, contract_id))));
+
+    schema
+        .validate_state(
+            &types,
+            &scripts,
+            genesis,
+            OrdOpRef::Genesis(genesis),
+            contract_state.clone(),
+            &BTreeMap::new(),
+        )
+        .map_err(|e| JsError::new(&format!("genesis re-validation: {e:?}")))?;
+
+    // Witness metadata: in the Spark flow there is no L1 witness tx, so
+    // we feed deterministic placeholders. The AluVM transfer script
+    // (`svs OS_ASSET`) reads only `prev_state` and `op.assignments`;
+    // these fields are recorded in the MemContract but never used to
+    // resolve anything.
+    let witness_txid = Txid::strict_dumb();
+    let witness_ord = WitnessOrd::strict_dumb();
+    let bundle_id = BundleId::strict_dumb();
+
+    schema
+        .validate_state(
+            &types,
+            &scripts,
+            genesis,
+            OrdOpRef::Transition(&transition, witness_txid, witness_ord, bundle_id),
+            contract_state,
+            &prev_state,
+        )
+        .map_err(|e| JsError::new(&format!("transition validation: {e:?}")))?;
+
+    Ok(hex::encode(transition.id().to_byte_array()))
+}
+
 // ---- helpers ----
 
 fn parse_pk(s: &str, field: &str) -> Result<CompressedPk, JsError> {
@@ -376,6 +611,49 @@ mod tests {
             validated_id, issued.contract_id_hex,
             "receiver-derived contractId must equal sender contractId"
         );
+    }
+
+    #[test]
+    fn build_and_validate_nia_transition_roundtrip() {
+        // Issuer-side: mint a NIA genesis with a known supply.
+        let issued =
+            issue_nia_contract("TX", "Transition test", 1_337, FIXTURE_TXID, 0, 1_700_000_002)
+                .expect("issuance");
+        // Build a transfer transition consuming the single genesis output,
+        // re-allocating the full amount to a new beneficiary seal.
+        let beneficiary_txid =
+            "97a8c0a35d36e3f9f44b94be77ba3f7e74e2b97ee8f57edf6f111d2d6f8a4c10";
+        let trn = build_nia_transition(&issued.consignment_hex, 0, 1_337, beneficiary_txid, 1)
+            .expect("build_nia_transition");
+        // commitIdHex is a 32-byte hex string (transition.id()).
+        assert_eq!(trn.commit_id_hex.len(), 64);
+        assert!(trn.commit_id_hex.chars().all(|c| c.is_ascii_hexdigit()));
+        // Receiver-side: re-decode + schema-validate (no resolver, no witness).
+        let next_msg = validate_nia_transition(&trn.transition_hex, &issued.consignment_hex)
+            .expect("validate_nia_transition");
+        assert_eq!(
+            next_msg, trn.commit_id_hex,
+            "receiver-derived nextMsg must equal sender commitId"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn validate_nia_transition_rejects_amount_mismatch() {
+        // Build a valid transition but tamper-test against a *different*
+        // genesis: contract_id mismatch must be caught.
+        let g_a = issue_nia_contract("A", "A", 10, FIXTURE_TXID, 0, 1_700_000_010).expect("a");
+        let g_b = issue_nia_contract("B", "B", 10, FIXTURE_TXID, 0, 1_700_000_011).expect("b");
+        let trn = build_nia_transition(
+            &g_a.consignment_hex,
+            0,
+            10,
+            "97a8c0a35d36e3f9f44b94be77ba3f7e74e2b97ee8f57edf6f111d2d6f8a4c10",
+            0,
+        )
+        .expect("build over genesis A");
+        let r = validate_nia_transition(&trn.transition_hex, &g_b.consignment_hex);
+        assert!(r.is_err(), "validation against the wrong genesis must fail");
     }
 
     // `JsError::new` panics on non-wasm targets (it's a stub when not compiled

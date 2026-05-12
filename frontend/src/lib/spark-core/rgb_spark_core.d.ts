@@ -16,6 +16,21 @@ export class NiaIssuance {
 }
 
 /**
+ * JS handle around the result of building a NIA `Transition`. Carries
+ * both the strict-encoded transition bytes and `transition.id()` — the
+ * 32-byte opid which the sender feeds into the receiver-side Spark-UTK
+ * mint as `msg`, so the new leaf is cryptographically bound to *this*
+ * specific RGB state-transition.
+ */
+export class NiaTransition {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    readonly commitIdHex: string;
+    readonly transitionHex: string;
+}
+
+/**
  * JS handle around [`SparkUtkProof`]. Round-trips through the same
  * strict-encoding the rgb-consensus validator consumes.
  */
@@ -35,6 +50,28 @@ export class SparkUtkProofJs {
     readonly operator: string;
     readonly uBase: string;
 }
+
+/**
+ * Build a NIA `transfer` state transition consuming the `no`-th
+ * `assetOwner` assignment of a previously issued genesis, allocating
+ * `amount` units to a new beneficiary seal. Returns
+ * `{ transitionHex, commitIdHex }` where `commitIdHex` is the
+ * `transition.id()` to be used as `msg` for the receiver's Spark-UTK
+ * mint.
+ *
+ * `genesis_hex`: strict-encoded `Consignment<false>` (genesis-only) as
+ *                produced by `issueNiaContract`.
+ * `consume_index`: which `assetOwner` output of the genesis to spend
+ *                  (`0` for the single-output case our `issueNiaContract`
+ *                  produces today).
+ * `amount`: units to allocate to the beneficiary. Must equal the
+ *           prior allocation's amount (`svs OS_ASSET` enforces
+ *           conservation — no split/merge yet).
+ * `beneficiary_txid_hex` / `beneficiary_vout`: the L1 outpoint that
+ *           formally "owns" the new RGB allocation. Placeholder-safe
+ *           in the Spark flow — never resolved on chain.
+ */
+export function buildNiaTransition(genesis_hex: string, consume_index: number, amount: bigint, beneficiary_txid_hex: string, beneficiary_vout: number): NiaTransition;
 
 /**
  * Derive the L1 unilateral-exit BIP-341 noscript x-only output key.
@@ -94,24 +131,46 @@ export function issueNiaContract(ticker: string, name: string, supply: bigint, b
  */
 export function validateNiaConsignment(consignment_hex: string): string;
 
+/**
+ * Validate a strict-encoded NIA `Transition` (hex) against its prior
+ * `Consignment<false>` (genesis, hex). Returns `transition.id()` as
+ * 32-byte hex — the value the receiver compares with `msgHex` to
+ * confirm the new leaf's Spark-UTK binding refers to *this* specific
+ * transition.
+ *
+ * This is the Spark-native path: we run the rgb-consensus schema
+ * validator (typesystem checks + AluVM `svs OS_ASSET` conservation
+ * check) on the transition in isolation, with the input state map
+ * built deterministically from the genesis assignments. We do NOT
+ * go through `Validator::validate_bundles`, which would require a
+ * `ResolveWitness` impl pointing at an L1 commitment — Spark replaces
+ * the L1 transport, see [feedback_no_synthetic_l1_witness].
+ */
+export function validateNiaTransition(transition_hex: string, genesis_hex: string): string;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_niaissuance_free: (a: number, b: number) => void;
+    readonly __wbg_niatransition_free: (a: number, b: number) => void;
     readonly __wbg_sparkutkproofjs_free: (a: number, b: number) => void;
+    readonly buildNiaTransition: (a: number, b: number, c: number, d: bigint, e: number, f: number, g: number) => [number, number, number];
     readonly deriveOutputXonly: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly deriveUTweaked: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly deriveVerifyingKey: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly issueNiaContract: (a: number, b: number, c: number, d: number, e: bigint, f: number, g: number, h: number, i: bigint) => [number, number, number];
     readonly niaissuance_consignmentHex: (a: number) => [number, number];
     readonly niaissuance_contractId: (a: number) => [number, number];
+    readonly niatransition_commitIdHex: (a: number) => [number, number];
+    readonly niatransition_transitionHex: (a: number) => [number, number];
     readonly sparkutkproofjs_decode: (a: number, b: number) => [number, number, number];
     readonly sparkutkproofjs_encode: (a: number) => [number, number, number, number];
     readonly sparkutkproofjs_new: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly sparkutkproofjs_operator: (a: number) => [number, number];
     readonly sparkutkproofjs_uBase: (a: number) => [number, number];
     readonly validateNiaConsignment: (a: number, b: number) => [number, number, number, number];
+    readonly validateNiaTransition: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly rustsecp256k1_v0_10_0_context_create: (a: number) => number;
     readonly rustsecp256k1_v0_10_0_context_destroy: (a: number) => void;
     readonly rustsecp256k1_v0_10_0_default_error_callback_fn: (a: number, b: number) => void;

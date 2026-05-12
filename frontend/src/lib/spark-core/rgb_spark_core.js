@@ -57,6 +57,63 @@ export class NiaIssuance {
 if (Symbol.dispose) NiaIssuance.prototype[Symbol.dispose] = NiaIssuance.prototype.free;
 
 /**
+ * JS handle around the result of building a NIA `Transition`. Carries
+ * both the strict-encoded transition bytes and `transition.id()` — the
+ * 32-byte opid which the sender feeds into the receiver-side Spark-UTK
+ * mint as `msg`, so the new leaf is cryptographically bound to *this*
+ * specific RGB state-transition.
+ */
+export class NiaTransition {
+    static __wrap(ptr) {
+        const obj = Object.create(NiaTransition.prototype);
+        obj.__wbg_ptr = ptr;
+        NiaTransitionFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        NiaTransitionFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_niatransition_free(ptr, 0);
+    }
+    /**
+     * @returns {string}
+     */
+    get commitIdHex() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.niatransition_commitIdHex(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {string}
+     */
+    get transitionHex() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.niatransition_transitionHex(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+}
+if (Symbol.dispose) NiaTransition.prototype[Symbol.dispose] = NiaTransition.prototype.free;
+
+/**
  * JS handle around [`SparkUtkProof`]. Round-trips through the same
  * strict-encoding the rgb-consensus validator consumes.
  */
@@ -163,6 +220,44 @@ export class SparkUtkProofJs {
     }
 }
 if (Symbol.dispose) SparkUtkProofJs.prototype[Symbol.dispose] = SparkUtkProofJs.prototype.free;
+
+/**
+ * Build a NIA `transfer` state transition consuming the `no`-th
+ * `assetOwner` assignment of a previously issued genesis, allocating
+ * `amount` units to a new beneficiary seal. Returns
+ * `{ transitionHex, commitIdHex }` where `commitIdHex` is the
+ * `transition.id()` to be used as `msg` for the receiver's Spark-UTK
+ * mint.
+ *
+ * `genesis_hex`: strict-encoded `Consignment<false>` (genesis-only) as
+ *                produced by `issueNiaContract`.
+ * `consume_index`: which `assetOwner` output of the genesis to spend
+ *                  (`0` for the single-output case our `issueNiaContract`
+ *                  produces today).
+ * `amount`: units to allocate to the beneficiary. Must equal the
+ *           prior allocation's amount (`svs OS_ASSET` enforces
+ *           conservation — no split/merge yet).
+ * `beneficiary_txid_hex` / `beneficiary_vout`: the L1 outpoint that
+ *           formally "owns" the new RGB allocation. Placeholder-safe
+ *           in the Spark flow — never resolved on chain.
+ * @param {string} genesis_hex
+ * @param {number} consume_index
+ * @param {bigint} amount
+ * @param {string} beneficiary_txid_hex
+ * @param {number} beneficiary_vout
+ * @returns {NiaTransition}
+ */
+export function buildNiaTransition(genesis_hex, consume_index, amount, beneficiary_txid_hex, beneficiary_vout) {
+    const ptr0 = passStringToWasm0(genesis_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(beneficiary_txid_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.buildNiaTransition(ptr0, len0, consume_index, amount, ptr1, len1, beneficiary_vout);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return NiaTransition.__wrap(ret[0]);
+}
 
 /**
  * Derive the L1 unilateral-exit BIP-341 noscript x-only output key.
@@ -339,6 +434,47 @@ export function validateNiaConsignment(consignment_hex) {
         wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
     }
 }
+
+/**
+ * Validate a strict-encoded NIA `Transition` (hex) against its prior
+ * `Consignment<false>` (genesis, hex). Returns `transition.id()` as
+ * 32-byte hex — the value the receiver compares with `msgHex` to
+ * confirm the new leaf's Spark-UTK binding refers to *this* specific
+ * transition.
+ *
+ * This is the Spark-native path: we run the rgb-consensus schema
+ * validator (typesystem checks + AluVM `svs OS_ASSET` conservation
+ * check) on the transition in isolation, with the input state map
+ * built deterministically from the genesis assignments. We do NOT
+ * go through `Validator::validate_bundles`, which would require a
+ * `ResolveWitness` impl pointing at an L1 commitment — Spark replaces
+ * the L1 transport, see [feedback_no_synthetic_l1_witness].
+ * @param {string} transition_hex
+ * @param {string} genesis_hex
+ * @returns {string}
+ */
+export function validateNiaTransition(transition_hex, genesis_hex) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const ptr0 = passStringToWasm0(transition_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(genesis_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.validateNiaTransition(ptr0, len0, ptr1, len1);
+        var ptr3 = ret[0];
+        var len3 = ret[1];
+        if (ret[3]) {
+            ptr3 = 0; len3 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+    }
+}
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
@@ -371,6 +507,9 @@ function __wbg_get_imports() {
 const NiaIssuanceFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_niaissuance_free(ptr, 1));
+const NiaTransitionFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_niatransition_free(ptr, 1));
 const SparkUtkProofJsFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_sparkutkproofjs_free(ptr, 1));

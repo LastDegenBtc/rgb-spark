@@ -366,10 +366,20 @@ interface SparkWalletInternals {
   claimTransfer: (opts: { transfer: unknown; emit?: boolean }) => Promise<SparkClaimedNode[]>;
 }
 
+export interface MintRgbPayload {
+  /** Genesis consignment hex (chunk-γ session 1 path) — `msg == contractId`. */
+  consignmentHex?: string;
+  /** Strict-encoded `Transition` hex (chunk-γ session 2 path) — `msg == transition.id()`.
+   *  When set, `prevGenesisHex` is required (receiver-side schema replay). */
+  transitionHex?: string;
+  /** Genesis consignment hex of the contract the transition consumes. */
+  prevGenesisHex?: string;
+}
+
 export async function mintViaSelfTransfer(
   leafId: string,
   msgBytes: Uint8Array,
-  consignmentHex?: string,
+  rgb?: MintRgbPayload,
 ): Promise<MintViaSelfTransferResult> {
   if (!walletInstance) throw new Error('Wallet not initialized');
   if (msgBytes.length !== 32) {
@@ -459,7 +469,14 @@ export async function mintViaSelfTransfer(
   // 3. Self-referencing tweak for the destination path — fires the tweak
   //    during the claim's newKeyDerivation lookup. Keeping the entry alive
   //    after claim turns it into the persistent record the receiver uses.
-  setPathTweak(destLeafId, destLeafId, msgBytes, destUBase, consignmentHex);
+  if (rgb?.transitionHex && !rgb.prevGenesisHex) {
+    throw new Error('mintViaSelfTransfer: transitionHex requires prevGenesisHex');
+  }
+  setPathTweak(destLeafId, destLeafId, msgBytes, destUBase, {
+    consignmentHex: rgb?.consignmentHex,
+    transitionHex: rgb?.transitionHex,
+    prevGenesisHex: rgb?.prevGenesisHex,
+  });
   let claimedNodes: SparkClaimedNode[];
   try {
     claimedNodes = await internals.claimTransfer({ transfer: pending, emit: false });

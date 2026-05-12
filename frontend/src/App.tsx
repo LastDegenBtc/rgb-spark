@@ -107,6 +107,15 @@ interface LeafReference {
    *  When all three pass, the receiver knows the Spark leaf is bound to a
    *  validly-issued RGB asset whose contractId they verified themselves. */
   consignmentHex?: string
+  /** When present (hex of a strict-encoded `Transition`), the leaf
+   *  commits to an NIA state transition rather than the genesis. The
+   *  receiver runs `core.validateNiaTransition(transitionHex,
+   *  prevGenesisHex)` — pure schema/AluVM replay, no L1 witness, no
+   *  resolver — and cross-checks the returned commit_id against msgHex.
+   *  `prevGenesisHex` is required: the receiver rebuilds the input state
+   *  map from the genesis assignments to feed Schema::validate_state. */
+  transitionHex?: string
+  prevGenesisHex?: string
 }
 
 type ConsignmentEnvelope =
@@ -557,17 +566,28 @@ interface MintViaTransferResult {
   transferId: string
 }
 
+// Payload shape produced by IssueNiaInline / BuildTransitionInline and
+// consumed by the mint flow when stitching together the persistent
+// pathTweaks entry.
+type PendingRgbPayload =
+  | { kind: 'genesis'; consignmentHex: string }
+  | { kind: 'transition'; transitionHex: string; prevGenesisHex: string }
+
 function SparkUtkMintViaTransfer() {
   const [core, setCore] = useState<SparkCore | null>(null)
   const [coreErr, setCoreErr] = useState<string | null>(null)
   const [leaves, setLeaves] = useState<SparkLeafRow[]>([])
   const [selectedLeafId, setSelectedLeafId] = useState('')
   const [msgHex, setMsgHex] = useState('')
-  // When the msg came from an NIA issuance, this holds the strict-encoded
-  // consignment hex so it can be attached to the persistent pathTweaks entry
-  // during mint, and then surfaced by ConsignmentLab when sending a proof.
-  // Cleared whenever the user touches the msg field manually or hits random.
-  const [pendingConsignmentHex, setPendingConsignmentHex] = useState<string | null>(null)
+  // When the msg came from an NIA issuance or a NIA transition, this holds
+  // the bytes that need to travel with the proof so the receiver can replay
+  // the RGB layer client-side. Cleared whenever the user touches msg manually.
+  const [pendingRgb, setPendingRgb] = useState<PendingRgbPayload | null>(null)
+  // Last successful NIA issuance kept here so the transition panel can chain
+  // on top of it without the user having to paste the hex around.
+  const [lastIssuance, setLastIssuance] = useState<
+    { contractId: string; consignmentHex: string; supply: bigint } | null
+  >(null)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [result, setResult] = useState<MintViaTransferResult | null>(null)
@@ -598,7 +618,7 @@ function SparkUtkMintViaTransfer() {
     const b = new Uint8Array(32)
     crypto.getRandomValues(b)
     setMsgHex(bytesToHex(b))
-    setPendingConsignmentHex(null)
+    setPendingRgb(null)
   }
 
   async function mint() {
@@ -622,10 +642,19 @@ function SparkUtkMintViaTransfer() {
         verifyingKey: sourceLeaf.verifyingPublicKey.toLowerCase(),
       }
 
+      const rgbPayload =
+        pendingRgb?.kind === 'genesis'
+          ? { consignmentHex: pendingRgb.consignmentHex }
+          : pendingRgb?.kind === 'transition'
+            ? {
+                transitionHex: pendingRgb.transitionHex,
+                prevGenesisHex: pendingRgb.prevGenesisHex,
+              }
+            : undefined
       const { transferId, leaf } = await mintViaSelfTransfer(
         selectedLeafId,
         msgBytes,
-        pendingConsignmentHex ?? undefined,
+        rgbPayload,
       )
 
       // Verification math:
@@ -716,29 +745,45 @@ function SparkUtkMintViaTransfer() {
           value={msgHex}
           onChange={(e) => {
             setMsgHex(e.target.value)
-            setPendingConsignmentHex(null)
+            setPendingRgb(null)
           }}
-          placeholder="random 32-byte commitment, or issue an NIA contract below"
+          placeholder="random 32-byte commitment, or issue / transition an NIA below"
           style={{ flex: 1, fontFamily: 'monospace', fontSize: 12, padding: 6 }}
           disabled={busy}
         />
         <button onClick={randomMsg} disabled={busy}>random</button>
       </div>
-      {pendingConsignmentHex && (
-        <div style={{
-          marginTop: 4, fontSize: 11, color: '#2a6',
-        }}>
-          RGB consignment ({pendingConsignmentHex.length / 2} bytes) will travel
+      {pendingRgb?.kind === 'genesis' && (
+        <div style={{ marginTop: 4, fontSize: 11, color: '#2a6' }}>
+          RGB genesis ({pendingRgb.consignmentHex.length / 2} bytes) will travel
           with the proof — receiver re-validates the issuance client-side.
+        </div>
+      )}
+      {pendingRgb?.kind === 'transition' && (
+        <div style={{ marginTop: 4, fontSize: 11, color: '#2a6' }}>
+          NIA transition ({pendingRgb.transitionHex.length / 2} B)
+          {' + '}prev genesis ({pendingRgb.prevGenesisHex.length / 2} B)
+          {' '}will travel — receiver replays the schema validator.
         </div>
       )}
 
       <IssueNiaInline
         core={core}
         disabled={busy}
-        onIssuance={(contractId, consignmentHex) => {
+        onIssuance={(contractId, consignmentHex, supply) => {
           setMsgHex(contractId)
-          setPendingConsignmentHex(consignmentHex)
+          setPendingRgb({ kind: 'genesis', consignmentHex })
+          setLastIssuance({ contractId, consignmentHex, supply })
+        }}
+      />
+
+      <BuildTransitionInline
+        core={core}
+        disabled={busy}
+        lastIssuance={lastIssuance}
+        onTransition={(commitId, transitionHex, prevGenesisHex) => {
+          setMsgHex(commitId)
+          setPendingRgb({ kind: 'transition', transitionHex, prevGenesisHex })
         }}
       />
 
@@ -815,8 +860,10 @@ function IssueNiaInline({
   disabled: boolean
   /** Called when an NIA issuance succeeds. `contractId` is the 32-byte hex
    *  to use as Spark-UTK msg; `consignmentHex` is the strict-encoded
-   *  Consignment<false> bytes that the receiver will validate. */
-  onIssuance: (contractId: string, consignmentHex: string) => void
+   *  Consignment<false> bytes that the receiver will validate. `supply`
+   *  flows through so the transition panel can default to a same-amount
+   *  full transfer (NIA `transfer` is conservation-checked, no split yet). */
+  onIssuance: (contractId: string, consignmentHex: string, supply: bigint) => void
 }) {
   const [ticker, setTicker] = useState('TEST')
   const [name, setName] = useState('Test asset')
@@ -856,7 +903,7 @@ function IssueNiaInline({
       const consignmentHex = issuance.consignmentHex
       issuance.free()
       setLastResult({ contractId, consignmentSize: consignmentHex.length / 2 })
-      onIssuance(contractId, consignmentHex)
+      onIssuance(contractId, consignmentHex, supplyBig)
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -916,6 +963,136 @@ function IssueNiaInline({
   )
 }
 
+// ---- Build NIA transition inline (chunk-γ session 2) -----------------------
+//
+// Builds a NIA `transfer` state transition on top of the most recent genesis
+// issued through IssueNiaInline. The transition is conservation-checked
+// (svs OS_ASSET = sum-inputs-vs-sum-outputs) so we default `amount` to the
+// genesis supply: no split/merge in this binding yet.
+//
+// The msg fed into the next Spark-UTK mint becomes `transition.id()` (32-byte
+// hex) instead of the genesis contractId. Receiver replays the schema
+// validator client-side via `core.validateNiaTransition(transitionHex,
+// prevGenesisHex)` and cross-checks against msgHex.
+
+const NIA_TRANSFER_PLACEHOLDER_TXID = 'cd'.repeat(32)
+
+function BuildTransitionInline({
+  core,
+  disabled,
+  lastIssuance,
+  onTransition,
+}: {
+  core: SparkCore | null
+  disabled: boolean
+  lastIssuance: { contractId: string; consignmentHex: string; supply: bigint } | null
+  onTransition: (commitId: string, transitionHex: string, prevGenesisHex: string) => void
+}) {
+  const [amount, setAmount] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [lastResult, setLastResult] = useState<{
+    commitId: string
+    transitionSize: number
+    prevGenesisSize: number
+  } | null>(null)
+
+  // Auto-fill amount from the most recent issuance — conservation requires
+  // input == output total, so default to full transfer.
+  useEffect(() => {
+    if (lastIssuance) setAmount(lastIssuance.supply.toString())
+  }, [lastIssuance])
+
+  async function buildTransition() {
+    setErr(null)
+    setBusy(true)
+    try {
+      if (!core) throw new Error('WASM not ready')
+      if (!lastIssuance) throw new Error('issue a NIA contract first — the transition consumes its genesis')
+      const supplyTrim = amount.trim()
+      if (!/^\d+$/.test(supplyTrim)) throw new Error('amount must be a non-negative integer')
+      const amt = BigInt(supplyTrim)
+      if (amt <= 0n) throw new Error('amount must be > 0')
+
+      const trn = core.buildNiaTransition(
+        lastIssuance.consignmentHex,
+        0,
+        amt,
+        NIA_TRANSFER_PLACEHOLDER_TXID,
+        1,
+      )
+      const commitId = trn.commitIdHex
+      const transitionHex = trn.transitionHex
+      trn.free()
+      setLastResult({
+        commitId,
+        transitionSize: transitionHex.length / 2,
+        prevGenesisSize: lastIssuance.consignmentHex.length / 2,
+      })
+      onTransition(commitId, transitionHex, lastIssuance.consignmentHex)
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const allDisabled = disabled || busy || !core || !lastIssuance
+
+  return (
+    <fieldset style={{ marginTop: 8, border: '1px solid #ddd', padding: '6px 10px' }}>
+      <legend style={{ fontSize: 12, color: '#666' }}>
+        or transition on top of the last issuance & use commit_id as msg
+      </legend>
+      {!lastIssuance && (
+        <div style={{ fontSize: 11, color: '#888', marginTop: 4 }}>
+          Issue a NIA contract above first — this panel consumes its genesis.
+        </div>
+      )}
+      {lastIssuance && (
+        <>
+          <div style={{ fontSize: 11, color: '#666', marginTop: 4, fontFamily: 'monospace', wordBreak: 'break-all' }}>
+            prev contract: {lastIssuance.contractId.slice(0, 16)}… · supply {String(lastIssuance.supply)}
+          </div>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginTop: 6 }}>
+            <label style={{ fontSize: 11, color: '#666' }}>amount</label>
+            <input
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              inputMode="numeric"
+              style={{ width: 120, fontSize: 12, padding: 4, fontFamily: 'monospace' }}
+              disabled={allDisabled}
+            />
+            <span style={{ fontSize: 11, color: '#888' }}>
+              must equal prev allocation (no split yet)
+            </span>
+            <button onClick={() => void buildTransition()} disabled={allDisabled}>
+              {busy ? 'building…' : 'build transition & use commit_id as msg'}
+            </button>
+          </div>
+        </>
+      )}
+      {lastResult && (
+        <div style={{ marginTop: 6, fontSize: 11, color: '#666' }}>
+          <div style={{ fontFamily: 'monospace', wordBreak: 'break-all' }}>
+            commit_id: {lastResult.commitId}
+          </div>
+          <div>
+            transition: {lastResult.transitionSize} B
+            {' · '}prev genesis: {lastResult.prevGenesisSize} B
+            {' '}(both attached to the proof)
+          </div>
+        </div>
+      )}
+      {err && (
+        <pre style={{ color: 'crimson', whiteSpace: 'pre-wrap', marginTop: 4, fontSize: 11 }}>
+          {err}
+        </pre>
+      )}
+    </fieldset>
+  )
+}
+
 // ---- Consignment Lab --------------------------------------------------------
 
 interface SentRecord {
@@ -932,16 +1109,23 @@ type LeafVerification =
   | { kind: 'mismatch'; expected: string; got: string; algo: LeafVerifyAlgo }
   | { kind: 'error'; message: string }                                  // derive call threw
 
-// Receiver-side validation of the optional RGB consignment carried by the
-// envelope. We run the rgb-consensus validator (wasm) against the canonical
-// NIA schema, then cross-check the validated contractId matches the
-// msgHex the Spark-UTK proof was bound to.
+// Receiver-side validation of the optional RGB payload carried by the
+// envelope. Two flavors:
+//   - `genesis`: validates a `Consignment<false>` against the canonical NIA
+//                schema; expected msg == validated contractId.
+//   - `transition`: replays `Schema::validate_state(OrdOpRef::Transition, ...)`
+//                   on a strict-encoded Transition, with the input state map
+//                   rebuilt from a prev-genesis consignment. No witness
+//                   resolver, no L1 — see feedback_no_synthetic_l1_witness.
+//                   Expected msg == returned transition.id().
+type RgbBindingKind = 'genesis' | 'transition'
+
 type RgbValidation =
-  | { kind: 'none' }                                            // no consignment attached
-  | { kind: 'ok'; contractId: string }                          // validator OK + contractId == msgHex
-  | { kind: 'msg-mismatch'; contractId: string; msgHex: string } // validator OK but msg disagrees
-  | { kind: 'missing-msg' }                                     // consignment present but envelope has no msgHex to cross-check
-  | { kind: 'fail'; message: string }                           // validator rejected
+  | { kind: 'none' }                                                        // no RGB payload attached
+  | { kind: 'ok'; binding: RgbBindingKind; committed: string }              // validator OK + committed == msgHex
+  | { kind: 'msg-mismatch'; binding: RgbBindingKind; committed: string; msgHex: string }
+  | { kind: 'missing-msg'; binding: RgbBindingKind }                        // payload present but envelope has no msgHex to cross-check
+  | { kind: 'fail'; binding: RgbBindingKind; message: string }              // validator rejected
 
 interface DecodedConsignment {
   raw: string                  // hex of the raw bytes received
@@ -1057,14 +1241,20 @@ function ConsignmentLab({
         let proofUBase: string
         let msgHex: string | undefined
         let consignmentHex: string | undefined
+        let transitionHex: string | undefined
+        let prevGenesisHex: string | undefined
         if (tweakEntry) {
           proofUBase = bytesToHex(tweakEntry.uBase).toLowerCase()
           msgHex = bytesToHex(tweakEntry.msg).toLowerCase()
           consignmentHex = tweakEntry.consignmentHex
+          transitionHex = tweakEntry.transitionHex
+          prevGenesisHex = tweakEntry.prevGenesisHex
         } else {
           proofUBase = selectedLeaf.ownerSigningPublicKey.toLowerCase()
           msgHex = undefined
           consignmentHex = undefined
+          transitionHex = undefined
+          prevGenesisHex = undefined
         }
         if (!COMPRESSED_PUBKEY_HEX_RE.test(proofUBase)) {
           throw new Error(`proof u_base is not a 33-byte compressed pubkey: ${proofUBase}`)
@@ -1088,6 +1278,8 @@ function ConsignmentLab({
             verifyingPublicKey: selectedLeaf.verifyingPublicKey.toLowerCase(),
             ...(msgHex ? { msgHex } : {}),
             ...(consignmentHex ? { consignmentHex } : {}),
+            ...(transitionHex ? { transitionHex } : {}),
+            ...(prevGenesisHex ? { prevGenesisHex } : {}),
           },
         }
       } else {
@@ -1177,25 +1369,54 @@ function ConsignmentLab({
           }
         }
         let rgbValidation: RgbValidation = { kind: 'none' }
-        if (leafRef?.consignmentHex) {
+        if (leafRef?.transitionHex && leafRef?.prevGenesisHex) {
+          // Spark-native transition validation: schema-only, no resolver,
+          // no synthetic L1 witness. The returned hex is transition.id(),
+          // which must match msgHex to close the chunk-α leaf-binding loop.
           try {
-            const validatedContractId = core
-              .validateNiaConsignment(leafRef.consignmentHex)
+            const committed = core
+              .validateNiaTransition(leafRef.transitionHex, leafRef.prevGenesisHex)
               .toLowerCase()
             if (!leafRef.msgHex) {
-              rgbValidation = { kind: 'missing-msg' }
-            } else if (leafRef.msgHex.toLowerCase() === validatedContractId) {
-              rgbValidation = { kind: 'ok', contractId: validatedContractId }
+              rgbValidation = { kind: 'missing-msg', binding: 'transition' }
+            } else if (leafRef.msgHex.toLowerCase() === committed) {
+              rgbValidation = { kind: 'ok', binding: 'transition', committed }
             } else {
               rgbValidation = {
                 kind: 'msg-mismatch',
-                contractId: validatedContractId,
+                binding: 'transition',
+                committed,
                 msgHex: leafRef.msgHex.toLowerCase(),
               }
             }
           } catch (e) {
             rgbValidation = {
               kind: 'fail',
+              binding: 'transition',
+              message: e instanceof Error ? e.message : String(e),
+            }
+          }
+        } else if (leafRef?.consignmentHex) {
+          try {
+            const committed = core
+              .validateNiaConsignment(leafRef.consignmentHex)
+              .toLowerCase()
+            if (!leafRef.msgHex) {
+              rgbValidation = { kind: 'missing-msg', binding: 'genesis' }
+            } else if (leafRef.msgHex.toLowerCase() === committed) {
+              rgbValidation = { kind: 'ok', binding: 'genesis', committed }
+            } else {
+              rgbValidation = {
+                kind: 'msg-mismatch',
+                binding: 'genesis',
+                committed,
+                msgHex: leafRef.msgHex.toLowerCase(),
+              }
+            }
+          } catch (e) {
+            rgbValidation = {
+              kind: 'fail',
+              binding: 'genesis',
               message: e instanceof Error ? e.message : String(e),
             }
           }
@@ -1533,29 +1754,36 @@ function DecodedView({ entry }: { entry: DecodedConsignment }) {
 
   const rv = entry.rgbValidation
   let rgbBadge: ReactNode = null
-  if (rv) {
+  if (rv && rv.kind !== 'none') {
+    const label = rv.kind === 'ok' || rv.kind === 'msg-mismatch' || rv.kind === 'missing-msg' || rv.kind === 'fail'
+      ? rv.binding === 'transition'
+        ? 'NIA transition'
+        : 'NIA genesis'
+      : ''
+    const committedLabel = (binding: RgbBindingKind) =>
+      binding === 'transition' ? 'transition.id()' : 'contractId'
     if (rv.kind === 'ok') {
       rgbBadge = (
         <span style={{ color: 'seagreen' }}>
-          OK · NIA consignment validates AND contractId == msg{' '}
-          (<code>{rv.contractId.slice(0, 16)}…</code>)
+          OK · {label} validates (schema replay){' '}
+          AND {committedLabel(rv.binding)} == msg (<code>{rv.committed.slice(0, 16)}…</code>)
         </span>
       )
     } else if (rv.kind === 'msg-mismatch') {
       rgbBadge = (
         <span style={{ color: '#c00' }}>
-          MISMATCH · consignment validates but contractId {rv.contractId.slice(0, 12)}… ≠ msg {rv.msgHex.slice(0, 12)}…
+          MISMATCH · {label} validates but {committedLabel(rv.binding)} {rv.committed.slice(0, 12)}… ≠ msg {rv.msgHex.slice(0, 12)}…
         </span>
       )
     } else if (rv.kind === 'missing-msg') {
       rgbBadge = (
         <span style={{ color: '#c80' }}>
-          consignment present but envelope has no msgHex to cross-check
+          {label} present but envelope has no msgHex to cross-check
         </span>
       )
     } else if (rv.kind === 'fail') {
       rgbBadge = (
-        <span style={{ color: '#c00' }}>FAIL · {rv.message}</span>
+        <span style={{ color: '#c00' }}>FAIL · {label} · {rv.message}</span>
       )
     }
   }
@@ -1638,6 +1866,19 @@ function DecodedView({ entry }: { entry: DecodedConsignment }) {
                   </summary>
                   <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#555', wordBreak: 'break-all' }}>
                     {leafRef.consignmentHex.slice(0, 200)}…
+                  </div>
+                </details>
+              )}
+              {leafRef.transitionHex && (
+                <details style={{ marginTop: 4 }}>
+                  <summary style={{ color: '#666', cursor: 'pointer', fontSize: 12 }}>
+                    transition ({leafRef.transitionHex.length / 2} B)
+                    {leafRef.prevGenesisHex && (
+                      <> + prev genesis ({leafRef.prevGenesisHex.length / 2} B)</>
+                    )}
+                  </summary>
+                  <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#555', wordBreak: 'break-all' }}>
+                    {leafRef.transitionHex.slice(0, 200)}…
                   </div>
                 </details>
               )}

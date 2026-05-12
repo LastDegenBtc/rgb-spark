@@ -58,6 +58,16 @@ export interface PathTweakEntry {
    *  client-side via `core.validateNiaConsignment` and cross-check that
    *  its contractId matches the msg the Spark leaf committed to. */
   consignmentHex?: string;
+  /** Optional strict-encoded `Transition` hex. Present only when the leaf
+   *  was minted bound to a NIA state transition (chunk-γ session 2). The
+   *  receiver validates with `core.validateNiaTransition(transitionHex,
+   *  prevGenesisHex)` and cross-checks the returned `transition.id()`
+   *  against `msg`. When set, [prevGenesisHex] is required for replay. */
+  transitionHex?: string;
+  /** Optional strict-encoded `Consignment<false>` of the genesis the
+   *  transition consumes. Receiver needs this to rebuild the input state
+   *  map for the rgb-consensus schema validator. */
+  prevGenesisHex?: string;
 }
 
 // currentLeafId -> { sourcePath, msg }. The signer reads this map to decide
@@ -81,7 +91,11 @@ export function setPathTweak(
   sourcePath: string,
   msg: Uint8Array,
   uBase: Uint8Array,
-  consignmentHex?: string,
+  extras?: {
+    consignmentHex?: string;
+    transitionHex?: string;
+    prevGenesisHex?: string;
+  },
 ): void {
   if (msg.length !== 32) {
     throw new Error(`RGB tweak msg must be 32 bytes, got ${msg.length}`);
@@ -89,7 +103,17 @@ export function setPathTweak(
   if (uBase.length !== 33) {
     throw new Error(`RGB tweak uBase must be 33 bytes compressed, got ${uBase.length}`);
   }
-  pathTweaks.set(currentLeafId, { sourcePath, msg, uBase, consignmentHex });
+  if (extras?.transitionHex && !extras.prevGenesisHex) {
+    throw new Error('setPathTweak: transitionHex requires prevGenesisHex for receiver replay');
+  }
+  pathTweaks.set(currentLeafId, {
+    sourcePath,
+    msg,
+    uBase,
+    consignmentHex: extras?.consignmentHex,
+    transitionHex: extras?.transitionHex,
+    prevGenesisHex: extras?.prevGenesisHex,
+  });
   notifyChange();
 }
 
@@ -114,6 +138,8 @@ export function listPathTweaks(): Array<{ currentLeafId: string } & PathTweakEnt
     msg: e.msg,
     uBase: e.uBase,
     consignmentHex: e.consignmentHex,
+    transitionHex: e.transitionHex,
+    prevGenesisHex: e.prevGenesisHex,
   }));
 }
 
@@ -129,11 +155,20 @@ export function restorePathTweaks(
     msg: Uint8Array;
     uBase: Uint8Array;
     consignmentHex?: string;
+    transitionHex?: string;
+    prevGenesisHex?: string;
   }>,
 ): void {
   pathTweaks.clear();
-  for (const { currentLeafId, sourcePath, msg, uBase, consignmentHex } of entries) {
-    pathTweaks.set(currentLeafId, { sourcePath, msg, uBase, consignmentHex });
+  for (const e of entries) {
+    pathTweaks.set(e.currentLeafId, {
+      sourcePath: e.sourcePath,
+      msg: e.msg,
+      uBase: e.uBase,
+      consignmentHex: e.consignmentHex,
+      transitionHex: e.transitionHex,
+      prevGenesisHex: e.prevGenesisHex,
+    });
   }
   // Intentionally skip notifyChange.
 }
