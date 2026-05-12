@@ -3,6 +3,15 @@ import { generateSecretKey, nip19 } from 'nostr-tools'
 import { addPublicKeys } from '@buildonspark/spark-sdk'
 import { parseLoginSecret, type ParsedLogin } from './lib/nostrKey'
 import {
+  readVault,
+  writeVault,
+  clearVault,
+  encryptSecret,
+  decryptSecret,
+  WrongPinError,
+  type EncryptedVault,
+} from './lib/secretVault'
+import {
   initSparkWallet,
   getBalance,
   disposeSparkWallet,
@@ -32,9 +41,26 @@ import './App.css'
 type Network = 'MAINNET' | 'REGTEST' | 'TESTNET'
 type BootState =
   | { kind: 'idle' }
+  | { kind: 'locked'; vault: EncryptedVault }
   | { kind: 'loading'; stage: string }
-  | { kind: 'ready'; parsed: ParsedLogin; wallet: WalletInitResult; balanceSats: bigint | 'pending' | 'error' }
+  | {
+      kind: 'ready'
+      parsed: ParsedLogin
+      wallet: WalletInitResult
+      balanceSats: bigint | 'pending' | 'error'
+      /** True if this boot came from decrypting a stored vault — disables the
+       *  "Save with PIN" prompt and labels Reset accordingly. */
+      cameFromVault: boolean
+      /** Flips when the user successfully saves the wallet to the vault from
+       *  within the ready view; collapses the save prompt. */
+      vaultJustSaved: boolean
+    }
   | { kind: 'error'; message: string }
+
+interface VaultPayload {
+  secret: string
+  network: Network
+}
 
 // "Demo" operator pubkey — pinned to scoping vector v1. Used only by the
 // legacy demo mode (v2 envelope, identityPubkey as u_base). Real Spark
@@ -88,15 +114,23 @@ type ConsignmentEnvelope =
 function App() {
   const [secret, setSecret] = useState('')
   const [network, setNetwork] = useState<Network>('REGTEST')
-  const [state, setState] = useState<BootState>({ kind: 'idle' })
+  // Lazy initial state: if a vault was previously written, start on the locked
+  // screen. Doing this at first-render (instead of in useEffect) avoids a flash
+  // of the input form and satisfies react-hooks/set-state-in-effect.
+  const [state, setState] = useState<BootState>(() => {
+    const v = readVault()
+    return v ? { kind: 'locked', vault: v } : { kind: 'idle' }
+  })
 
-  async function bootFromInput(input: string) {
+  async function bootFromInput(input: string, opts?: { network?: Network; cameFromVault?: boolean }) {
+    const net = opts?.network ?? network
+    const cameFromVault = opts?.cameFromVault ?? false
     setState({ kind: 'loading', stage: 'parsing secret' })
     try {
       const parsed = parseLoginSecret(input)
-      setState({ kind: 'loading', stage: `initializing Spark wallet on ${network}` })
-      const wallet = await initSparkWallet(parsed.sparkSeed, network)
-      setState({ kind: 'ready', parsed, wallet, balanceSats: 'pending' })
+      setState({ kind: 'loading', stage: `initializing Spark wallet on ${net}` })
+      const wallet = await initSparkWallet(parsed.sparkSeed, net)
+      setState({ kind: 'ready', parsed, wallet, balanceSats: 'pending', cameFromVault, vaultJustSaved: false })
       try {
         const sats = await getBalance()
         setState((prev) => prev.kind === 'ready' ? { ...prev, balanceSats: sats } : prev)
@@ -108,6 +142,24 @@ function App() {
     }
   }
 
+  async function unlockWithPin(vault: EncryptedVault, pin: string) {
+    // Decrypt outside the ready-state machine so a wrong PIN can be retried
+    // without bouncing through 'error' (which sends the user back to the input
+    // form and asks them to paste a secret).
+    const payloadJson = await decryptSecret(vault, pin)
+    const payload = JSON.parse(payloadJson) as VaultPayload
+    setNetwork(payload.network)
+    await bootFromInput(payload.secret, { network: payload.network, cameFromVault: true })
+  }
+
+  async function saveCurrentToVault(pin: string) {
+    if (state.kind !== 'ready') throw new Error('save: wallet not ready')
+    const payload: VaultPayload = { secret: state.parsed.nsec, network: state.wallet.network as Network }
+    const vault = await encryptSecret(JSON.stringify(payload), pin, state.parsed.npub)
+    writeVault(vault)
+    setState((prev) => prev.kind === 'ready' ? { ...prev, vaultJustSaved: true } : prev)
+  }
+
   function generateAndBoot() {
     const sk = generateSecretKey()
     const nsec = nip19.nsecEncode(sk)
@@ -117,6 +169,7 @@ function App() {
 
   async function reset() {
     await disposeSparkWallet()
+    clearVault()
     setSecret('')
     setState({ kind: 'idle' })
   }
@@ -131,7 +184,15 @@ function App() {
         No persistence: reload regenerates.
       </p>
 
-      {state.kind !== 'ready' && (
+      {state.kind === 'locked' && (
+        <LockedScreen
+          vault={state.vault}
+          onUnlock={(pin) => unlockWithPin(state.vault, pin)}
+          onForget={() => void reset()}
+        />
+      )}
+
+      {state.kind !== 'ready' && state.kind !== 'locked' && (
         <>
           <label style={{ display: 'block', fontSize: 13, marginBottom: 4, marginTop: 16 }}>
             Mnemonic (12/24 words), nsec1…, or 64 hex
@@ -182,7 +243,9 @@ function App() {
         <div style={{ marginTop: 16 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <h2 style={{ margin: 0 }}>booted · {state.wallet.network}</h2>
-            <button onClick={() => void reset()}>Reset</button>
+            <button onClick={() => void reset()}>
+              {state.cameFromVault || state.vaultJustSaved ? 'Forget wallet' : 'Reset'}
+            </button>
           </div>
           <KV label="login kind"          value={state.parsed.kind} />
           <KV label="npub"                value={state.parsed.npub} mono />
@@ -198,6 +261,20 @@ function App() {
               state.balanceSats.toString()
             }
           />
+
+          {!state.cameFromVault && !state.vaultJustSaved && (
+            <SaveWithPin onSave={saveCurrentToVault} />
+          )}
+          {state.vaultJustSaved && (
+            <div style={{ marginTop: 12, padding: 8, background: '#e8f5e9', border: '1px solid #a5d6a7', fontSize: 13 }}>
+              Wallet saved. Next reload will ask for your PIN.
+            </div>
+          )}
+          {state.cameFromVault && (
+            <div style={{ marginTop: 12, fontSize: 12, color: '#888' }}>
+              Unlocked from PIN-encrypted vault.
+            </div>
+          )}
 
           <ConsignmentLab
             myNpub={state.parsed.npub}
@@ -797,6 +874,137 @@ function DecodedView({ entry }: { entry: DecodedConsignment }) {
         <div style={{ wordBreak: 'break-all' }}>{entry.raw}</div>
       </details>
     </div>
+  )
+}
+
+// ---- Locked screen (vault present, awaiting PIN) ---------------------------
+
+function LockedScreen({
+  vault,
+  onUnlock,
+  onForget,
+}: {
+  vault: EncryptedVault
+  onUnlock: (pin: string) => Promise<void>
+  onForget: () => void
+}) {
+  const [pin, setPin] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  async function submit() {
+    if (!pin) return
+    setBusy(true)
+    setErr(null)
+    try {
+      await onUnlock(pin)
+    } catch (e) {
+      if (e instanceof WrongPinError) {
+        setErr('Wrong PIN')
+      } else {
+        setErr(e instanceof Error ? e.message : String(e))
+      }
+      setPin('')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div style={{ marginTop: 16 }}>
+      <h2 style={{ margin: '0 0 6px 0' }}>Locked</h2>
+      <p style={{ color: '#666', fontSize: 13, margin: '0 0 12px 0' }}>
+        Vault present for npub <code>{vault.npubFp ?? '???????'}…</code> · enter PIN to unlock.
+      </p>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <input
+          type="password"
+          inputMode="numeric"
+          autoComplete="current-password"
+          autoFocus
+          value={pin}
+          onChange={(e) => setPin(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') void submit() }}
+          placeholder="PIN"
+          style={{ flex: 1, fontFamily: 'monospace', fontSize: 14, padding: '6px 8px' }}
+          disabled={busy}
+        />
+        <button onClick={() => void submit()} disabled={busy || !pin}>
+          {busy ? 'unlocking…' : 'Unlock'}
+        </button>
+      </div>
+      {err && <pre style={{ color: 'crimson', whiteSpace: 'pre-wrap', marginTop: 8 }}>{err}</pre>}
+      <button
+        onClick={onForget}
+        style={{ marginTop: 16, fontSize: 12, color: '#a06010', background: 'transparent', border: 'none', cursor: 'pointer', textDecoration: 'underline' }}
+      >
+        Forget this wallet (clears the vault)
+      </button>
+    </div>
+  )
+}
+
+// ---- Save with PIN (offered in ready view when no vault exists) ------------
+
+function SaveWithPin({ onSave }: { onSave: (pin: string) => Promise<void> }) {
+  const [pin, setPin] = useState('')
+  const [pin2, setPin2] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  async function submit() {
+    setErr(null)
+    if (!pin) return
+    if (pin !== pin2) {
+      setErr('PINs do not match')
+      return
+    }
+    setBusy(true)
+    try {
+      await onSave(pin)
+      setPin('')
+      setPin2('')
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <fieldset style={{ marginTop: 16, border: '1px solid #ddd', padding: '10px 12px' }}>
+      <legend style={{ fontSize: 12, color: '#666' }}>persist with PIN (optional)</legend>
+      <p style={{ fontSize: 12, color: '#666', margin: '0 0 8px 0' }}>
+        Encrypts your nsec with the chosen PIN (PBKDF2-SHA256 600k + AES-GCM) and
+        stores it in this browser's localStorage. Next reload asks for the PIN
+        instead of regenerating.
+      </p>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <input
+          type="password"
+          inputMode="numeric"
+          value={pin}
+          onChange={(e) => setPin(e.target.value)}
+          placeholder="PIN"
+          style={{ flex: '1 1 120px', fontFamily: 'monospace', fontSize: 13, padding: '6px 8px' }}
+          disabled={busy}
+        />
+        <input
+          type="password"
+          inputMode="numeric"
+          value={pin2}
+          onChange={(e) => setPin2(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') void submit() }}
+          placeholder="confirm PIN"
+          style={{ flex: '1 1 120px', fontFamily: 'monospace', fontSize: 13, padding: '6px 8px' }}
+          disabled={busy}
+        />
+        <button onClick={() => void submit()} disabled={busy || !pin}>
+          {busy ? 'saving…' : 'Save with PIN'}
+        </button>
+      </div>
+      {err && <div style={{ color: 'crimson', fontSize: 12, marginTop: 6 }}>{err}</div>}
+    </fieldset>
   )
 }
 
