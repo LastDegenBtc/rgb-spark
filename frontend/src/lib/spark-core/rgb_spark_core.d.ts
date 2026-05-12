@@ -45,6 +45,26 @@ export function deriveUTweaked(u_base_hex: string, msg_hex: string): string;
  */
 export function deriveVerifyingKey(u_base_hex: string, msg_hex: string, operator_hex: string): string;
 
+/**
+ * Build a Non-Inflatable Asset (NIA) contract genesis programmatically
+ * and return the deterministic 32-byte contractId as hex.
+ *
+ * The contractId is the canonical RGB identifier for the issued asset and
+ * serves as the `msg` we bind a Spark leaf to via the Spark-UTK mint flow.
+ * Same inputs always produce the same id (modulo `beneficiary_vout` and the
+ * random nonce inside `GenesisSeal::new_random`, which IS non-deterministic;
+ * callers wanting a reproducible id should round-trip the genesis instead).
+ *
+ * `ticker` / `name`: human-readable asset metadata (e.g. "TEST", "Test Asset").
+ * `supply`: issued supply at genesis (allocated entirely to the beneficiary).
+ * `beneficiary_txid_hex` / `beneficiary_vout`: the L1 outpoint that will
+ * receive the asset at issuance. For Spark-UTK use, this is typically a
+ * dummy/placeholder outpoint — we care about the contractId, not the seal.
+ * `timestamp_secs`: unix timestamp for the genesis (caller-provided to
+ * avoid relying on chrono's wasm time source).
+ */
+export function issueNiaContract(ticker: string, name: string, supply: bigint, beneficiary_txid_hex: string, beneficiary_vout: number, timestamp_secs: bigint): string;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -53,6 +73,7 @@ export interface InitOutput {
     readonly deriveOutputXonly: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly deriveUTweaked: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly deriveVerifyingKey: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly issueNiaContract: (a: number, b: number, c: number, d: number, e: bigint, f: number, g: number, h: number, i: bigint) => [number, number, number, number];
     readonly sparkutkproofjs_decode: (a: number, b: number) => [number, number, number];
     readonly sparkutkproofjs_encode: (a: number) => [number, number, number, number];
     readonly sparkutkproofjs_new: (a: number, b: number, c: number, d: number) => [number, number, number];
@@ -62,6 +83,8 @@ export interface InitOutput {
     readonly rustsecp256k1_v0_10_0_context_destroy: (a: number) => void;
     readonly rustsecp256k1_v0_10_0_default_error_callback_fn: (a: number, b: number) => void;
     readonly rustsecp256k1_v0_10_0_default_illegal_callback_fn: (a: number, b: number) => void;
+    readonly __wbindgen_exn_store: (a: number) => void;
+    readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;

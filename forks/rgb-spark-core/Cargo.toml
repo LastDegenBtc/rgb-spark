@@ -19,6 +19,14 @@ amplify = "~4.8.0"
 wasm-bindgen = "0.2"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
+# RGB state-transition layer — chunk-β/γ. Used to build a real RGB
+# issuance whose contractId / Merkle root we feed into the Spark-UTK
+# mint as `msg`. default-features off so we don't drag in any
+# electrum/esplora/sqlite/fs path that wouldn't WASM-compile.
+rgb-consensus = { version = "0.11.1-rc.6", default-features = false }
+rgb-ops = { version = "0.11.1-rc.6", default-features = false }
+rgb-schemas = { version = "0.11.1-rc.5", default-features = false }
+
 # secp256k1 pulls rand → rand_core → getrandom 0.2 (different feature
 # name "js"); newer crates land on getrandom 0.3 ("wasm_js"). Both must
 # be wired for wasm32 — the dep graph has them as two distinct crates.

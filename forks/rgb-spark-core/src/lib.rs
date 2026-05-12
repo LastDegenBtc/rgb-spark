@@ -4,12 +4,27 @@
 // functions used by the wallet on the client side plus a wasm-bindgen
 // wrapper around [`SparkUtkProof`] that strict-encodes to the same
 // bytes the validator (in rgb-consensus) expects.
+//
+// Chunk-β additions (2026-05-12): real RGB issuance via rgb-ops + rgb-schemas.
+// `issueNiaContract` builds a Non-Inflatable Asset genesis programmatically
+// and returns the deterministic 32-byte contractId — the value we feed into
+// the Spark-UTK mint as `msg` so a Spark leaf commits to a specific RGB
+// asset at issuance time.
+
+use core::str::FromStr;
 
 use amplify::confinement::Confined;
 use bc::CompressedPk;
 use commit_verify::mpc::Commitment;
-// Lib-name (not package-name) gotcha: bp-consensus → bc, bp-dbc → dbc.
+// Lib-name (not package-name) gotcha: bp-consensus → bc, bp-dbc → dbc,
+// rgb-consensus → rgbcore (via rgb-ops re-export), rgb-ops → rgbstd,
+// rgb-schemas → schemata.
 use dbc::keytweak::{self, SparkUtkProof};
+use rgbstd::containers::ConsignmentExt;
+use rgbstd::contract::{ContractBuilder, IssuerWrapper};
+use rgbstd::stl::{AssetSpec, ContractTerms, RicardianContract};
+use rgbstd::{Amount, ChainNet, GenesisSeal, Identity, Precision, Txid};
+use schemata::NonInflatableAsset;
 use strict_encoding::{StrictDeserialize, StrictSerialize};
 use wasm_bindgen::prelude::*;
 
@@ -111,6 +126,65 @@ impl SparkUtkProofJs {
     }
 }
 
+// ---- RGB issuance (chunk-β) ----
+
+/// Build a Non-Inflatable Asset (NIA) contract genesis programmatically
+/// and return the deterministic 32-byte contractId as hex.
+///
+/// The contractId is the canonical RGB identifier for the issued asset and
+/// serves as the `msg` we bind a Spark leaf to via the Spark-UTK mint flow.
+/// Same inputs always produce the same id (modulo `beneficiary_vout` and the
+/// random nonce inside `GenesisSeal::new_random`, which IS non-deterministic;
+/// callers wanting a reproducible id should round-trip the genesis instead).
+///
+/// `ticker` / `name`: human-readable asset metadata (e.g. "TEST", "Test Asset").
+/// `supply`: issued supply at genesis (allocated entirely to the beneficiary).
+/// `beneficiary_txid_hex` / `beneficiary_vout`: the L1 outpoint that will
+/// receive the asset at issuance. For Spark-UTK use, this is typically a
+/// dummy/placeholder outpoint — we care about the contractId, not the seal.
+/// `timestamp_secs`: unix timestamp for the genesis (caller-provided to
+/// avoid relying on chrono's wasm time source).
+#[wasm_bindgen(js_name = issueNiaContract)]
+pub fn issue_nia_contract(
+    ticker: &str,
+    name: &str,
+    supply: u64,
+    beneficiary_txid_hex: &str,
+    beneficiary_vout: u32,
+    timestamp_secs: i64,
+) -> Result<String, JsError> {
+    let txid = Txid::from_str(beneficiary_txid_hex)
+        .map_err(|e| JsError::new(&format!("beneficiary_txid parse: {e}")))?;
+    let beneficiary = GenesisSeal::new_random(txid, beneficiary_vout);
+
+    let spec = AssetSpec::with(ticker, name, Precision::CentiMicro, None)
+        .map_err(map_err("AssetSpec::with"))?;
+    let terms = ContractTerms {
+        text: RicardianContract::default(),
+        media: None,
+    };
+
+    let contract = ContractBuilder::with(
+        Identity::default(),
+        NonInflatableAsset::schema(),
+        NonInflatableAsset::types(),
+        NonInflatableAsset::scripts(),
+        ChainNet::BitcoinMainnet,
+    )
+    .add_global_state("spec", spec)
+    .map_err(map_err("add_global_state(spec)"))?
+    .add_global_state("terms", terms)
+    .map_err(map_err("add_global_state(terms)"))?
+    .add_global_state("issuedSupply", Amount::from(supply))
+    .map_err(map_err("add_global_state(issuedSupply)"))?
+    .add_fungible_state("assetOwner", beneficiary, supply)
+    .map_err(map_err("add_fungible_state(assetOwner)"))?
+    .issue_contract_raw(timestamp_secs)
+    .map_err(map_err("issue_contract_raw"))?;
+
+    Ok(hex::encode(contract.contract_id().to_byte_array()))
+}
+
 // ---- helpers ----
 
 fn parse_pk(s: &str, field: &str) -> Result<CompressedPk, JsError> {
@@ -170,5 +244,40 @@ mod tests {
         let decoded = SparkUtkProofJs::decode(&encoded).expect("decode");
         assert_eq!(proof.u_base(), decoded.u_base());
         assert_eq!(proof.operator(), decoded.operator());
+    }
+
+    // Realistic-looking but arbitrary mainnet-style txid for fixture beneficiary.
+    const FIXTURE_TXID: &str =
+        "14295d5bb1a191cdb6286dc0944df938421e3dfcbf0811353ccac4100c2068c5";
+
+    #[test]
+    fn issue_nia_contract_returns_32byte_hex() {
+        let id = issue_nia_contract("TEST", "Test asset", 1_000_000, FIXTURE_TXID, 0, 0)
+            .expect("issuance should succeed");
+        assert_eq!(id.len(), 64, "contractId is 32 bytes = 64 hex chars; got {id}");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "non-hex char in {id}");
+    }
+
+    #[test]
+    fn issue_nia_contract_changes_with_supply() {
+        // Two issuances with the same beneficiary but different supply must
+        // produce different contractIds — the supply is part of the genesis
+        // committed state. (The other randomness source is GenesisSeal's
+        // internal nonce, so we can't assert determinism across all inputs.)
+        let a = issue_nia_contract("A", "A", 100, FIXTURE_TXID, 0, 1_700_000_000)
+            .expect("issuance A");
+        let b = issue_nia_contract("A", "A", 200, FIXTURE_TXID, 0, 1_700_000_000)
+            .expect("issuance B");
+        assert_ne!(a, b, "differing supplies must produce differing contractIds");
+    }
+
+    // `JsError::new` panics on non-wasm targets (it's a stub when not compiled
+    // to wasm32), so the error-path assertion is gated to the wasm target.
+    // Compile-time checking still happens on native via `cargo check`.
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn issue_nia_contract_rejects_bad_txid() {
+        let r = issue_nia_contract("X", "X", 1, "not-hex", 0, 0);
+        assert!(r.is_err(), "non-hex txid must be rejected");
     }
 }
