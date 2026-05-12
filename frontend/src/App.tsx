@@ -20,6 +20,13 @@ import {
   type ConsignmentMeta,
   type RelayHealth,
 } from './lib/consignmentRelay'
+import {
+  signEnvelope,
+  verifyEnvelope,
+  type UnsignedEnvelopeV4,
+  type SignedEnvelopeV4,
+  type SignatureCheck,
+} from './lib/envelopeSign'
 import './App.css'
 
 type Network = 'MAINNET' | 'REGTEST' | 'TESTNET'
@@ -76,6 +83,7 @@ type ConsignmentEnvelope =
       proofHex: string
       leafReference: LeafReference
     }
+  | (SignedEnvelopeV4 & { kind: 'spark-utk-proof' })
 
 function App() {
   const [secret, setSecret] = useState('')
@@ -194,6 +202,7 @@ function App() {
           <ConsignmentLab
             myNpub={state.parsed.npub}
             myIdentityPubkey={state.wallet.identityPubkey}
+            myNostrPrivkeyHex={state.parsed.nostrPrivkeyHex}
           />
         </div>
       )}
@@ -221,12 +230,21 @@ interface DecodedConsignment {
   proofUBase?: string
   proofOperator?: string
   leafVerification?: LeafVerification
+  signatureCheck?: SignatureCheck
   parseError?: string
 }
 
 type LabMode = 'demo' | 'leaf'
 
-function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdentityPubkey: string }) {
+function ConsignmentLab({
+  myNpub,
+  myIdentityPubkey,
+  myNostrPrivkeyHex,
+}: {
+  myNpub: string
+  myIdentityPubkey: string
+  myNostrPrivkeyHex: string
+}) {
   const [core, setCore] = useState<SparkCore | null>(null)
   const [coreErr, setCoreErr] = useState<string | null>(null)
   const [health, setHealth] = useState<RelayHealth | null>(null)
@@ -302,7 +320,7 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
       const t = target.trim()
       if (!t) throw new Error('target npub is empty')
 
-      let envelope: ConsignmentEnvelope
+      let unsigned: UnsignedEnvelopeV4
       if (mode === 'leaf') {
         if (!selectedLeaf) throw new Error('no leaf selected — fund the wallet or switch to demo mode')
         const uBase = selectedLeaf.ownerSigningPublicKey.toLowerCase()
@@ -316,8 +334,8 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
         const proof = new core.SparkUtkProofJs(uBase, operator)
         const proofHex = proof.encode()
         proof.free()
-        envelope = {
-          v: 3,
+        unsigned = {
+          v: 4,
           sender: myNpub,
           senderIdentityPubkey: myIdentityPubkey.toLowerCase(),
           createdAt: new Date().toISOString(),
@@ -344,8 +362,8 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
         const proof = new core.SparkUtkProofJs(uBase, DEMO_OPERATOR)
         const proofHex = proof.encode()
         proof.free()
-        envelope = {
-          v: 2,
+        unsigned = {
+          v: 4,
           sender: myNpub,
           senderIdentityPubkey: uBase,
           createdAt: new Date().toISOString(),
@@ -353,6 +371,8 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
           proofHex,
         }
       }
+      const senderSignature = signEnvelope(unsigned, myNostrPrivkeyHex)
+      const envelope: ConsignmentEnvelope = { ...unsigned, senderSignature, kind: 'spark-utk-proof' }
 
       const bytes = new TextEncoder().encode(JSON.stringify(envelope))
       const meta = await postConsignment(t, bytes)
@@ -379,8 +399,12 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
         const proofUBase = proof.uBase
         const proofOperator = proof.operator
         proof.free()
+        const leafRef =
+          env.v === 3 ? env.leafReference :
+          env.v === 4 ? env.leafReference :
+          undefined
         let leafVerification: LeafVerification = { kind: 'none' }
-        if (env.v === 3 && env.leafReference) {
+        if (leafRef) {
           try {
             // Spark vanilla leaf invariant (matches SDK's own SparkWallet.verifyKey):
             //   verifyingPublicKey === ownerSigningPublicKey + signingKeyshare.publicKey
@@ -389,7 +413,7 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
             // creation, which the stock SDK doesn't expose (chunk-α-bis).
             const derivedBytes = addPublicKeys(hexToBytes(proofUBase), hexToBytes(proofOperator))
             const derived = bytesToHex(derivedBytes).toLowerCase()
-            const claimed = env.leafReference.verifyingPublicKey.toLowerCase()
+            const claimed = leafRef.verifyingPublicKey.toLowerCase()
             leafVerification = derived === claimed
               ? { kind: 'ok', derivedVerifyingKey: derived }
               : { kind: 'mismatch', expected: claimed, got: derived }
@@ -397,12 +421,15 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
             leafVerification = { kind: 'error', message: e instanceof Error ? e.message : String(e) }
           }
         }
+        const signatureCheck: SignatureCheck =
+          env.v === 4 ? verifyEnvelope(env) : { kind: 'missing' }
         entry = {
           raw: rawHex,
           envelope: env,
           proofUBase,
           proofOperator,
           leafVerification,
+          signatureCheck,
         }
       } catch (e) {
         entry.parseError = e instanceof Error ? e.message : String(e)
@@ -623,8 +650,8 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
         </summary>
         <ul style={{ margin: '6px 0 0 0', paddingLeft: 18, fontSize: 12, color: '#665030' }}>
           <li>
-            <strong>Spark vanilla, not Spark-UTK</strong>: v3 verifies the
-            relation <code>u_base + operator == leaf.verifyingPublicKey</code>{' '}
+            <strong>Spark vanilla, not Spark-UTK</strong>: leaf-backed envelopes
+            verify <code>u_base + operator == leaf.verifyingPublicKey</code>{' '}
             — that's Spark's own leaf-key invariant (the SDK calls it
             <code> SparkWallet.verifyKey</code>). It proves the proof refers
             to a real Spark leaf, but the leaf does <em>not</em> yet carry an
@@ -634,9 +661,12 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
             doesn't expose that hook → SDK fork = chunk-α-bis.
           </li>
           <li>
-            <strong>envelope unsigned</strong>: anyone can claim any
-            <code> senderIdentityPubkey</code> / leaf reference. Real binding
-            needs the envelope signed with the sender's nsec (step 9d).
+            <strong>signature scope</strong>: v4's BIP-340 schnorr signature
+            covers the canonical bytes of every envelope field except the
+            signature itself. It proves the holder of the sender's nsec
+            authored this exact envelope (incl. proofHex + leaf reference).
+            It does <em>not</em> prove the leaf belongs to that nsec — that's
+            still the leaf-binding check above.
           </li>
           <li>
             <strong>no RGB validator yet</strong>: rgb-consensus state-transition
@@ -650,6 +680,10 @@ function ConsignmentLab({ myNpub, myIdentityPubkey }: { myNpub: string; myIdenti
 
 function DecodedView({ entry }: { entry: DecodedConsignment }) {
   const env = entry.envelope
+  const leafRef =
+    env?.v === 3 ? env.leafReference :
+    env?.v === 4 ? env.leafReference :
+    undefined
   const claimed = env?.senderIdentityPubkey?.toLowerCase()
   const got = entry.proofUBase?.toLowerCase()
   let bindingBadge: ReactNode = null
@@ -658,11 +692,10 @@ function DecodedView({ entry }: { entry: DecodedConsignment }) {
       bindingBadge = <span style={{ color: '#888' }}>envelope has no senderIdentityPubkey (legacy v1)</span>
     } else if (claimed === got) {
       bindingBadge = <span style={{ color: 'seagreen' }}>OK · proof.u_base matches claimed Spark identity</span>
-    } else if (env.v === 3) {
-      // v3 binds u_base to the *leaf*, not the wallet identity — so a difference
-      // is expected. Don't mark it as MISMATCH; defer the trust badge to leaf
-      // verification below.
-      bindingBadge = <span style={{ color: '#888' }}>n/a · v3 binds u_base to the leaf, not the wallet identity</span>
+    } else if (leafRef) {
+      // Leaf-backed envelopes bind u_base to the *leaf*, not the wallet identity —
+      // a difference is expected. Defer the trust badge to leaf verification below.
+      bindingBadge = <span style={{ color: '#888' }}>n/a · leaf-backed envelope binds u_base to the leaf, not the wallet identity</span>
     } else {
       bindingBadge = <span style={{ color: '#c80' }}>MISMATCH · proof.u_base ≠ envelope.senderIdentityPubkey</span>
     }
@@ -670,7 +703,7 @@ function DecodedView({ entry }: { entry: DecodedConsignment }) {
 
   const lv = entry.leafVerification
   let leafBadge: ReactNode = null
-  if (env?.v === 3 && lv) {
+  if (leafRef && lv) {
     if (lv.kind === 'ok') {
       leafBadge = (
         <span style={{ color: 'seagreen' }}>
@@ -685,6 +718,26 @@ function DecodedView({ entry }: { entry: DecodedConsignment }) {
       )
     } else if (lv.kind === 'error') {
       leafBadge = <span style={{ color: 'crimson' }}>derive error · {lv.message}</span>
+    }
+  }
+
+  const sc = entry.signatureCheck
+  let signatureBadge: ReactNode = null
+  if (sc) {
+    if (sc.kind === 'ok') {
+      signatureBadge = (
+        <span style={{ color: 'seagreen' }}>
+          OK · BIP-340 schnorr signature verified against sender npub
+        </span>
+      )
+    } else if (sc.kind === 'fail') {
+      signatureBadge = (
+        <span style={{ color: '#c00' }}>FAIL · {sc.reason}</span>
+      )
+    } else if (sc.kind === 'missing') {
+      signatureBadge = (
+        <span style={{ color: '#888' }}>n/a · pre-v4 envelope, no signature field</span>
+      )
     }
   }
 
@@ -705,15 +758,15 @@ function DecodedView({ entry }: { entry: DecodedConsignment }) {
           <div style={{ marginTop: 4 }}>
             <span style={{ color: '#666' }}>identity binding:</span> {bindingBadge}
           </div>
-          {env.v === 3 && (
+          {leafRef && (
             <>
               <div style={{ marginTop: 6, color: '#666' }}>leafReference:</div>
               <div style={{ paddingLeft: 8 }}>
-                <div>id: {env.leafReference.id}</div>
-                <div>treeId: {env.leafReference.treeId}</div>
-                <div>value: {env.leafReference.value} sats</div>
-                <div>network: {env.leafReference.network}</div>
-                <div>verifyingPublicKey: {env.leafReference.verifyingPublicKey}</div>
+                <div>id: {leafRef.id}</div>
+                <div>treeId: {leafRef.treeId}</div>
+                <div>value: {leafRef.value} sats</div>
+                <div>network: {leafRef.network}</div>
+                <div>verifyingPublicKey: {leafRef.verifyingPublicKey}</div>
                 {lv?.kind === 'ok' && (
                   <div>computed (u_base + operator): {lv.derivedVerifyingKey}</div>
                 )}
@@ -729,6 +782,14 @@ function DecodedView({ entry }: { entry: DecodedConsignment }) {
               </div>
             </>
           )}
+          {env.v === 4 && (
+            <div style={{ marginTop: 6, color: '#666', wordBreak: 'break-all' }}>
+              senderSignature: <span style={{ color: '#222' }}>{env.senderSignature}</span>
+            </div>
+          )}
+          <div style={{ marginTop: 4 }}>
+            <span style={{ color: '#666' }}>signature:</span> {signatureBadge}
+          </div>
         </>
       )}
       <details style={{ marginTop: 4 }}>
