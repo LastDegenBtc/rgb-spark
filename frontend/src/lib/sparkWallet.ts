@@ -5,8 +5,9 @@
 // for the unified-seed rationale). Spark accepts a Uint8Array for
 // `mnemonicOrSeed` and runs its own HD derivation on top.
 
-import { SparkWallet } from '@buildonspark/spark-sdk';
+import { SparkWallet, KeyDerivationType } from '@buildonspark/spark-sdk';
 import type { SparkSigner } from '@buildonspark/spark-sdk';
+import { setPathTweak, clearPathTweak } from './rgbAwareSigner';
 
 type Network = 'MAINNET' | 'REGTEST' | 'TESTNET';
 
@@ -307,6 +308,141 @@ export async function claimL1Deposit(txid: string): Promise<ClaimL1Result> {
   const leaves = await walletInstance.claimDeposit(txid);
   const totalSats = leaves.reduce((sum, l) => sum + Number(l.value ?? 0), 0);
   return { totalSats, leafCount: leaves.length };
+}
+
+// ----- Spark-UTK mint via self-transfer (chunk-α-bis rev v2) -----------------
+//
+// Why this exists: tweaking during `claimDeposit` is rejected by the SE
+// because the L1 P2TR scriptPubKey commits to U_base — see
+// project_spark_deposit_owner_check.md. The only safe place to apply a
+// Spark-UTK tweak is the *receiver side of a Spark→Spark transfer*, where
+// the destination signing pubkey is not L1-pinned and the SE persists
+// whatever we declare.
+//
+// To make this work without touching the SDK source we:
+//   1. Send to our own sparkAddress via `transferService.sendTransferV3`
+//      with the signer's pathTweaks empty (source leaf must sign vanilla).
+//   2. Add `leafId → msg` to pathTweaks.
+//   3. Manually call `transferService.claimTransfer` — during the claim's
+//      `newKeyDerivation = { LEAF, path: leafId }` lookup, the signer sees
+//      the path is tweaked and returns U_tweaked. The SE persists the new
+//      leaf with `verifyingPublicKey = U_tweaked + operator`.
+//   4. Remove the path from pathTweaks immediately.
+//
+// We bypass `walletInstance.transfer` because that method bundles send+claim
+// inline for self-transfers and we need to interpose pathTweaks state
+// between the two phases. `transferService` is protected on the wallet, but
+// JS visibility doesn't enforce it — we cast through `unknown`.
+
+export interface MintViaSelfTransferResult {
+  transferId: string;
+  leaf: SparkLeafRow;
+}
+
+// Minimal shape of a Spark TreeNode (SDK type) we need from the claim's
+// return value. Everything is bytes/strings off the proto.
+interface SparkClaimedNode {
+  id: string;
+  value: number;
+  network: string;
+  ownerSigningPublicKey: Uint8Array;
+  verifyingPublicKey: Uint8Array;
+  signingKeyshare?: { publicKey?: Uint8Array };
+}
+
+interface SparkWalletInternals {
+  transferService: {
+    sendTransferV3: (leaves: unknown[]) => Promise<{ id: string }>;
+    queryTransfer: (transferId: string) => Promise<unknown>;
+    claimTransfer: (transfer: unknown) => Promise<unknown>;
+  };
+  // Private on the wallet but accessible at runtime. We use it because it
+  // (a) wraps the SDK claim in a mutex, (b) returns the new TreeNodes directly
+  // from processClaimedTransferResults, which is critical: listSparkLeaves()
+  // re-queries the SE and applies a verifyKey filter that drops our tweaked
+  // leaf (its persisted pubkey doesn't match a vanilla HD derivation from
+  // the new leaf id). The claim's return value is the only place we see the
+  // freshly-minted tweaked leaf without that filter.
+  claimTransfer: (opts: { transfer: unknown; emit?: boolean }) => Promise<SparkClaimedNode[]>;
+}
+
+export async function mintViaSelfTransfer(
+  leafId: string,
+  msgBytes: Uint8Array,
+): Promise<MintViaSelfTransferResult> {
+  if (!walletInstance) throw new Error('Wallet not initialized');
+  if (msgBytes.length !== 32) {
+    throw new Error(`mint msg must be 32 bytes, got ${msgBytes.length}`);
+  }
+
+  const allLeaves = await walletInstance.getLeaves(true);
+  const sourceLeaf = allLeaves.find((l) => String(l.id) === leafId);
+  if (!sourceLeaf) {
+    throw new Error(`leaf ${leafId} not found in wallet`);
+  }
+
+  // wallet.getIdentityPublicKey() returns a hex string; the SDK's internal
+  // LeafKeyTweak expects a 33-byte Uint8Array. Decode here.
+  const identityPubkeyHex = await walletInstance.getIdentityPublicKey();
+  if (identityPubkeyHex.length !== 66) {
+    throw new Error(`identityPubkey must be 33 bytes (66 hex), got ${identityPubkeyHex.length} hex chars`);
+  }
+  const identityPubkey = new Uint8Array(33);
+  for (let i = 0; i < 33; i++) {
+    identityPubkey[i] = parseInt(identityPubkeyHex.substr(i * 2, 2), 16);
+  }
+
+  const internals = walletInstance as unknown as SparkWalletInternals;
+  const transferService = internals.transferService;
+  if (!transferService) {
+    throw new Error('transferService not accessible on walletInstance');
+  }
+
+  // 1. Send phase — pathTweaks empty, source signs vanilla.
+  const leafKeyTweak = {
+    leaf: sourceLeaf,
+    keyDerivation: { type: KeyDerivationType.LEAF, path: leafId },
+    newKeyDerivation: { type: KeyDerivationType.RANDOM },
+    receiverIdentityPublicKey: identityPubkey,
+  };
+  const transfer = await transferService.sendTransferV3([leafKeyTweak]);
+
+  // 2-4. Tweaked-claim phase, narrowly scoped. wallet.claimTransfer returns
+  //      the freshly-registered TreeNodes — we read the new leaf from there
+  //      rather than re-listing via getLeaves() (which validates against
+  //      vanilla HD derivation and drops our tweaked leaf).
+  setPathTweak(leafId, msgBytes);
+  let claimedNodes: SparkClaimedNode[];
+  try {
+    const pending = await transferService.queryTransfer(transfer.id);
+    if (!pending) {
+      throw new Error(`pending transfer ${transfer.id} not found after sendTransferV3`);
+    }
+    claimedNodes = await internals.claimTransfer({ transfer: pending, emit: false });
+  } finally {
+    clearPathTweak(leafId);
+  }
+
+  if (claimedNodes.length === 0) {
+    throw new Error(`claimTransfer returned no nodes for source ${leafId}`);
+  }
+  // For a single-leaf self-transfer there should be exactly one new node.
+  const expectedValue = Number(sourceLeaf.value ?? 0);
+  const newNode =
+    claimedNodes.find((n) => n.value === expectedValue) ?? claimedNodes[0];
+
+  const newLeaf: SparkLeafRow = {
+    id: String(newNode.id),
+    treeId: String((newNode as unknown as { treeId?: string }).treeId ?? ''),
+    value: Number(newNode.value ?? 0),
+    status: String((newNode as unknown as { status?: string }).status ?? ''),
+    network: String(newNode.network ?? ''),
+    ownerSigningPublicKey: bytesToHex(newNode.ownerSigningPublicKey),
+    operatorPublicKey: bytesToHex(newNode.signingKeyshare?.publicKey),
+    verifyingPublicKey: bytesToHex(newNode.verifyingPublicKey),
+  };
+
+  return { transferId: transfer.id, leaf: newLeaf };
 }
 
 export async function disposeSparkWallet(): Promise<void> {

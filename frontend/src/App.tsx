@@ -18,10 +18,11 @@ import {
   listSparkLeaves,
   claimL1Deposit,
   transferToSpark,
+  mintViaSelfTransfer,
   type WalletInitResult,
   type SparkLeafRow,
 } from './lib/sparkWallet'
-import { RgbAwareSparkSigner, setRgbIntent, clearRgbIntent } from './lib/rgbAwareSigner'
+import { RgbAwareSparkSigner, clearRgbIntent } from './lib/rgbAwareSigner'
 import { ensureSparkCoreReady, type SparkCore } from './lib/sparkCore'
 import {
   postConsignment,
@@ -289,7 +290,7 @@ function App() {
             myNostrPrivkeyHex={state.parsed.nostrPrivkeyHex}
           />
 
-          <SparkUtkMint />
+          <SparkUtkMintViaTransfer />
         </div>
       )}
     </section>
@@ -464,41 +465,59 @@ function SendToSpark() {
   )
 }
 
-// ---- Spark-UTK Mint (chunk-α-bis) -------------------------------------------
+// ---- Spark-UTK Mint via self-transfer (chunk-α-bis rev v2) ------------------
 //
-// Drives the RgbAwareSparkSigner end-to-end. User funds a depositAddress with
-// L1 sats (above the L1 dust limit — ~1000 sats is a safe round amount on
-// mainnet P2TR), supplies the txid + a 32-byte msg (the would-be RGB Merkle root),
-// and clicks Mint. The signer tweaks U_base → U_tweaked during claimDeposit so
-// the SE persists a leaf whose verifyingPublicKey = U_tweaked + operator —
-// i.e. cryptographically commits to msg. Receiver-side verification uses the
-// WASM deriveVerifyingKey(uBase, msg, operator) primitive, mirrored against
-// the same Rust vector v1 the JS tweak math is anchored to.
+// Picks an existing vanilla leaf, sends it to our own sparkAddress, and during
+// the receiver-side claim the RgbAwareSparkSigner applies the Spark-UTK tweak
+// to the destination key. The SE persists a new leaf with
+//   verifyingPublicKey = U_tweaked + operator
+//        where U_tweaked = U_base + tagged_hash("Spark-RGB-UTK-v1", U_base‖msg)·G
+// which we re-derive client-side and compare to confirm the binding.
+//
+// We use this path (not claimDeposit) because tweaking during L1 deposit
+// finalization is rejected by the SE — see project_spark_deposit_owner_check.md.
 
-interface MintResult {
+interface MintViaTransferResult {
+  leafBefore: { uBase: string; verifyingKey: string }
   leaf: SparkLeafRow
   msgHex: string
   expectedVerifyingKey: string
   match: boolean
   vanillaWouldMatch: boolean
-  totalSats: number
-  leafCount: number
+  transferId: string
 }
 
-function SparkUtkMint() {
+function SparkUtkMintViaTransfer() {
   const [core, setCore] = useState<SparkCore | null>(null)
   const [coreErr, setCoreErr] = useState<string | null>(null)
-  const [txid, setTxid] = useState('')
+  const [leaves, setLeaves] = useState<SparkLeafRow[]>([])
+  const [selectedLeafId, setSelectedLeafId] = useState('')
   const [msgHex, setMsgHex] = useState('')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
-  const [result, setResult] = useState<MintResult | null>(null)
+  const [result, setResult] = useState<MintViaTransferResult | null>(null)
 
   useEffect(() => {
     ensureSparkCoreReady()
       .then((c) => setCore(c))
       .catch((e) => setCoreErr(e instanceof Error ? e.message : String(e)))
   }, [])
+
+  const refreshLeaves = useCallback(async () => {
+    try {
+      const list = await listSparkLeaves()
+      setLeaves(list)
+      if (list.length > 0 && !list.find((l) => l.id === selectedLeafId)) {
+        setSelectedLeafId(list[0].id)
+      }
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    }
+  }, [selectedLeafId])
+
+  useEffect(() => {
+    void refreshLeaves()
+  }, [refreshLeaves])
 
   function randomMsg() {
     const b = new Uint8Array(32)
@@ -512,57 +531,52 @@ function SparkUtkMint() {
     setBusy(true)
     try {
       if (!core) throw new Error('WASM not ready')
-      const cleanTxid = txid.replace(/[^0-9a-fA-F]/g, '').toLowerCase()
-      if (cleanTxid.length !== 64) {
-        throw new Error(`txid must be 64 hex chars — got ${cleanTxid.length} after stripping non-hex`)
-      }
+      if (!selectedLeafId) throw new Error('select a leaf first')
+
       const cleanMsg = msgHex.replace(/[^0-9a-fA-F]/g, '').toLowerCase()
       if (cleanMsg.length !== 64) {
         throw new Error(`msg must be 64 hex chars (32 bytes) — got ${cleanMsg.length} after stripping non-hex`)
       }
       const msgBytes = hexToBytes(cleanMsg)
 
-      const before = await listSparkLeaves()
-      const beforeIds = new Set(before.map((l) => l.id))
-
-      setRgbIntent(msgBytes)
-      let claim
-      try {
-        claim = await claimL1Deposit(cleanTxid)
-      } finally {
-        clearRgbIntent()
+      const sourceLeaf = leaves.find((l) => l.id === selectedLeafId)
+      if (!sourceLeaf) throw new Error(`selected leaf ${selectedLeafId} not in cached list`)
+      const leafBefore = {
+        uBase: sourceLeaf.ownerSigningPublicKey.toLowerCase(),
+        verifyingKey: sourceLeaf.verifyingPublicKey.toLowerCase(),
       }
 
-      const after = await listSparkLeaves()
-      const newLeaves = after.filter((l) => !beforeIds.has(l.id))
-      if (newLeaves.length === 0) {
-        throw new Error('claimDeposit returned but no new leaf appeared in getLeaves()')
-      }
-      // If multiple leaves got created (unlikely for a single L1 utxo) we
-      // surface the first one; all should share the same msg since the intent
-      // was a single global value.
-      const leaf = newLeaves[0]
+      const { transferId, leaf } = await mintViaSelfTransfer(selectedLeafId, msgBytes)
 
-      const uBase = leaf.ownerSigningPublicKey.toLowerCase()
+      // Verification math:
+      //   expected = deriveVerifyingKey(leafBefore.uBase, msg, operator)
+      //            = (leafBefore.uBase + t·G) + operator
+      //            = U_tweaked + operator
+      //   actual   = leaf.verifyingPublicKey (SE-persisted)
+      // Use the pre-mint u_base — the post-mint leaf.ownerSigningPublicKey is
+      // already U_tweaked, so re-derive on that would double-tweak.
+      const uBasePre = leafBefore.uBase
       const operator = leaf.operatorPublicKey.toLowerCase()
       const realVk = leaf.verifyingPublicKey.toLowerCase()
-      const expectedVk = core.deriveVerifyingKey(uBase, cleanMsg, operator).toLowerCase()
+      const expectedVk = core.deriveVerifyingKey(uBasePre, cleanMsg, operator).toLowerCase()
       const vanillaVk = bytesToHex(
         (await import('@buildonspark/spark-sdk')).addPublicKeys(
-          hexToBytes(uBase),
+          hexToBytes(uBasePre),
           hexToBytes(operator),
         ),
       ).toLowerCase()
 
       setResult({
+        leafBefore,
         leaf,
         msgHex: cleanMsg,
         expectedVerifyingKey: expectedVk,
         match: expectedVk === realVk,
         vanillaWouldMatch: vanillaVk === realVk,
-        totalSats: claim.totalSats,
-        leafCount: claim.leafCount,
+        transferId,
       })
+      // Refresh the list so the post-mint state is visible.
+      void refreshLeaves()
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -572,26 +586,37 @@ function SparkUtkMint() {
 
   return (
     <section style={{ marginTop: 32, borderTop: '1px solid #ddd', paddingTop: 16 }}>
-      <h2 style={{ margin: '0 0 4px' }}>Spark-UTK Mint</h2>
+      <h2 style={{ margin: '0 0 4px' }}>Spark-UTK Mint (via self-transfer)</h2>
       <p style={{ color: '#666', marginTop: 0, fontSize: 13 }}>
-        Fund the depositAddress above with an L1 amount above the dust limit
-        (~1000 sats is safe), wait 1 conf, paste the funding txid + a 32-byte
-        RGB commitment, then Mint. The new leaf's verifyingKey will commit to
-        msg cryptographically — provable client-side.
+        Pick an existing leaf, supply a 32-byte msg, and click Mint. The leaf is
+        self-transferred Spark→Spark; during the receiver-side claim the signer
+        injects the Spark-UTK tweak so the new leaf's verifyingKey
+        cryptographically commits to msg.
       </p>
 
       {coreErr && <pre style={{ color: 'crimson' }}>{coreErr}</pre>}
 
       <label style={{ display: 'block', fontSize: 12, marginTop: 8 }}>
-        funding txid (64 hex)
+        source leaf
       </label>
-      <input
-        value={txid}
-        onChange={(e) => setTxid(e.target.value)}
-        placeholder="abcd…ef (txid of the L1 deposit)"
-        style={{ width: '100%', fontFamily: 'monospace', fontSize: 12, padding: 6, boxSizing: 'border-box' }}
-        disabled={busy}
-      />
+      <div style={{ display: 'flex', gap: 6 }}>
+        <select
+          value={selectedLeafId}
+          onChange={(e) => setSelectedLeafId(e.target.value)}
+          disabled={busy || leaves.length === 0}
+          style={{ flex: 1, fontFamily: 'monospace', fontSize: 12, padding: 6 }}
+        >
+          {leaves.length === 0 && <option value="">— no leaves —</option>}
+          {leaves.map((l) => (
+            <option key={l.id} value={l.id}>
+              {l.id.slice(0, 10)}…{l.id.slice(-4)} · {l.value} sat · {l.status}
+            </option>
+          ))}
+        </select>
+        <button onClick={() => void refreshLeaves()} disabled={busy} style={{ fontSize: 11 }}>
+          refresh
+        </button>
+      </div>
 
       <label style={{ display: 'block', fontSize: 12, marginTop: 8 }}>
         msg (32 bytes / 64 hex) — would be the RGB Merkle root
@@ -610,9 +635,9 @@ function SparkUtkMint() {
       <div style={{ marginTop: 10 }}>
         <button
           onClick={() => void mint()}
-          disabled={busy || !core || !txid.trim() || !msgHex.trim()}
+          disabled={busy || !core || !selectedLeafId || !msgHex.trim()}
         >
-          {busy ? 'minting…' : 'Mint with Spark-UTK intent'}
+          {busy ? 'minting…' : 'Mint via self-transfer'}
         </button>
       </div>
 
@@ -625,16 +650,16 @@ function SparkUtkMint() {
       {result && (
         <div style={{ marginTop: 14, padding: 10, border: '1px solid #ccc', background: '#fafafa' }}>
           <div style={{ fontSize: 13, marginBottom: 6 }}>
-            claimed <b>{result.totalSats} sats</b> across <b>{result.leafCount}</b> leaf
-            {result.leafCount === 1 ? '' : 's'}.
+            transferId <code style={{ fontSize: 11 }}>{result.transferId}</code>
           </div>
-          <KV label="leaf.id"             value={result.leaf.id} mono />
-          <KV label="leaf.value"          value={String(result.leaf.value)} />
-          <KV label="u_base"              value={result.leaf.ownerSigningPublicKey} mono />
-          <KV label="operator"            value={result.leaf.operatorPublicKey} mono />
-          <KV label="msg"                 value={result.msgHex} mono />
-          <KV label="leaf.verifyingKey"   value={result.leaf.verifyingPublicKey} mono />
-          <KV label="expected (UTK)"      value={result.expectedVerifyingKey} mono />
+          <KV label="leaf.id"                value={result.leaf.id} mono />
+          <KV label="leaf.value"             value={String(result.leaf.value)} />
+          <KV label="u_base (pre-mint)"      value={result.leafBefore.uBase} mono />
+          <KV label="u_base (post-mint)"     value={result.leaf.ownerSigningPublicKey} mono />
+          <KV label="operator"               value={result.leaf.operatorPublicKey} mono />
+          <KV label="msg"                    value={result.msgHex} mono />
+          <KV label="leaf.verifyingKey"      value={result.leaf.verifyingPublicKey} mono />
+          <KV label="expected (UTK)"         value={result.expectedVerifyingKey} mono />
           <div
             style={{
               marginTop: 8,
@@ -651,7 +676,8 @@ function SparkUtkMint() {
           {!result.match && result.vanillaWouldMatch && (
             <div style={{ marginTop: 6, padding: 6, background: '#fff8e1', border: '1px solid #ffe082', fontSize: 12 }}>
               diagnosis: leaf is vanilla (addPublicKeys(u_base, operator) == verifyingKey).
-              The signer's tweak gate didn't fire — check setRgbIntent timing.
+              The signer's tweak gate didn't fire on the claim's newKeyDerivation —
+              check that pathTweaks is set on the right leafId at the right moment.
             </div>
           )}
         </div>
