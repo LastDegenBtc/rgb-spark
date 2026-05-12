@@ -33,6 +33,13 @@ import {
   type HtlcCrossExpiryProbeResult,
   type InvoiceShape,
 } from './lib/htlcProbe'
+import {
+  runSellerFlow,
+  lockUnderHash,
+  newPreimagePair,
+  bytesToHex as htlcBytesToHex,
+  type SwapState,
+} from './lib/htlcSwap'
 import { RgbAwareSparkSigner, clearRgbIntent, listPathTweaks, getPathTweak } from './lib/rgbAwareSigner'
 import { attachPathTweakStorage, detachPathTweakStorage } from './lib/pathTweakStorage'
 import {
@@ -349,6 +356,7 @@ function App() {
             <div style={{ marginTop: 8 }}>
               <PathTweaksDebug />
               <HtlcProbe />
+              <HtlcSelfSwap />
               <ConsignmentLab
                 myNpub={state.parsed.npub}
                 myIdentityPubkey={state.wallet.identityPubkey}
@@ -789,6 +797,164 @@ function HtlcProbe() {
               </div>
             )
           })}
+        </div>
+      )}
+    </fieldset>
+  )
+}
+
+// ---- Self-swap smoke test (Phase 1C session 1) -----------------------------
+//
+// Walks the seller-side state machine end-to-end on a single wallet by
+// using SELF-RECEIVE: the seller locks her leaf to her OWN identity pubkey.
+// The same lock is then discovered by `queryPendingHtlcs(role='receiver')`
+// (because we ARE the receiver), and revealed via `revealAndClaim`.
+//
+// Why self-receive and not two locks under the same H: the Spark coordinator
+// enforces `(senderIdentityPublicKey, paymentHash)` uniqueness — a single
+// sender can't post two preimage requests under the same H. Multiple senders
+// under the same H is fine (and required for the real cross-wallet flow,
+// Lightning-routing style). See reference_spark_htlc_primitive memory.
+//
+// What this test proves:
+//   - The state machine transitions phases correctly (preparing → locking
+//     → locked → awaiting-counterparty → revealing → completed).
+//   - `lockUnderHash` accepts a self-receive call.
+//   - `queryPendingHtlcs(role='receiver', paymentHashes=[H])` finds the
+//     just-created lock.
+//   - `revealAndClaim` succeeds on a self-receive lock.
+// Cross-wallet semantics (different sender + receiver pubkeys) were already
+// validated in HTLC probe 3 (cross-receiver + expiry). This test focuses
+// on the state machine plumbing of the orchestrator module.
+
+function HtlcSelfSwap() {
+  const [running, setRunning] = useState(false)
+  const [stateLog, setStateLog] = useState<SwapState[]>([])
+  const [err, setErr] = useState<string | null>(null)
+  const [outcome, setOutcome] = useState<string | null>(null)
+
+  async function runTest() {
+    setRunning(true)
+    setErr(null)
+    setOutcome(null)
+    setStateLog([])
+    try {
+      const wallet = getSparkWallet()
+      if (!wallet) throw new Error('wallet not initialized')
+
+      const allLeaves = await (wallet as unknown as {
+        getLeaves: (b?: boolean) => Promise<Array<{ id: string; value: number }>>
+      }).getLeaves(true)
+      if (allLeaves.length === 0) {
+        throw new Error('no leaves available — fund the wallet first')
+      }
+      const assetLeaf = ([...allLeaves].sort((a, b) => a.value - b.value)[0] as unknown) as Parameters<typeof lockUnderHash>[1]['leaves'][number]
+
+      const { preimage } = newPreimagePair()
+      const identityPubkeyBytes = await (wallet as unknown as {
+        config: { signer: { getIdentityPublicKey: () => Promise<Uint8Array> } }
+      }).config.signer.getIdentityPublicKey()
+
+      // T_seller_expiry kept short (5 min) for this single-wallet test;
+      // the real cross-wallet flow uses larger values with a delta of ~30
+      // min between seller and buyer expiries.
+      const sellerExpiry = new Date(Date.now() + 5 * 60_000)
+
+      const result = await runSellerFlow(wallet, {
+        assetLeaves: [assetLeaf],
+        // Self-receive: the seller's lock counts as her own incoming HTLC,
+        // letting the awaiting-counterparty polling loop close immediately.
+        counterpartyPubkey: identityPubkeyBytes,
+        expectedSatsFromBuyer: (assetLeaf as { value: number }).value,
+        expiryTime: sellerExpiry,
+        preimage,
+        pollIntervalMs: 1_500,
+        onState: (s) => {
+          setStateLog((prev) => [...prev, s])
+        },
+      })
+      setOutcome(result.outcome)
+      // Log the preimage match for verification.
+      if (result.outcome === 'completed') {
+        const expectedHex = htlcBytesToHex(preimage)
+        if (result.state.revealedPreimageHex === expectedHex) {
+          setStateLog((prev) => [
+            ...prev,
+            {
+              ...result.state,
+              message: `🟢 revealed preimage matches generated preimage (${expectedHex.slice(0, 16)}…)`,
+              updatedAt: new Date().toISOString(),
+            },
+          ])
+        }
+      }
+    } catch (e) {
+      setErr(e instanceof Error ? `${e.name}: ${e.message}` : String(e))
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  return (
+    <fieldset style={{ marginTop: 10, border: '1px solid #ddd', padding: '8px 12px' }}>
+      <legend style={{ fontSize: 12, color: '#666' }}>
+        Self-swap smoke test · Phase 1C session 1
+      </legend>
+      <div style={{ fontSize: 12, color: '#666', marginBottom: 8 }}>
+        Runs <code>runSellerFlow</code> end-to-end with self-receive:
+        the seller locks one leaf to her own identity, the same lock is
+        seen as "incoming" by the polling loop, then reveal+claim closes
+        it. Validates the orchestrator state machine without needing
+        two wallets. ~5 s for the full state walk.
+      </div>
+      <button onClick={() => void runTest()} disabled={running}>
+        {running ? 'running…' : 'Run seller-flow self-swap'}
+      </button>
+      {err && (
+        <pre style={{ color: 'crimson', whiteSpace: 'pre-wrap', marginTop: 8, fontSize: 11 }}>
+          {err}
+        </pre>
+      )}
+      {stateLog.length > 0 && (
+        <div style={{ marginTop: 10, fontFamily: 'monospace', fontSize: 11 }}>
+          <div style={{ fontWeight: 'bold', marginBottom: 4 }}>
+            state transitions · paymentHash:{' '}
+            <span style={{ fontWeight: 'normal', color: '#666' }}>
+              {stateLog[0].paymentHashHex.slice(0, 16)}…
+            </span>
+          </div>
+          {stateLog.map((s, i) => (
+            <div
+              key={i}
+              style={{
+                borderTop: i === 0 ? 'none' : '1px dashed #eee',
+                padding: '3px 0',
+                color:
+                  s.phase === 'completed' ? 'seagreen' :
+                  s.phase === 'expired' ? '#c80' :
+                  s.phase === 'failed' ? 'crimson' :
+                  '#444',
+              }}
+            >
+              <strong>{s.phase}</strong> · {s.message}
+            </div>
+          ))}
+          {outcome && (
+            <div
+              style={{
+                marginTop: 6,
+                padding: 6,
+                background:
+                  outcome === 'completed' ? '#e8f5e9' :
+                  outcome === 'expired' ? '#fff8e1' : '#ffebee',
+                border:
+                  outcome === 'completed' ? '1px solid #a5d6a7' :
+                  outcome === 'expired' ? '1px solid #ffe082' : '1px solid #ef9a9a',
+              }}
+            >
+              outcome: <strong>{outcome}</strong>
+            </div>
+          )}
         </div>
       )}
     </fieldset>
