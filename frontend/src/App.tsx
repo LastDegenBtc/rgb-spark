@@ -19,6 +19,7 @@ import {
   type WalletInitResult,
   type SparkLeafRow,
 } from './lib/sparkWallet'
+import { RgbAwareSparkSigner } from './lib/rgbAwareSigner'
 import { ensureSparkCoreReady, type SparkCore } from './lib/sparkCore'
 import {
   postConsignment,
@@ -129,7 +130,7 @@ function App() {
     try {
       const parsed = parseLoginSecret(input)
       setState({ kind: 'loading', stage: `initializing Spark wallet on ${net}` })
-      const wallet = await initSparkWallet(parsed.sparkSeed, net)
+      const wallet = await initSparkWallet(parsed.sparkSeed, net, new RgbAwareSparkSigner())
       setState({ kind: 'ready', parsed, wallet, balanceSats: 'pending', cameFromVault, vaultJustSaved: false })
       try {
         const sats = await getBalance()

@@ -6,6 +6,7 @@
 // `mnemonicOrSeed` and runs its own HD derivation on top.
 
 import { SparkWallet } from '@buildonspark/spark-sdk';
+import type { SparkSigner } from '@buildonspark/spark-sdk';
 
 type Network = 'MAINNET' | 'REGTEST' | 'TESTNET';
 
@@ -36,6 +37,7 @@ export interface WalletInitResult {
 export async function initSparkWallet(
   seed: Uint8Array,
   network: Network = 'MAINNET',
+  signer?: SparkSigner,
 ): Promise<WalletInitResult> {
   const seedHash = await hashSeed(seed);
   if (walletInstance && initSeedHash === seedHash && currentNetwork === network) {
@@ -52,6 +54,7 @@ export async function initSparkWallet(
     }
     const { wallet } = await SparkWallet.initialize({
       mnemonicOrSeed: seed,
+      signer,
       options: { network },
     });
     walletInstance = wallet;
