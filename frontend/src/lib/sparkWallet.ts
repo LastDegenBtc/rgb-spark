@@ -407,11 +407,12 @@ export async function mintViaSelfTransfer(
   };
   const transfer = await transferService.sendTransferV3([leafKeyTweak]);
 
-  // 2-4. Tweaked-claim phase, narrowly scoped. wallet.claimTransfer returns
-  //      the freshly-registered TreeNodes — we read the new leaf from there
-  //      rather than re-listing via getLeaves() (which validates against
-  //      vanilla HD derivation and drops our tweaked leaf).
-  setPathTweak(leafId, msgBytes);
+  // 2. Self-referencing tweak — during the claim, the SDK calls the signer
+  //    with newKeyDerivation = {LEAF, path: leafId}, where leafId is the
+  //    SOURCE leaf id (not the new one yet, which the SE only assigns later).
+  //    A self-ref entry (sourcePath == currentLeafId) makes the signer return
+  //    U_tweaked at that moment.
+  setPathTweak(leafId, leafId, msgBytes);
   let claimedNodes: SparkClaimedNode[];
   try {
     const pending = await transferService.queryTransfer(transfer.id);
@@ -420,6 +421,9 @@ export async function mintViaSelfTransfer(
     }
     claimedNodes = await internals.claimTransfer({ transfer: pending, emit: false });
   } finally {
+    // Always drop the self-ref so future getLeaves()/sync() asking for the
+    // source leaf's path returns vanilla. (The source leaf is spent anyway,
+    // but defensive — the SDK may still query that path during ack flows.)
     clearPathTweak(leafId);
   }
 
@@ -430,6 +434,12 @@ export async function mintViaSelfTransfer(
   const expectedValue = Number(sourceLeaf.value ?? 0);
   const newNode =
     claimedNodes.find((n) => n.value === expectedValue) ?? claimedNodes[0];
+
+  // 3. Indirect persistent entry — for every future getPublicKeyFromDerivation
+  //    or getSigningPrivateKeyFromDerivation on the NEW leaf id, the signer
+  //    must return U_tweaked. Bind the new id back to the original sourcePath
+  //    so it can re-derive the base, then apply the same msg.
+  setPathTweak(String(newNode.id), leafId, msgBytes);
 
   const newLeaf: SparkLeafRow = {
     id: String(newNode.id),

@@ -8,23 +8,31 @@
 //   priv_tweak = (priv + t) mod n
 //   U_tweaked  = U_base + t·G    (which equals pubkey(priv_tweak))
 //
-// Scoping (rev v2, 2026-05-12):
-// Earlier (v1) we gated on a single global intent + `keyDerivation.type === LEAF`.
-// That gate is too coarse — `LEAF`-typed derivations also fire for:
-//   (a) deposit finalization (L1-pinned to U_base; tweaking breaks the SE owner check)
-//   (b) source-leaf authorization during outbound transfers (must stay vanilla
-//       to match the SE's on-record verifyingKey of the leaf being spent)
-// Both above must remain vanilla. Only the *receiver-side new-leaf pubkey
-// declaration* during `claimTransferCore` is a free destination key the SE
-// will persist for us — that's where the tweak should fire.
+// Scoping (rev v3, 2026-05-12):
+// v1 (global intent) was too coarse — tweaking fired for deposit finalization
+// and for source-leaf signing during outbound transfers, both of which must
+// stay vanilla.
+// v2 (path-scoped, transient) tweaked only when the SDK asked for a specific
+// leafId that we'd flagged. Worked for the mint moment itself but the tweaked
+// leaf disappeared on every subsequent `getLeaves()` / `sync()` — the SDK's
+// verifyKey filter asked the signer for `{LEAF, path: newLeafId}` and got a
+// vanilla pubkey back (because base derivation from `sha256(newLeafId)` is
+// totally different from the U_base we'd tweaked).
 //
-// The discriminator the SDK gives us is just `{ type: LEAF, path: leafId }`.
-// We can't tell from inside the signer whether this call is "I'm proving
-// ownership of leaf X" or "I'm declaring my pubkey for new leaf X". So the
-// gating is moved outside: the caller (mintViaSelfTransfer in sparkWallet.ts)
-// adds `leafId → msg` to `pathTweaks` ONLY for the brief window of the claim,
-// then removes it. Any `LEAF` derivation hitting the signer with a path that
-// happens to be in `pathTweaks` at that instant gets tweaked.
+// v3 makes pathTweaks **persistent and indirect**:
+//   pathTweaks: Map<currentLeafId, { sourcePath, msg }>
+// The signer derives the base private key from `sourcePath` (the leaf id we
+// originally tweaked against) and applies the same `tweakScalar(U_base, msg)`,
+// so we can return U_tweaked when asked for path=newLeafId. The map persists
+// for the lifetime of the wallet — see [[project_spark_leaf_validity_check]].
+//
+// Two kinds of entries live in the map:
+//   - **Self-referencing** (sourcePath == currentLeafId): set briefly during
+//     a mint, when the SDK asks for the destination pubkey via the source
+//     leaf's id. Removed once claim returns.
+//   - **Indirect** (sourcePath != currentLeafId): set after the SE confirms
+//     the new leaf id, so future getLeaves/sync calls keep returning U_tweaked.
+//     Stays until the leaf is spent.
 
 import { DefaultSparkSigner } from '@buildonspark/spark-sdk';
 import { KeyDerivationType } from '@buildonspark/spark-sdk';
@@ -35,27 +43,74 @@ import { sha256 } from '@noble/hashes/sha2';
 const SPARK_UTK_TAG = 'Spark-RGB-UTK-v1';
 const TEXT_ENCODER = new TextEncoder();
 
-// path -> msg. Owned by sparkWallet's mint flow which adds/removes entries
-// within the strict claim window. Empty = signer is fully vanilla.
-const pathTweaks = new Map<string, Uint8Array>();
+export interface PathTweakEntry {
+  sourcePath: string;
+  msg: Uint8Array;
+}
 
-export function setPathTweak(path: string, msg: Uint8Array): void {
+// currentLeafId -> { sourcePath, msg }. The signer reads this map to decide
+// whether (and how) to tweak any LEAF derivation call. Empty = fully vanilla.
+const pathTweaks = new Map<string, PathTweakEntry>();
+
+// Optional callback fired whenever pathTweaks mutates — lets a higher layer
+// (App boot) persist the map to localStorage without coupling the signer to
+// browser APIs.
+type PersistenceListener = (entries: ReadonlyMap<string, PathTweakEntry>) => void;
+let onChange: PersistenceListener | null = null;
+export function setPathTweaksPersistenceListener(cb: PersistenceListener | null): void {
+  onChange = cb;
+}
+function notifyChange(): void {
+  if (onChange) onChange(pathTweaks);
+}
+
+export function setPathTweak(
+  currentLeafId: string,
+  sourcePath: string,
+  msg: Uint8Array,
+): void {
   if (msg.length !== 32) {
     throw new Error(`RGB tweak msg must be 32 bytes, got ${msg.length}`);
   }
-  pathTweaks.set(path, msg);
+  pathTweaks.set(currentLeafId, { sourcePath, msg });
+  notifyChange();
 }
 
-export function clearPathTweak(path: string): void {
-  pathTweaks.delete(path);
+export function clearPathTweak(currentLeafId: string): void {
+  if (pathTweaks.delete(currentLeafId)) notifyChange();
 }
 
 export function clearAllPathTweaks(): void {
+  if (pathTweaks.size === 0) return;
   pathTweaks.clear();
+  notifyChange();
 }
 
-export function getPathTweak(path: string): Uint8Array | null {
-  return pathTweaks.get(path) ?? null;
+export function getPathTweak(currentLeafId: string): PathTweakEntry | null {
+  return pathTweaks.get(currentLeafId) ?? null;
+}
+
+export function listPathTweaks(): Array<{ currentLeafId: string } & PathTweakEntry> {
+  return Array.from(pathTweaks.entries()).map(([currentLeafId, e]) => ({
+    currentLeafId,
+    sourcePath: e.sourcePath,
+    msg: e.msg,
+  }));
+}
+
+/**
+ * Restore pathTweaks from a persisted snapshot — used at wallet boot after
+ * decrypting localStorage. Does NOT trigger the persistence listener (would
+ * cause a redundant rewrite).
+ */
+export function restorePathTweaks(
+  entries: Array<{ currentLeafId: string; sourcePath: string; msg: Uint8Array }>,
+): void {
+  pathTweaks.clear();
+  for (const { currentLeafId, sourcePath, msg } of entries) {
+    pathTweaks.set(currentLeafId, { sourcePath, msg });
+  }
+  // Intentionally skip notifyChange.
 }
 
 // Legacy compat. Pre-v2 flow used a single global intent; the only remaining
@@ -146,27 +201,36 @@ export function tweakPublicKey(uBase: Uint8Array, msg: Uint8Array): Uint8Array {
   return tweakedPoint.toRawBytes(true);
 }
 
-function lookupTweak(keyDerivation: KeyDerivation): Uint8Array | null {
+function lookupTweak(keyDerivation: KeyDerivation): PathTweakEntry | null {
   if (keyDerivation.type !== KeyDerivationType.LEAF) return null;
   return pathTweaks.get(keyDerivation.path) ?? null;
 }
 
 export class RgbAwareSparkSigner extends DefaultSparkSigner {
+  // Single chokepoint: tweak only the private-key derivation. The base
+  // `getPublicKeyFromDerivation` impl re-dispatches to this method via
+  // `this.getSigningPrivateKeyFromDerivation()` and then calls
+  // `secp256k1.getPublicKey()` on the result, so the pubkey side gets the
+  // tweak transparently. Overriding BOTH (as we did in the first v3 cut)
+  // produced a double-tweak — super.getPublicKeyFromDerivation would re-call
+  // our subclass's getSigningPrivateKeyFromDerivation (already tweaked), then
+  // we'd apply tweakPublicKey on top of an already-tweaked U_tweaked, giving
+  // U_tweaked + tagged_hash(U_tweaked, msg)·G instead of U_tweaked. That
+  // pubkey didn't match the SE record so verifyKey filtered the leaf out.
   protected async getSigningPrivateKeyFromDerivation(
     keyDerivation: KeyDerivation,
   ): Promise<Uint8Array> {
-    const basePriv = await super.getSigningPrivateKeyFromDerivation(keyDerivation);
-    const msg = lookupTweak(keyDerivation);
-    if (!msg) return basePriv;
-    return tweakPrivateKey(basePriv, msg);
-  }
-
-  async getPublicKeyFromDerivation(
-    keyDerivation: KeyDerivation,
-  ): Promise<Uint8Array> {
-    const basePub = await super.getPublicKeyFromDerivation(keyDerivation);
-    const msg = lookupTweak(keyDerivation);
-    if (!msg) return basePub;
-    return tweakPublicKey(basePub, msg);
+    const entry = lookupTweak(keyDerivation);
+    if (!entry) {
+      return super.getSigningPrivateKeyFromDerivation(keyDerivation);
+    }
+    // Derive the base private key from the ORIGINAL sourcePath (which binds
+    // to the U_base the SE saw at mint time), then apply the additive tweak
+    // with the stored msg. The pubkey side is handled by the default impl.
+    const basePriv = await super.getSigningPrivateKeyFromDerivation({
+      type: KeyDerivationType.LEAF,
+      path: entry.sourcePath,
+    });
+    return tweakPrivateKey(basePriv, entry.msg);
   }
 }

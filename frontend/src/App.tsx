@@ -22,7 +22,8 @@ import {
   type WalletInitResult,
   type SparkLeafRow,
 } from './lib/sparkWallet'
-import { RgbAwareSparkSigner, clearRgbIntent } from './lib/rgbAwareSigner'
+import { RgbAwareSparkSigner, clearRgbIntent, listPathTweaks } from './lib/rgbAwareSigner'
+import { attachPathTweakStorage, detachPathTweakStorage } from './lib/pathTweakStorage'
 import { ensureSparkCoreReady, type SparkCore } from './lib/sparkCore'
 import {
   postConsignment,
@@ -132,6 +133,14 @@ function App() {
     setState({ kind: 'loading', stage: 'parsing secret' })
     try {
       const parsed = parseLoginSecret(input)
+      // Restore pathTweaks BEFORE initSparkWallet — the SDK's initialize()
+      // runs an internal syncWallet() (spark-wallet.ts:472) which iterates
+      // leaves and asks the signer for getPublicKeyFromDerivation. If the
+      // map is empty at that moment, every tweaked leaf gets filtered out
+      // of leafManager.this.leaves (the sync clears and re-populates with
+      // valid leaves only), and later restoration of pathTweaks doesn't
+      // re-add them — they'd need another sync round to come back.
+      attachPathTweakStorage(parsed.npub)
       setState({ kind: 'loading', stage: `initializing Spark wallet on ${net}` })
       const wallet = await initSparkWallet(parsed.sparkSeed, net, new RgbAwareSparkSigner())
       setState({ kind: 'ready', parsed, wallet, balanceSats: 'pending', cameFromVault, vaultJustSaved: false })
@@ -174,6 +183,7 @@ function App() {
   async function reset() {
     await disposeSparkWallet()
     clearVault()
+    detachPathTweakStorage()
     setSecret('')
     setState({ kind: 'idle' })
   }
@@ -257,6 +267,7 @@ function App() {
           <KV label="identityPubkey"      value={state.wallet.identityPubkey} mono />
           <KV label="sparkAddress"        value={state.wallet.sparkAddress} mono />
           <KV label="depositAddress (L1)" value={state.wallet.depositAddress} mono />
+          <PathTweaksDebug />
           <KV
             label="balance (sats)"
             value={
@@ -294,6 +305,52 @@ function App() {
         </div>
       )}
     </section>
+  )
+}
+
+// ---- Path tweaks debug panel ------------------------------------------------
+//
+// Displays the current pathTweaks map. Useful to check that persistence is
+// loading entries at boot — a count of 0 right after reload means
+// localStorage wasn't read or was empty.
+
+function PathTweaksDebug() {
+  const [tweaks, setTweaks] = useState(() => listPathTweaks())
+
+  useEffect(() => {
+    // Re-poll every 2s — pathTweaks is a module-level Map with no event
+    // subscription exposed here, so polling is the simplest way to keep the
+    // debug view in sync without coupling to the signer's listener API.
+    const t = setInterval(() => setTweaks(listPathTweaks()), 2000)
+    return () => clearInterval(t)
+  }, [])
+
+  const raw = (() => {
+    try {
+      return localStorage.getItem('rgbspark.pathTweaks.v1') ?? '(empty)'
+    } catch {
+      return '(localStorage error)'
+    }
+  })()
+
+  return (
+    <details style={{ marginTop: 8, fontSize: 12 }}>
+      <summary>pathTweaks debug · in-memory: {tweaks.length} entries</summary>
+      <div style={{ marginTop: 6, padding: 6, background: '#fafafa', border: '1px solid #eee' }}>
+        <div style={{ marginBottom: 4, color: '#666' }}>in-memory entries:</div>
+        {tweaks.length === 0 && <div style={{ color: '#999' }}>(none)</div>}
+        {tweaks.map((t) => (
+          <div key={t.currentLeafId} style={{ fontFamily: 'monospace', fontSize: 11, wordBreak: 'break-all' }}>
+            {t.currentLeafId.slice(0, 10)}…{t.currentLeafId.slice(-4)} ← from{' '}
+            {t.sourcePath.slice(0, 10)}…{t.sourcePath.slice(-4)}
+          </div>
+        ))}
+        <div style={{ marginTop: 6, color: '#666' }}>localStorage raw (truncated):</div>
+        <div style={{ fontFamily: 'monospace', fontSize: 10, wordBreak: 'break-all' }}>
+          {raw.length > 300 ? raw.slice(0, 300) + '…' : raw}
+        </div>
+      </div>
+    </details>
   )
 }
 
