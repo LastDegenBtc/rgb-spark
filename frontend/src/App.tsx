@@ -24,6 +24,17 @@ import {
 } from './lib/sparkWallet'
 import { RgbAwareSparkSigner, clearRgbIntent, listPathTweaks, getPathTweak } from './lib/rgbAwareSigner'
 import { attachPathTweakStorage, detachPathTweakStorage } from './lib/pathTweakStorage'
+import {
+  attachStash,
+  detachStash,
+  addContract,
+  addTransition,
+  listContracts,
+  listTransitionsFor,
+  subscribeStash,
+  type StashContract,
+  type StashTransition,
+} from './lib/rgbStash'
 import { ensureSparkCoreReady, type SparkCore } from './lib/sparkCore'
 import {
   postConsignment,
@@ -163,6 +174,7 @@ function App() {
       // valid leaves only), and later restoration of pathTweaks doesn't
       // re-add them — they'd need another sync round to come back.
       attachPathTweakStorage(parsed.npub)
+      attachStash(parsed.npub)
       setState({ kind: 'loading', stage: `initializing Spark wallet on ${net}` })
       const wallet = await initSparkWallet(parsed.sparkSeed, net, new RgbAwareSparkSigner())
       setState({ kind: 'ready', parsed, wallet, balanceSats: 'pending', cameFromVault, vaultJustSaved: false })
@@ -206,6 +218,7 @@ function App() {
     await disposeSparkWallet()
     clearVault()
     detachPathTweakStorage()
+    detachStash()
     setSecret('')
     setState({ kind: 'idle' })
   }
@@ -289,7 +302,6 @@ function App() {
           <KV label="identityPubkey"      value={state.wallet.identityPubkey} mono />
           <KV label="sparkAddress"        value={state.wallet.sparkAddress} mono />
           <KV label="depositAddress (L1)" value={state.wallet.depositAddress} mono />
-          <PathTweaksDebug />
           <KV
             label="balance (sats)"
             value={
@@ -317,16 +329,119 @@ function App() {
 
           <SendToSpark />
 
-          <ConsignmentLab
-            myNpub={state.parsed.npub}
-            myIdentityPubkey={state.wallet.identityPubkey}
-            myNostrPrivkeyHex={state.parsed.nostrPrivkeyHex}
-          />
+          <RgbStashPanel />
 
-          <SparkUtkMintViaTransfer />
+          <details style={{ marginTop: 28, borderTop: '2px solid #ccc', paddingTop: 12 }}>
+            <summary style={{ cursor: 'pointer', fontSize: 13, color: '#666', fontWeight: 'bold' }}>
+              Developer lab · Spark-UTK mint + NIA consignment round-trip
+            </summary>
+            <div style={{ marginTop: 8 }}>
+              <PathTweaksDebug />
+              <ConsignmentLab
+                myNpub={state.parsed.npub}
+                myIdentityPubkey={state.wallet.identityPubkey}
+                myNostrPrivkeyHex={state.parsed.nostrPrivkeyHex}
+              />
+              <SparkUtkMintViaTransfer />
+            </div>
+          </details>
         </div>
       )}
     </section>
+  )
+}
+
+// ---- RGB stash panel (product surface) -------------------------------------
+//
+// Lists the NIA contracts this wallet has issued plus the transitions built
+// over each. Data comes from `rgbStash.ts` (localStorage, npub-scoped).
+// Issuance and transition building still happens in the Developer lab —
+// this panel is read-only and exists so a user can see "what RGB state does
+// my wallet hold" without diving into the lab UI.
+
+function RgbStashPanel() {
+  const [contracts, setContracts] = useState<StashContract[]>([])
+  const [transitions, setTransitions] = useState<StashTransition[]>([])
+  const [openContractId, setOpenContractId] = useState<string | null>(null)
+
+  useEffect(() => {
+    const unsubscribe = subscribeStash((snap) => {
+      setContracts(snap.contracts)
+      setTransitions(snap.transitions)
+    })
+    return () => { unsubscribe() }
+  }, [])
+
+  return (
+    <fieldset style={{ marginTop: 16, border: '1px solid #ddd', padding: '8px 12px' }}>
+      <legend style={{ fontSize: 12, color: '#666' }}>
+        RGB assets · {contracts.length} contract{contracts.length === 1 ? '' : 's'}
+        {transitions.length > 0 && (
+          <> · {transitions.length} transition{transitions.length === 1 ? '' : 's'}</>
+        )}
+      </legend>
+      {contracts.length === 0 ? (
+        <div style={{ fontSize: 12, color: '#888', padding: '6px 0' }}>
+          No RGB assets yet — issue a NIA contract from the Developer lab below.
+        </div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {contracts.map((c) => {
+            const txns = listTransitionsFor(c.contractId)
+            const isOpen = openContractId === c.contractId
+            return (
+              <div
+                key={c.contractId}
+                style={{
+                  border: '1px solid #eee',
+                  padding: '6px 8px',
+                  background: isOpen ? '#fafafa' : '#fff',
+                }}
+              >
+                <div
+                  onClick={() => setOpenContractId(isOpen ? null : c.contractId)}
+                  style={{ cursor: 'pointer', display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}
+                >
+                  <span style={{ fontWeight: 'bold', fontSize: 13 }}>{c.ticker}</span>
+                  <span style={{ fontSize: 12, color: '#666' }}>{c.name}</span>
+                  <span style={{ fontSize: 11, color: '#888' }}>supply {c.supply}</span>
+                  {txns.length > 0 && (
+                    <span style={{ fontSize: 11, color: '#2a6' }}>
+                      · {txns.length} transition{txns.length === 1 ? '' : 's'}
+                    </span>
+                  )}
+                  <span style={{ marginLeft: 'auto', fontSize: 11, color: '#aaa' }}>{isOpen ? '▾' : '▸'}</span>
+                </div>
+                {isOpen && (
+                  <div style={{ marginTop: 6, fontFamily: 'monospace', fontSize: 11, color: '#555' }}>
+                    <div style={{ wordBreak: 'break-all' }}>
+                      <span style={{ color: '#888' }}>contractId:</span> {c.contractId}
+                    </div>
+                    <div>
+                      <span style={{ color: '#888' }}>issued:</span> {c.createdAt}
+                      {' · '}
+                      <span style={{ color: '#888' }}>genesis:</span> {c.consignmentHex.length / 2} B
+                    </div>
+                    {txns.length > 0 && (
+                      <div style={{ marginTop: 4 }}>
+                        <div style={{ color: '#888' }}>transitions:</div>
+                        {txns.map((t) => (
+                          <div key={t.commitId} style={{ paddingLeft: 8, wordBreak: 'break-all' }}>
+                            · {t.commitId.slice(0, 16)}… amount {t.amount}
+                            {' · '}{t.transitionHex.length / 2} B
+                            {' · '}{t.createdAt}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </fieldset>
   )
 }
 
@@ -584,10 +699,20 @@ function SparkUtkMintViaTransfer() {
   // the RGB layer client-side. Cleared whenever the user touches msg manually.
   const [pendingRgb, setPendingRgb] = useState<PendingRgbPayload | null>(null)
   // Last successful NIA issuance kept here so the transition panel can chain
-  // on top of it without the user having to paste the hex around.
+  // on top of it without the user having to paste the hex around. Hydrated
+  // from the persisted stash on mount so the chain survives reloads.
   const [lastIssuance, setLastIssuance] = useState<
     { contractId: string; consignmentHex: string; supply: bigint } | null
-  >(null)
+  >(() => {
+    const contracts = listContracts()
+    if (contracts.length === 0) return null
+    const latest = contracts[contracts.length - 1]
+    return {
+      contractId: latest.contractId,
+      consignmentHex: latest.consignmentHex,
+      supply: BigInt(latest.supply),
+    }
+  })
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [result, setResult] = useState<MintViaTransferResult | null>(null)
@@ -903,6 +1028,14 @@ function IssueNiaInline({
       const consignmentHex = issuance.consignmentHex
       issuance.free()
       setLastResult({ contractId, consignmentSize: consignmentHex.length / 2 })
+      addContract({
+        contractId,
+        ticker: tickerTrim,
+        name: nameTrim,
+        supply: supplyTrim,
+        consignmentHex,
+        createdAt: new Date().toISOString(),
+      })
       onIssuance(contractId, consignmentHex, supplyBig)
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
@@ -1028,6 +1161,13 @@ function BuildTransitionInline({
         commitId,
         transitionSize: transitionHex.length / 2,
         prevGenesisSize: lastIssuance.consignmentHex.length / 2,
+      })
+      addTransition({
+        commitId,
+        prevContractId: lastIssuance.contractId,
+        amount: supplyTrim,
+        transitionHex,
+        createdAt: new Date().toISOString(),
       })
       onTransition(commitId, transitionHex, lastIssuance.consignmentHex)
     } catch (e) {
