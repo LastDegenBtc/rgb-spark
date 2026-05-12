@@ -46,6 +46,11 @@ const TEXT_ENCODER = new TextEncoder();
 export interface PathTweakEntry {
   sourcePath: string;
   msg: Uint8Array;
+  /** Pre-mint `U_base` of the source leaf — captured at mint time so that
+   *  proof builders (ConsignmentLab leaf-mode) can reconstruct the
+   *  Spark-UTK relation `verifyingKey = U_base + tagged_hash(U_base‖msg)·G + operator`
+   *  without re-querying the signer. Stored as 33-byte compressed pubkey bytes. */
+  uBase: Uint8Array;
 }
 
 // currentLeafId -> { sourcePath, msg }. The signer reads this map to decide
@@ -68,11 +73,15 @@ export function setPathTweak(
   currentLeafId: string,
   sourcePath: string,
   msg: Uint8Array,
+  uBase: Uint8Array,
 ): void {
   if (msg.length !== 32) {
     throw new Error(`RGB tweak msg must be 32 bytes, got ${msg.length}`);
   }
-  pathTweaks.set(currentLeafId, { sourcePath, msg });
+  if (uBase.length !== 33) {
+    throw new Error(`RGB tweak uBase must be 33 bytes compressed, got ${uBase.length}`);
+  }
+  pathTweaks.set(currentLeafId, { sourcePath, msg, uBase });
   notifyChange();
 }
 
@@ -95,6 +104,7 @@ export function listPathTweaks(): Array<{ currentLeafId: string } & PathTweakEnt
     currentLeafId,
     sourcePath: e.sourcePath,
     msg: e.msg,
+    uBase: e.uBase,
   }));
 }
 
@@ -104,11 +114,11 @@ export function listPathTweaks(): Array<{ currentLeafId: string } & PathTweakEnt
  * cause a redundant rewrite).
  */
 export function restorePathTweaks(
-  entries: Array<{ currentLeafId: string; sourcePath: string; msg: Uint8Array }>,
+  entries: Array<{ currentLeafId: string; sourcePath: string; msg: Uint8Array; uBase: Uint8Array }>,
 ): void {
   pathTweaks.clear();
-  for (const { currentLeafId, sourcePath, msg } of entries) {
-    pathTweaks.set(currentLeafId, { sourcePath, msg });
+  for (const { currentLeafId, sourcePath, msg, uBase } of entries) {
+    pathTweaks.set(currentLeafId, { sourcePath, msg, uBase });
   }
   // Intentionally skip notifyChange.
 }

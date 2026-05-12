@@ -24,6 +24,7 @@ interface PersistedShape {
     currentLeafId: string;
     sourcePath: string;
     msgHex: string;
+    uBaseHex: string;
   }>;
 }
 
@@ -63,18 +64,20 @@ function writeRaw(payload: PersistedShape | null): void {
  * boot, after the user is authenticated.
  */
 export function attachPathTweakStorage(npub: string): void {
-  // Restore matching tweaks.
+  // Restore matching tweaks. Entries persisted before uBase was added (pre
+  // session 6) won't have uBaseHex; we skip those rather than guessing.
   const persisted = readRaw();
   if (persisted && persisted.npub === npub) {
+    const usable = persisted.entries.filter((e) => typeof e.uBaseHex === 'string' && e.uBaseHex.length === 66);
     restorePathTweaks(
-      persisted.entries.map((e) => ({
+      usable.map((e) => ({
         currentLeafId: e.currentLeafId,
         sourcePath: e.sourcePath,
         msg: hexToBytes(e.msgHex),
+        uBase: hexToBytes(e.uBaseHex),
       })),
     );
   } else {
-    // Different npub (or first run) — start fresh.
     restorePathTweaks([]);
   }
 
@@ -84,6 +87,7 @@ export function attachPathTweakStorage(npub: string): void {
       currentLeafId,
       sourcePath: e.sourcePath,
       msgHex: bytesToHex(e.msg),
+      uBaseHex: bytesToHex(e.uBase),
     }));
     writeRaw({ npub, entries });
   });

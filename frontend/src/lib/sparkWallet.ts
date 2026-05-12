@@ -380,6 +380,19 @@ export async function mintViaSelfTransfer(
   if (!sourceLeaf) {
     throw new Error(`leaf ${leafId} not found in wallet`);
   }
+  // Capture the source leaf's vanilla u_base (pre-mint). The post-mint leaf
+  // will carry U_tweaked as its ownerSigningPublicKey; we need to remember
+  // U_base for proof builders that reconstruct the Spark-UTK relation
+  //   verifyingKey = U_base + tagged_hash(U_base ‖ msg)·G + operator
+  // without having to talk back to the signer.
+  const sourceUBase = sourceLeaf.ownerSigningPublicKey as Uint8Array;
+  if (!(sourceUBase instanceof Uint8Array) || sourceUBase.length !== 33) {
+    throw new Error(
+      `source leaf ${leafId} ownerSigningPublicKey is not 33-byte compressed (got ${
+        sourceUBase instanceof Uint8Array ? `${sourceUBase.length} bytes` : typeof sourceUBase
+      })`,
+    );
+  }
 
   // wallet.getIdentityPublicKey() returns a hex string; the SDK's internal
   // LeafKeyTweak expects a 33-byte Uint8Array. Decode here.
@@ -412,7 +425,7 @@ export async function mintViaSelfTransfer(
   //    SOURCE leaf id (not the new one yet, which the SE only assigns later).
   //    A self-ref entry (sourcePath == currentLeafId) makes the signer return
   //    U_tweaked at that moment.
-  setPathTweak(leafId, leafId, msgBytes);
+  setPathTweak(leafId, leafId, msgBytes, sourceUBase);
   let claimedNodes: SparkClaimedNode[];
   try {
     const pending = await transferService.queryTransfer(transfer.id);
@@ -439,7 +452,7 @@ export async function mintViaSelfTransfer(
   //    or getSigningPrivateKeyFromDerivation on the NEW leaf id, the signer
   //    must return U_tweaked. Bind the new id back to the original sourcePath
   //    so it can re-derive the base, then apply the same msg.
-  setPathTweak(String(newNode.id), leafId, msgBytes);
+  setPathTweak(String(newNode.id), leafId, msgBytes, sourceUBase);
 
   const newLeaf: SparkLeafRow = {
     id: String(newNode.id),

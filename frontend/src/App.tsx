@@ -22,7 +22,7 @@ import {
   type WalletInitResult,
   type SparkLeafRow,
 } from './lib/sparkWallet'
-import { RgbAwareSparkSigner, clearRgbIntent, listPathTweaks } from './lib/rgbAwareSigner'
+import { RgbAwareSparkSigner, clearRgbIntent, listPathTweaks, getPathTweak } from './lib/rgbAwareSigner'
 import { attachPathTweakStorage, detachPathTweakStorage } from './lib/pathTweakStorage'
 import { ensureSparkCoreReady, type SparkCore } from './lib/sparkCore'
 import {
@@ -90,10 +90,14 @@ interface LeafReference {
   treeId: string
   value: number
   network: string
-  // Per-leaf 33-byte compressed verifying key. Receiver re-derives this from
-  // (proof.uBase, ZERO_MSG, proof.operator) and compares — match means the
-  // proof is mathematically bound to a real leaf the SE knows about.
+  // Per-leaf 33-byte compressed verifying key recorded by the Spark SE.
   verifyingPublicKey: string
+  /** When present (32-byte hex), the proof carries a Spark-UTK tweaked binding:
+   *  proof.u_base is the PRE-mint vanilla u_base of the source leaf, and the
+   *  receiver verifies via deriveVerifyingKey(u_base, msg, operator) == verifyingPublicKey.
+   *  When absent, the leaf is vanilla and the receiver verifies via
+   *  addPublicKeys(u_base, operator) == verifyingPublicKey. */
+  msgHex?: string
 }
 
 type ConsignmentEnvelope =
@@ -751,11 +755,13 @@ interface SentRecord {
   envelope: ConsignmentEnvelope
 }
 
+type LeafVerifyAlgo = 'vanilla' | 'spark-utk'
+
 type LeafVerification =
-  | { kind: 'none' }                                       // v2 envelope, no leaf to verify against
-  | { kind: 'ok'; derivedVerifyingKey: string }            // match
-  | { kind: 'mismatch'; expected: string; got: string }    // derived ≠ leaf.verifyingPublicKey
-  | { kind: 'error'; message: string }                     // derive call threw
+  | { kind: 'none' }                                                    // v2 envelope, no leaf to verify against
+  | { kind: 'ok'; derivedVerifyingKey: string; algo: LeafVerifyAlgo }   // match
+  | { kind: 'mismatch'; expected: string; got: string; algo: LeafVerifyAlgo }
+  | { kind: 'error'; message: string }                                  // derive call threw
 
 interface DecodedConsignment {
   raw: string                  // hex of the raw bytes received
@@ -856,15 +862,31 @@ function ConsignmentLab({
       let unsigned: UnsignedEnvelopeV4
       if (mode === 'leaf') {
         if (!selectedLeaf) throw new Error('no leaf selected — fund the wallet or switch to demo mode')
-        const uBase = selectedLeaf.ownerSigningPublicKey.toLowerCase()
         const operator = selectedLeaf.operatorPublicKey.toLowerCase()
-        if (!COMPRESSED_PUBKEY_HEX_RE.test(uBase)) {
-          throw new Error(`leaf.ownerSigningPublicKey is not a 33-byte compressed pubkey: ${uBase}`)
-        }
         if (!COMPRESSED_PUBKEY_HEX_RE.test(operator)) {
           throw new Error(`leaf.operatorPublicKey is not a 33-byte compressed pubkey: ${operator}`)
         }
-        const proof = new core.SparkUtkProofJs(uBase, operator)
+
+        // If the leaf is in pathTweaks, it's a Spark-UTK tweaked leaf — use
+        // the PRE-MINT u_base (entry.uBase) for the proof, NOT the post-mint
+        // leaf.ownerSigningPublicKey (which is U_tweaked). Carry msgHex on
+        // the leafReference so the receiver verifies via deriveVerifyingKey.
+        // Otherwise use the leaf's own pubkey and emit a vanilla envelope.
+        const tweakEntry = getPathTweak(selectedLeaf.id)
+        let proofUBase: string
+        let msgHex: string | undefined
+        if (tweakEntry) {
+          proofUBase = bytesToHex(tweakEntry.uBase).toLowerCase()
+          msgHex = bytesToHex(tweakEntry.msg).toLowerCase()
+        } else {
+          proofUBase = selectedLeaf.ownerSigningPublicKey.toLowerCase()
+          msgHex = undefined
+        }
+        if (!COMPRESSED_PUBKEY_HEX_RE.test(proofUBase)) {
+          throw new Error(`proof u_base is not a 33-byte compressed pubkey: ${proofUBase}`)
+        }
+
+        const proof = new core.SparkUtkProofJs(proofUBase, operator)
         const proofHex = proof.encode()
         proof.free()
         unsigned = {
@@ -880,6 +902,7 @@ function ConsignmentLab({
             value: selectedLeaf.value,
             network: selectedLeaf.network,
             verifyingPublicKey: selectedLeaf.verifyingPublicKey.toLowerCase(),
+            ...(msgHex ? { msgHex } : {}),
           },
         }
       } else {
@@ -939,17 +962,31 @@ function ConsignmentLab({
         let leafVerification: LeafVerification = { kind: 'none' }
         if (leafRef) {
           try {
-            // Spark vanilla leaf invariant (matches SDK's own SparkWallet.verifyKey):
-            //   verifyingPublicKey === ownerSigningPublicKey + signingKeyshare.publicKey
-            // Pure secp256k1 point addition, no Spark-UTK tweak. The non-trivial
-            // tagged-hash tweak only kicks in once we inject msg ≠ 0 at leaf
-            // creation, which the stock SDK doesn't expose (chunk-α-bis).
-            const derivedBytes = addPublicKeys(hexToBytes(proofUBase), hexToBytes(proofOperator))
-            const derived = bytesToHex(derivedBytes).toLowerCase()
+            // Two verification modes:
+            //   - vanilla (msgHex absent): verifyingPublicKey === u_base + operator
+            //     Plain secp256k1 point addition; matches the SDK's SparkWallet.verifyKey.
+            //   - Spark-UTK tweaked (msgHex present): verifyingPublicKey ===
+            //     deriveVerifyingKey(u_base, msg, operator). u_base is the pre-mint
+            //     vanilla pubkey of the source leaf; the wasm primitive applies the
+            //     tagged-hash tweak before adding operator.
             const claimed = leafRef.verifyingPublicKey.toLowerCase()
+            let derived: string
+            let algo: LeafVerifyAlgo
+            if (leafRef.msgHex) {
+              const cleanMsg = leafRef.msgHex.replace(/[^0-9a-fA-F]/g, '').toLowerCase()
+              if (cleanMsg.length !== 64) {
+                throw new Error(`msgHex must be 64 hex chars, got ${cleanMsg.length}`)
+              }
+              derived = core.deriveVerifyingKey(proofUBase, cleanMsg, proofOperator).toLowerCase()
+              algo = 'spark-utk'
+            } else {
+              const derivedBytes = addPublicKeys(hexToBytes(proofUBase), hexToBytes(proofOperator))
+              derived = bytesToHex(derivedBytes).toLowerCase()
+              algo = 'vanilla'
+            }
             leafVerification = derived === claimed
-              ? { kind: 'ok', derivedVerifyingKey: derived }
-              : { kind: 'mismatch', expected: claimed, got: derived }
+              ? { kind: 'ok', derivedVerifyingKey: derived, algo }
+              : { kind: 'mismatch', expected: claimed, got: derived, algo }
           } catch (e) {
             leafVerification = { kind: 'error', message: e instanceof Error ? e.message : String(e) }
           }
@@ -1006,14 +1043,16 @@ function ConsignmentLab({
             Self-consistent identity binding only. Works without funding.
           </li>
           <li>
-            <strong>real leaf</strong> (v3): <code>u_base</code> = leaf's
-            <code> ownerSigningPublicKey</code>, operator = leaf's aggregated
-            FROST key. Receiver checks the Spark vanilla invariant
-            <code> u_base + operator == leaf.verifyingPublicKey</code>{' '}
-            (same primitive the SDK uses in <code>SparkWallet.verifyKey</code>).
-            Proves the proof material lives on a real Spark leaf the SE
-            recognizes. Does <em>not</em> yet prove Spark-UTK binding — that
-            needs msg ≠ 0 at leaf creation (chunk-α-bis).
+            <strong>real leaf</strong> (v3/v4): if the selected leaf was
+            minted via Spark-UTK (entry in pathTweaks), the proof carries the
+            <em> pre-mint</em> <code>u_base</code> and the envelope's
+            <code>leafReference</code> includes <code>msgHex</code>; the
+            receiver verifies via
+            <code> deriveVerifyingKey(u_base, msg, operator) == verifyingPublicKey</code>
+            (the full Spark-UTK binding). Otherwise it falls back to the
+            vanilla Spark invariant
+            <code> u_base + operator == verifyingPublicKey</code> for
+            non-tweaked leaves.
           </li>
         </ul>
       </details>
@@ -1076,19 +1115,43 @@ function ConsignmentLab({
                 {leavesLoading ? '…' : 'refresh'}
               </button>
             </div>
-            {selectedLeaf && (
-              <details style={{ marginTop: 6 }}>
-                <summary style={{ fontSize: 11, color: '#666', cursor: 'pointer' }}>
-                  leaf hex details
-                </summary>
-                <div style={{ marginTop: 4, fontFamily: 'monospace', fontSize: 11, color: '#555', wordBreak: 'break-all' }}>
-                  <div>treeId: {selectedLeaf.treeId}</div>
-                  <div>ownerSigningPublicKey (u_base): {selectedLeaf.ownerSigningPublicKey}</div>
-                  <div>operatorPublicKey (FROST): {selectedLeaf.operatorPublicKey}</div>
-                  <div>verifyingPublicKey (target): {selectedLeaf.verifyingPublicKey}</div>
-                </div>
-              </details>
-            )}
+            {selectedLeaf && (() => {
+              const tweak = getPathTweak(selectedLeaf.id)
+              return (
+                <>
+                  {tweak && (
+                    <div style={{
+                      marginTop: 6, padding: '6px 8px',
+                      background: '#e8f5e9', border: '1px solid #a5d6a7',
+                      fontSize: 12,
+                    }}>
+                      Spark-UTK tweaked leaf · msg ={' '}
+                      <code style={{ fontSize: 11 }}>{bytesToHex(tweak.msg).slice(0, 16)}…</code>
+                      . The proof will carry the pre-mint u_base and msg so the
+                      receiver verifies via deriveVerifyingKey (not vanilla add).
+                    </div>
+                  )}
+                  <details style={{ marginTop: 6 }}>
+                    <summary style={{ fontSize: 11, color: '#666', cursor: 'pointer' }}>
+                      leaf hex details
+                    </summary>
+                    <div style={{ marginTop: 4, fontFamily: 'monospace', fontSize: 11, color: '#555', wordBreak: 'break-all' }}>
+                      <div>treeId: {selectedLeaf.treeId}</div>
+                      <div>ownerSigningPublicKey: {selectedLeaf.ownerSigningPublicKey}</div>
+                      <div>operatorPublicKey (FROST): {selectedLeaf.operatorPublicKey}</div>
+                      <div>verifyingPublicKey (target): {selectedLeaf.verifyingPublicKey}</div>
+                      {tweak && (
+                        <>
+                          <div>pre-mint u_base: {bytesToHex(tweak.uBase)}</div>
+                          <div>msg: {bytesToHex(tweak.msg)}</div>
+                          <div>sourcePath: {tweak.sourcePath}</div>
+                        </>
+                      )}
+                    </div>
+                  </details>
+                </>
+              )
+            })()}
             {leavesErr && <div style={{ color: 'crimson', fontSize: 12, marginTop: 4 }}>{leavesErr}</div>}
             {!leavesErr && leaves.length === 0 && !leavesLoading && (
               <div style={{ color: '#888', fontSize: 12, marginTop: 4 }}>
@@ -1240,13 +1303,17 @@ function DecodedView({ entry }: { entry: DecodedConsignment }) {
     if (lv.kind === 'ok') {
       leafBadge = (
         <span style={{ color: 'seagreen' }}>
-          OK · u_base + operator == leaf.verifyingPublicKey (Spark vanilla)
+          OK ·{' '}
+          {lv.algo === 'spark-utk'
+            ? <>deriveVerifyingKey(u_base, msg, operator) == leaf.verifyingPublicKey <strong>(Spark-UTK)</strong></>
+            : <>u_base + operator == leaf.verifyingPublicKey <strong>(Spark vanilla)</strong></>
+          }
         </span>
       )
     } else if (lv.kind === 'mismatch') {
       leafBadge = (
         <span style={{ color: '#c00' }}>
-          MISMATCH · u_base + operator ≠ leaf.verifyingPublicKey
+          MISMATCH ({lv.algo === 'spark-utk' ? 'Spark-UTK' : 'Spark vanilla'}) · derived {lv.got.slice(0, 12)}… ≠ claimed {lv.expected.slice(0, 12)}…
         </span>
       )
     } else if (lv.kind === 'error') {
@@ -1300,12 +1367,19 @@ function DecodedView({ entry }: { entry: DecodedConsignment }) {
                 <div>value: {leafRef.value} sats</div>
                 <div>network: {leafRef.network}</div>
                 <div>verifyingPublicKey: {leafRef.verifyingPublicKey}</div>
+                {leafRef.msgHex && <div>msg: {leafRef.msgHex}</div>}
                 {lv?.kind === 'ok' && (
-                  <div>computed (u_base + operator): {lv.derivedVerifyingKey}</div>
+                  <div>
+                    computed ({lv.algo === 'spark-utk' ? 'deriveVerifyingKey(u_base, msg, operator)' : 'u_base + operator'}):{' '}
+                    {lv.derivedVerifyingKey}
+                  </div>
                 )}
                 {lv?.kind === 'mismatch' && (
                   <>
-                    <div>computed (u_base + operator): {lv.got}</div>
+                    <div>
+                      computed ({lv.algo === 'spark-utk' ? 'deriveVerifyingKey(u_base, msg, operator)' : 'u_base + operator'}):{' '}
+                      {lv.got}
+                    </div>
                     <div>expected (claimed): {lv.expected}</div>
                   </>
                 )}
