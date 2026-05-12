@@ -427,9 +427,15 @@ function OrderBookPanel({
 }: OrderBookPanelProps) {
   const [contracts, setContracts] = useState<StashContract[]>([])
   const [selectedAssetId, setSelectedAssetId] = useState<string>('')
+  /** When set, takes precedence over the stash dropdown — lets the user
+   *  paste a counterparty's assetId to discover their book entries. */
+  const [pastedAssetId, setPastedAssetId] = useState<string>('')
   const [book, setBook] = useState<StoredOrder[]>([])
   const [bookErr, setBookErr] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
+
+  const effectiveAssetId = pastedAssetId.trim() || selectedAssetId
+  const isUsingPasted = pastedAssetId.trim().length > 0
 
   // Live subscribe to the stash so the asset dropdown picks up new
   // issuances without a page refresh.
@@ -442,21 +448,26 @@ function OrderBookPanel({
   }, [])
 
   const refresh = useCallback(async () => {
-    if (!selectedAssetId) {
+    if (!effectiveAssetId) {
       setBook([])
+      return
+    }
+    if (!/^[0-9a-fA-F]{64}$/.test(effectiveAssetId)) {
+      setBook([])
+      setBookErr(`bad assetId: expected 64 hex chars, got ${effectiveAssetId.length}`)
       return
     }
     setRefreshing(true)
     setBookErr(null)
     try {
-      const list = await listOrders(selectedAssetId)
+      const list = await listOrders(effectiveAssetId)
       setBook(list)
     } catch (e) {
       setBookErr(e instanceof Error ? e.message : String(e))
     } finally {
       setRefreshing(false)
     }
-  }, [selectedAssetId])
+  }, [effectiveAssetId])
 
   useEffect(() => {
     void refresh()
@@ -466,7 +477,7 @@ function OrderBookPanel({
     return () => clearInterval(t)
   }, [refresh])
 
-  const selectedContract = contracts.find((c) => c.contractId === selectedAssetId)
+  const selectedContract = contracts.find((c) => c.contractId === effectiveAssetId)
 
   return (
     <fieldset style={{ marginTop: 16, border: '1px solid #ddd', padding: '8px 12px' }}>
@@ -474,33 +485,57 @@ function OrderBookPanel({
         Order book · {book.length} order{book.length === 1 ? '' : 's'}
       </legend>
 
-      {contracts.length === 0 ? (
-        <div style={{ fontSize: 12, color: '#888', padding: '6px 0' }}>
-          No issued contracts yet — issue an NIA from the Developer lab below to
-          enable trading.
-        </div>
-      ) : (
-        <>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <label style={{ fontSize: 12, color: '#666' }}>asset:</label>
-            <select
-              value={selectedAssetId}
-              onChange={(e) => setSelectedAssetId(e.target.value)}
-              style={{ fontSize: 12, padding: 4, fontFamily: 'monospace', flex: 1, minWidth: 200 }}
-            >
-              {contracts.map((c) => (
-                <option key={c.contractId} value={c.contractId}>
-                  {c.ticker} · {c.name} · {c.contractId.slice(0, 10)}…
-                </option>
-              ))}
-            </select>
-            <button onClick={() => void refresh()} disabled={refreshing} style={{ fontSize: 11 }}>
-              {refreshing ? '…' : 'refresh'}
-            </button>
-          </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <label style={{ fontSize: 12, color: '#666' }}>asset:</label>
+        <select
+          value={selectedAssetId}
+          onChange={(e) => {
+            setSelectedAssetId(e.target.value)
+            setPastedAssetId('')
+          }}
+          disabled={isUsingPasted || contracts.length === 0}
+          style={{ fontSize: 12, padding: 4, fontFamily: 'monospace', flex: 1, minWidth: 200 }}
+        >
+          {contracts.length === 0 ? (
+            <option value="">— no local contracts —</option>
+          ) : (
+            contracts.map((c) => (
+              <option key={c.contractId} value={c.contractId}>
+                {c.ticker} · {c.name} · {c.contractId.slice(0, 10)}…
+              </option>
+            ))
+          )}
+        </select>
+        <button onClick={() => void refresh()} disabled={refreshing || !effectiveAssetId} style={{ fontSize: 11 }}>
+          {refreshing ? '…' : 'refresh'}
+        </button>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6, flexWrap: 'wrap' }}>
+        <label style={{ fontSize: 11, color: '#888' }}>or paste asset id (64 hex):</label>
+        <input
+          value={pastedAssetId}
+          onChange={(e) => setPastedAssetId(e.target.value)}
+          placeholder="counterparty's contractId for cross-wallet discovery"
+          style={{ fontSize: 11, padding: 4, fontFamily: 'monospace', flex: 1, minWidth: 200 }}
+        />
+        {isUsingPasted && (
+          <button onClick={() => setPastedAssetId('')} style={{ fontSize: 11 }}>
+            clear
+          </button>
+        )}
+      </div>
 
+      {contracts.length === 0 && !isUsingPasted && (
+        <div style={{ fontSize: 12, color: '#888', padding: '6px 0' }}>
+          No issued contracts yet — issue an NIA from the Developer lab below,
+          or paste a counterparty's assetId above to browse their book.
+        </div>
+      )}
+
+      {effectiveAssetId && (
+        <>
           <PlaceOrderForms
-            assetId={selectedAssetId}
+            assetId={effectiveAssetId}
             selectedContract={selectedContract}
             myNpub={myNpub}
             myNostrPrivkeyHex={myNostrPrivkeyHex}
