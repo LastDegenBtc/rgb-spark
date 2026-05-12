@@ -25,6 +25,7 @@ interface PersistedShape {
     sourcePath: string;
     msgHex: string;
     uBaseHex: string;
+    consignmentHex?: string;
   }>;
 }
 
@@ -75,6 +76,7 @@ export function attachPathTweakStorage(npub: string): void {
         sourcePath: e.sourcePath,
         msg: hexToBytes(e.msgHex),
         uBase: hexToBytes(e.uBaseHex),
+        consignmentHex: e.consignmentHex,
       })),
     );
   } else {
@@ -88,6 +90,7 @@ export function attachPathTweakStorage(npub: string): void {
       sourcePath: e.sourcePath,
       msgHex: bytesToHex(e.msg),
       uBaseHex: bytesToHex(e.uBase),
+      ...(e.consignmentHex ? { consignmentHex: e.consignmentHex } : {}),
     }));
     writeRaw({ npub, entries });
   });

@@ -51,6 +51,13 @@ export interface PathTweakEntry {
    *  Spark-UTK relation `verifyingKey = U_base + tagged_hash(U_base‖msg)·G + operator`
    *  without re-querying the signer. Stored as 33-byte compressed pubkey bytes. */
   uBase: Uint8Array;
+  /** Optional RGB consignment (hex) whose contractId == msg. Present only
+   *  when the leaf was minted bound to a real RGB issuance via
+   *  IssueNiaInline. Lets the sender attach the consignment to the
+   *  Spark-UTK proof so the receiver can validate the RGB layer
+   *  client-side via `core.validateNiaConsignment` and cross-check that
+   *  its contractId matches the msg the Spark leaf committed to. */
+  consignmentHex?: string;
 }
 
 // currentLeafId -> { sourcePath, msg }. The signer reads this map to decide
@@ -74,6 +81,7 @@ export function setPathTweak(
   sourcePath: string,
   msg: Uint8Array,
   uBase: Uint8Array,
+  consignmentHex?: string,
 ): void {
   if (msg.length !== 32) {
     throw new Error(`RGB tweak msg must be 32 bytes, got ${msg.length}`);
@@ -81,7 +89,7 @@ export function setPathTweak(
   if (uBase.length !== 33) {
     throw new Error(`RGB tweak uBase must be 33 bytes compressed, got ${uBase.length}`);
   }
-  pathTweaks.set(currentLeafId, { sourcePath, msg, uBase });
+  pathTweaks.set(currentLeafId, { sourcePath, msg, uBase, consignmentHex });
   notifyChange();
 }
 
@@ -105,6 +113,7 @@ export function listPathTweaks(): Array<{ currentLeafId: string } & PathTweakEnt
     sourcePath: e.sourcePath,
     msg: e.msg,
     uBase: e.uBase,
+    consignmentHex: e.consignmentHex,
   }));
 }
 
@@ -114,11 +123,17 @@ export function listPathTweaks(): Array<{ currentLeafId: string } & PathTweakEnt
  * cause a redundant rewrite).
  */
 export function restorePathTweaks(
-  entries: Array<{ currentLeafId: string; sourcePath: string; msg: Uint8Array; uBase: Uint8Array }>,
+  entries: Array<{
+    currentLeafId: string;
+    sourcePath: string;
+    msg: Uint8Array;
+    uBase: Uint8Array;
+    consignmentHex?: string;
+  }>,
 ): void {
   pathTweaks.clear();
-  for (const { currentLeafId, sourcePath, msg, uBase } of entries) {
-    pathTweaks.set(currentLeafId, { sourcePath, msg, uBase });
+  for (const { currentLeafId, sourcePath, msg, uBase, consignmentHex } of entries) {
+    pathTweaks.set(currentLeafId, { sourcePath, msg, uBase, consignmentHex });
   }
   // Intentionally skip notifyChange.
 }
@@ -242,5 +257,25 @@ export class RgbAwareSparkSigner extends DefaultSparkSigner {
       path: entry.sourcePath,
     });
     return tweakPrivateKey(basePriv, entry.msg);
+  }
+
+  /**
+   * Compute the vanilla (untweaked) pubkey for a derivation path — bypassing
+   * any pathTweaks entry. Used by `mintViaSelfTransfer` to capture the true
+   * `U_base` that the SE will combine with the operator share at claim time,
+   * when the source leaf may itself have a previous tweak (in which case
+   * `sourceLeaf.ownerSigningPublicKey` is U_tweaked_old, not the vanilla
+   * base — wrong material for the proof).
+   *
+   * Calls super.getSigningPrivateKeyFromDerivation DIRECTLY (not through
+   * super.getPublicKeyFromDerivation, which would re-dispatch to our
+   * subclass override via `this`). The base impl is a pure HD derivation
+   * with no pathTweaks lookup, so the returned pubkey is always vanilla.
+   */
+  async getVanillaPublicKeyFromDerivation(
+    keyDerivation: KeyDerivation,
+  ): Promise<Uint8Array> {
+    const priv = await super.getSigningPrivateKeyFromDerivation(keyDerivation);
+    return secp256k1.getPublicKey(priv, true);
   }
 }

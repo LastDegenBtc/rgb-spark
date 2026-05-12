@@ -20,9 +20,11 @@ use commit_verify::mpc::Commitment;
 // rgb-consensus → rgbcore (via rgb-ops re-export), rgb-ops → rgbstd,
 // rgb-schemas → schemata.
 use dbc::keytweak::{self, SparkUtkProof};
-use rgbstd::containers::ConsignmentExt;
+use rgbstd::containers::{Consignment, ConsignmentExt};
 use rgbstd::contract::{ContractBuilder, IssuerWrapper};
 use rgbstd::stl::{AssetSpec, ContractTerms, RicardianContract};
+use rgbstd::validation::{ResolveWitness, ValidationConfig, WitnessResolverError, WitnessStatus};
+use rgbstd::vm::WitnessOrd;
 use rgbstd::{Amount, ChainNet, GenesisSeal, Identity, Precision, Txid};
 use schemata::NonInflatableAsset;
 use strict_encoding::{StrictDeserialize, StrictSerialize};
@@ -31,6 +33,10 @@ use wasm_bindgen::prelude::*;
 // SparkUtkProof is two 33-byte pubkeys plus strict-encoding overhead;
 // 1 KiB is a comfortable ceiling that costs us nothing in the bundle.
 const PROOF_MAX_LEN: usize = 1024;
+
+// Genesis-only NIA consignment is small (a few KB), but we leave headroom
+// for future transition consignments. 1 MiB matches the relay's per-blob cap.
+const CONSIGNMENT_MAX_LEN: usize = 1_048_576;
 
 /// Derive `U_tweaked = U_base + t·G`, with
 /// `t = tagged_hash("Spark-RGB-UTK-v1", U_base ‖ msg)`.
@@ -128,22 +134,65 @@ impl SparkUtkProofJs {
 
 // ---- RGB issuance (chunk-β) ----
 
-/// Build a Non-Inflatable Asset (NIA) contract genesis programmatically
-/// and return the deterministic 32-byte contractId as hex.
+// Stand-in witness resolver for genesis-only consignments — no witness
+// transactions to look up, but the validator still calls `check_chain_net`
+// and may call `resolve_witness` defensively. We can't reuse rgb-ops'
+// internal `DumbResolver` (pub(crate)) or schemata's `NoResolver` (panics
+// in check_chain_net), so we ship our own minimal pass-through copy of
+// the rgb-ops DumbResolver.
+//
+// IMPORTANT: this resolver pretends every queried witness is resolved and
+// every chain net is allowed. It's safe for genesis-only consignments,
+// which have no bundles to resolve. Transition consignments (chunk-γ
+// session 2+) will need a real resolver that actually checks L1.
+struct GenesisOnlyResolver;
+
+impl ResolveWitness for GenesisOnlyResolver {
+    fn resolve_witness(&self, _: Txid) -> Result<WitnessStatus, WitnessResolverError> {
+        use bc::Tx;
+        use strict_encoding::StrictDumb;
+        Ok(WitnessStatus::Resolved(Tx::strict_dumb(), WitnessOrd::strict_dumb()))
+    }
+
+    fn check_chain_net(&self, _: ChainNet) -> Result<(), WitnessResolverError> { Ok(()) }
+}
+
+
+/// JS handle around the result of a NIA issuance — carries both the
+/// deterministic contractId (the value we bind a Spark leaf to as `msg`)
+/// AND the strict-encoded genesis consignment bytes (what a receiver
+/// needs to validate the issuance client-side without trusting us).
+#[wasm_bindgen]
+pub struct NiaIssuance {
+    contract_id_hex: String,
+    consignment_hex: String,
+}
+
+#[wasm_bindgen]
+impl NiaIssuance {
+    #[wasm_bindgen(getter, js_name = contractId)]
+    pub fn contract_id(&self) -> String { self.contract_id_hex.clone() }
+
+    #[wasm_bindgen(getter, js_name = consignmentHex)]
+    pub fn consignment_hex(&self) -> String { self.consignment_hex.clone() }
+}
+
+/// Build a Non-Inflatable Asset (NIA) contract genesis programmatically.
 ///
-/// The contractId is the canonical RGB identifier for the issued asset and
-/// serves as the `msg` we bind a Spark leaf to via the Spark-UTK mint flow.
-/// Same inputs always produce the same id (modulo `beneficiary_vout` and the
-/// random nonce inside `GenesisSeal::new_random`, which IS non-deterministic;
-/// callers wanting a reproducible id should round-trip the genesis instead).
+/// Returns `{ contractId, consignmentHex }`:
+///   - `contractId`: 32-byte hex, the canonical RGB identifier — fed into
+///     the Spark-UTK mint as `msg` so the leaf commits to this asset.
+///   - `consignmentHex`: strict-encoded `Consignment<false>` bytes — sent
+///     to the receiver alongside the Spark-UTK proof so they can validate
+///     the issuance client-side via `validateNiaConsignment` below.
 ///
-/// `ticker` / `name`: human-readable asset metadata (e.g. "TEST", "Test Asset").
-/// `supply`: issued supply at genesis (allocated entirely to the beneficiary).
+/// `ticker` / `name`: human-readable metadata.
+/// `supply`: issued supply (allocated entirely to the beneficiary).
 /// `beneficiary_txid_hex` / `beneficiary_vout`: the L1 outpoint that will
-/// receive the asset at issuance. For Spark-UTK use, this is typically a
-/// dummy/placeholder outpoint — we care about the contractId, not the seal.
+/// receive the asset at issuance. For UTK msg-binding use, a placeholder
+/// is fine — what matters is the deterministic contractId.
 /// `timestamp_secs`: unix timestamp for the genesis (caller-provided to
-/// avoid relying on chrono's wasm time source).
+/// avoid chrono's wasm time path).
 #[wasm_bindgen(js_name = issueNiaContract)]
 pub fn issue_nia_contract(
     ticker: &str,
@@ -152,7 +201,7 @@ pub fn issue_nia_contract(
     beneficiary_txid_hex: &str,
     beneficiary_vout: u32,
     timestamp_secs: i64,
-) -> Result<String, JsError> {
+) -> Result<NiaIssuance, JsError> {
     let txid = Txid::from_str(beneficiary_txid_hex)
         .map_err(|e| JsError::new(&format!("beneficiary_txid parse: {e}")))?;
     let beneficiary = GenesisSeal::new_random(txid, beneficiary_vout);
@@ -182,7 +231,45 @@ pub fn issue_nia_contract(
     .issue_contract_raw(timestamp_secs)
     .map_err(map_err("issue_contract_raw"))?;
 
-    Ok(hex::encode(contract.contract_id().to_byte_array()))
+    let contract_id_hex = hex::encode(contract.contract_id().to_byte_array());
+
+    let bytes = contract
+        .to_strict_serialized::<CONSIGNMENT_MAX_LEN>()
+        .map_err(map_err("strict encode consignment"))?;
+    let consignment_hex = hex::encode(bytes.release());
+
+    Ok(NiaIssuance { contract_id_hex, consignment_hex })
+}
+
+/// Decode + validate a strict-encoded NIA genesis consignment (hex).
+/// Returns the contractId (32-byte hex) extracted from the validated
+/// consignment, so the receiver can compare it against the `msgHex`
+/// the Spark-UTK proof was bound to. Validation runs the full
+/// rgb-consensus pipeline against `NonInflatableAsset::types()` as the
+/// trusted typesystem — i.e. the receiver verifies the asset against
+/// the canonical NIA schema, not a sender-supplied one.
+///
+/// Uses `NoResolver` because a genesis-only consignment has no witness
+/// transactions to look up; transition consignments (chunk-γ session 2+)
+/// will need a real resolver.
+#[wasm_bindgen(js_name = validateNiaConsignment)]
+pub fn validate_nia_consignment(consignment_hex: &str) -> Result<String, JsError> {
+    let bytes = hex::decode(consignment_hex).map_err(map_err("hex decode"))?;
+    let confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(bytes)
+        .map_err(map_err("size limit"))?;
+    let consignment = Consignment::<false>::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(confined)
+        .map_err(map_err("strict decode consignment"))?;
+
+    let validation_config = ValidationConfig {
+        chain_net: ChainNet::BitcoinMainnet,
+        trusted_typesystem: NonInflatableAsset::types(),
+        ..Default::default()
+    };
+    let valid = consignment
+        .validate(&GenesisOnlyResolver, &validation_config)
+        .map_err(|e| JsError::new(&format!("consignment validation: {e:?}")))?;
+
+    Ok(hex::encode(valid.contract_id().to_byte_array()))
 }
 
 // ---- helpers ----
@@ -251,11 +338,15 @@ mod tests {
         "14295d5bb1a191cdb6286dc0944df938421e3dfcbf0811353ccac4100c2068c5";
 
     #[test]
-    fn issue_nia_contract_returns_32byte_hex() {
-        let id = issue_nia_contract("TEST", "Test asset", 1_000_000, FIXTURE_TXID, 0, 0)
+    fn issue_nia_contract_returns_32byte_hex_id_and_consignment_bytes() {
+        let r = issue_nia_contract("TEST", "Test asset", 1_000_000, FIXTURE_TXID, 0, 0)
             .expect("issuance should succeed");
-        assert_eq!(id.len(), 64, "contractId is 32 bytes = 64 hex chars; got {id}");
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "non-hex char in {id}");
+        assert_eq!(r.contract_id_hex.len(), 64, "contractId is 32 bytes = 64 hex");
+        assert!(r.contract_id_hex.chars().all(|c| c.is_ascii_hexdigit()));
+        // Consignment is the strict-encoded contract; a genesis-only NIA is
+        // a few KB. Bound loosely to catch a regression in either direction.
+        assert!(r.consignment_hex.len() > 200, "consignment_hex too small: {}", r.consignment_hex.len());
+        assert!(r.consignment_hex.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -268,16 +359,39 @@ mod tests {
             .expect("issuance A");
         let b = issue_nia_contract("A", "A", 200, FIXTURE_TXID, 0, 1_700_000_000)
             .expect("issuance B");
-        assert_ne!(a, b, "differing supplies must produce differing contractIds");
+        assert_ne!(a.contract_id_hex, b.contract_id_hex,
+            "differing supplies must produce differing contractIds");
+    }
+
+    #[test]
+    fn issue_then_validate_consignment_roundtrip() {
+        // The whole chunk-γ session 1 promise: sender issues, gets bytes,
+        // wire roundtrip (simulated as pure passthrough here), receiver
+        // validates and pulls the same contractId out byte-for-byte.
+        let issued = issue_nia_contract("RND", "Round-trip", 42, FIXTURE_TXID, 0, 1_700_000_001)
+            .expect("issuance");
+        let validated_id = validate_nia_consignment(&issued.consignment_hex)
+            .expect("validate should succeed");
+        assert_eq!(
+            validated_id, issued.contract_id_hex,
+            "receiver-derived contractId must equal sender contractId"
+        );
     }
 
     // `JsError::new` panics on non-wasm targets (it's a stub when not compiled
-    // to wasm32), so the error-path assertion is gated to the wasm target.
+    // to wasm32), so error-path assertions are gated to the wasm target.
     // Compile-time checking still happens on native via `cargo check`.
     #[cfg(target_arch = "wasm32")]
     #[test]
     fn issue_nia_contract_rejects_bad_txid() {
         let r = issue_nia_contract("X", "X", 1, "not-hex", 0, 0);
         assert!(r.is_err(), "non-hex txid must be rejected");
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn validate_nia_consignment_rejects_garbage() {
+        let r = validate_nia_consignment("00");
+        assert!(r.is_err(), "single-byte garbage must not decode as a consignment");
     }
 }

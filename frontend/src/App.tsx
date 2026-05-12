@@ -98,6 +98,15 @@ interface LeafReference {
    *  When absent, the leaf is vanilla and the receiver verifies via
    *  addPublicKeys(u_base, operator) == verifyingPublicKey. */
   msgHex?: string
+  /** When present (hex of a strict-encoded `Consignment<false>`), the RGB
+   *  layer comes along for the ride. The receiver runs
+   *  `core.validateNiaConsignment(consignmentHex)` to:
+   *    1. Validate the consignment against the canonical NIA schema
+   *    2. Extract the deterministic contractId
+   *    3. Cross-check contractId == msgHex
+   *  When all three pass, the receiver knows the Spark leaf is bound to a
+   *  validly-issued RGB asset whose contractId they verified themselves. */
+  consignmentHex?: string
 }
 
 type ConsignmentEnvelope =
@@ -554,6 +563,11 @@ function SparkUtkMintViaTransfer() {
   const [leaves, setLeaves] = useState<SparkLeafRow[]>([])
   const [selectedLeafId, setSelectedLeafId] = useState('')
   const [msgHex, setMsgHex] = useState('')
+  // When the msg came from an NIA issuance, this holds the strict-encoded
+  // consignment hex so it can be attached to the persistent pathTweaks entry
+  // during mint, and then surfaced by ConsignmentLab when sending a proof.
+  // Cleared whenever the user touches the msg field manually or hits random.
+  const [pendingConsignmentHex, setPendingConsignmentHex] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [result, setResult] = useState<MintViaTransferResult | null>(null)
@@ -584,6 +598,7 @@ function SparkUtkMintViaTransfer() {
     const b = new Uint8Array(32)
     crypto.getRandomValues(b)
     setMsgHex(bytesToHex(b))
+    setPendingConsignmentHex(null)
   }
 
   async function mint() {
@@ -607,16 +622,30 @@ function SparkUtkMintViaTransfer() {
         verifyingKey: sourceLeaf.verifyingPublicKey.toLowerCase(),
       }
 
-      const { transferId, leaf } = await mintViaSelfTransfer(selectedLeafId, msgBytes)
+      const { transferId, leaf } = await mintViaSelfTransfer(
+        selectedLeafId,
+        msgBytes,
+        pendingConsignmentHex ?? undefined,
+      )
 
       // Verification math:
-      //   expected = deriveVerifyingKey(leafBefore.uBase, msg, operator)
-      //            = (leafBefore.uBase + t·G) + operator
+      //   expected = deriveVerifyingKey(entry.uBase, msg, operator)
+      //            = (entry.uBase + t(entry.uBase, msg)·G) + operator
       //            = U_tweaked + operator
       //   actual   = leaf.verifyingPublicKey (SE-persisted)
-      // Use the pre-mint u_base — the post-mint leaf.ownerSigningPublicKey is
-      // already U_tweaked, so re-derive on that would double-tweak.
-      const uBasePre = leafBefore.uBase
+      // entry.uBase is the vanilla HD derivation for the DESTINATION leaf id
+      // (the path the SDK used in claimTransferCore's newKeyDerivation).
+      // It is NOT necessarily the source leaf's pre-mint ownerSigningPublicKey:
+      // when the destination id differs from the source id (or when the source
+      // was already tweaked), those values diverge.
+      const entry = getPathTweak(leaf.id)
+      if (!entry) {
+        throw new Error(
+          `pathTweaks missing entry for new leaf ${leaf.id} after mint — ` +
+          'mintViaSelfTransfer post-condition violated',
+        )
+      }
+      const uBasePre = bytesToHex(entry.uBase).toLowerCase()
       const operator = leaf.operatorPublicKey.toLowerCase()
       const realVk = leaf.verifyingPublicKey.toLowerCase()
       const expectedVk = core.deriveVerifyingKey(uBasePre, cleanMsg, operator).toLowerCase()
@@ -685,15 +714,33 @@ function SparkUtkMintViaTransfer() {
       <div style={{ display: 'flex', gap: 6 }}>
         <input
           value={msgHex}
-          onChange={(e) => setMsgHex(e.target.value)}
+          onChange={(e) => {
+            setMsgHex(e.target.value)
+            setPendingConsignmentHex(null)
+          }}
           placeholder="random 32-byte commitment, or issue an NIA contract below"
           style={{ flex: 1, fontFamily: 'monospace', fontSize: 12, padding: 6 }}
           disabled={busy}
         />
         <button onClick={randomMsg} disabled={busy}>random</button>
       </div>
+      {pendingConsignmentHex && (
+        <div style={{
+          marginTop: 4, fontSize: 11, color: '#2a6',
+        }}>
+          RGB consignment ({pendingConsignmentHex.length / 2} bytes) will travel
+          with the proof — receiver re-validates the issuance client-side.
+        </div>
+      )}
 
-      <IssueNiaInline core={core} disabled={busy} onContractId={setMsgHex} />
+      <IssueNiaInline
+        core={core}
+        disabled={busy}
+        onIssuance={(contractId, consignmentHex) => {
+          setMsgHex(contractId)
+          setPendingConsignmentHex(consignmentHex)
+        }}
+      />
 
       <div style={{ marginTop: 10 }}>
         <button
@@ -762,18 +809,24 @@ const NIA_PLACEHOLDER_TXID = 'ab'.repeat(32) // 32 bytes of 0xab, valid hex
 function IssueNiaInline({
   core,
   disabled,
-  onContractId,
+  onIssuance,
 }: {
   core: SparkCore | null
   disabled: boolean
-  onContractId: (id: string) => void
+  /** Called when an NIA issuance succeeds. `contractId` is the 32-byte hex
+   *  to use as Spark-UTK msg; `consignmentHex` is the strict-encoded
+   *  Consignment<false> bytes that the receiver will validate. */
+  onIssuance: (contractId: string, consignmentHex: string) => void
 }) {
   const [ticker, setTicker] = useState('TEST')
   const [name, setName] = useState('Test asset')
   const [supply, setSupply] = useState('1000000')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
-  const [lastId, setLastId] = useState<string | null>(null)
+  const [lastResult, setLastResult] = useState<{
+    contractId: string
+    consignmentSize: number
+  } | null>(null)
 
   async function issue() {
     setErr(null)
@@ -791,7 +844,7 @@ function IssueNiaInline({
       if (!nameTrim) throw new Error('name required')
 
       const nowSecs = BigInt(Math.floor(Date.now() / 1000))
-      const id = core.issueNiaContract(
+      const issuance = core.issueNiaContract(
         tickerTrim,
         nameTrim,
         supplyBig,
@@ -799,8 +852,11 @@ function IssueNiaInline({
         0,
         nowSecs,
       )
-      setLastId(id)
-      onContractId(id)
+      const contractId = issuance.contractId
+      const consignmentHex = issuance.consignmentHex
+      issuance.free()
+      setLastResult({ contractId, consignmentSize: consignmentHex.length / 2 })
+      onIssuance(contractId, consignmentHex)
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -843,9 +899,12 @@ function IssueNiaInline({
           {busy ? 'issuing…' : 'issue & use as msg'}
         </button>
       </div>
-      {lastId && (
-        <div style={{ marginTop: 6, fontSize: 11, fontFamily: 'monospace', color: '#666', wordBreak: 'break-all' }}>
-          contractId: {lastId}
+      {lastResult && (
+        <div style={{ marginTop: 6, fontSize: 11, color: '#666' }}>
+          <div style={{ fontFamily: 'monospace', wordBreak: 'break-all' }}>
+            contractId: {lastResult.contractId}
+          </div>
+          <div>consignment: {lastResult.consignmentSize} bytes (will be attached to the proof)</div>
         </div>
       )}
       {err && (
@@ -873,12 +932,24 @@ type LeafVerification =
   | { kind: 'mismatch'; expected: string; got: string; algo: LeafVerifyAlgo }
   | { kind: 'error'; message: string }                                  // derive call threw
 
+// Receiver-side validation of the optional RGB consignment carried by the
+// envelope. We run the rgb-consensus validator (wasm) against the canonical
+// NIA schema, then cross-check the validated contractId matches the
+// msgHex the Spark-UTK proof was bound to.
+type RgbValidation =
+  | { kind: 'none' }                                            // no consignment attached
+  | { kind: 'ok'; contractId: string }                          // validator OK + contractId == msgHex
+  | { kind: 'msg-mismatch'; contractId: string; msgHex: string } // validator OK but msg disagrees
+  | { kind: 'missing-msg' }                                     // consignment present but envelope has no msgHex to cross-check
+  | { kind: 'fail'; message: string }                           // validator rejected
+
 interface DecodedConsignment {
   raw: string                  // hex of the raw bytes received
   envelope?: ConsignmentEnvelope
   proofUBase?: string
   proofOperator?: string
   leafVerification?: LeafVerification
+  rgbValidation?: RgbValidation
   signatureCheck?: SignatureCheck
   parseError?: string
 }
@@ -985,12 +1056,15 @@ function ConsignmentLab({
         const tweakEntry = getPathTweak(selectedLeaf.id)
         let proofUBase: string
         let msgHex: string | undefined
+        let consignmentHex: string | undefined
         if (tweakEntry) {
           proofUBase = bytesToHex(tweakEntry.uBase).toLowerCase()
           msgHex = bytesToHex(tweakEntry.msg).toLowerCase()
+          consignmentHex = tweakEntry.consignmentHex
         } else {
           proofUBase = selectedLeaf.ownerSigningPublicKey.toLowerCase()
           msgHex = undefined
+          consignmentHex = undefined
         }
         if (!COMPRESSED_PUBKEY_HEX_RE.test(proofUBase)) {
           throw new Error(`proof u_base is not a 33-byte compressed pubkey: ${proofUBase}`)
@@ -1013,6 +1087,7 @@ function ConsignmentLab({
             network: selectedLeaf.network,
             verifyingPublicKey: selectedLeaf.verifyingPublicKey.toLowerCase(),
             ...(msgHex ? { msgHex } : {}),
+            ...(consignmentHex ? { consignmentHex } : {}),
           },
         }
       } else {
@@ -1101,6 +1176,30 @@ function ConsignmentLab({
             leafVerification = { kind: 'error', message: e instanceof Error ? e.message : String(e) }
           }
         }
+        let rgbValidation: RgbValidation = { kind: 'none' }
+        if (leafRef?.consignmentHex) {
+          try {
+            const validatedContractId = core
+              .validateNiaConsignment(leafRef.consignmentHex)
+              .toLowerCase()
+            if (!leafRef.msgHex) {
+              rgbValidation = { kind: 'missing-msg' }
+            } else if (leafRef.msgHex.toLowerCase() === validatedContractId) {
+              rgbValidation = { kind: 'ok', contractId: validatedContractId }
+            } else {
+              rgbValidation = {
+                kind: 'msg-mismatch',
+                contractId: validatedContractId,
+                msgHex: leafRef.msgHex.toLowerCase(),
+              }
+            }
+          } catch (e) {
+            rgbValidation = {
+              kind: 'fail',
+              message: e instanceof Error ? e.message : String(e),
+            }
+          }
+        }
         const signatureCheck: SignatureCheck =
           env.v === 4 ? verifyEnvelope(env) : { kind: 'missing' }
         entry = {
@@ -1109,6 +1208,7 @@ function ConsignmentLab({
           proofUBase,
           proofOperator,
           leafVerification,
+          rgbValidation,
           signatureCheck,
         }
       } catch (e) {
@@ -1431,6 +1531,35 @@ function DecodedView({ entry }: { entry: DecodedConsignment }) {
     }
   }
 
+  const rv = entry.rgbValidation
+  let rgbBadge: ReactNode = null
+  if (rv) {
+    if (rv.kind === 'ok') {
+      rgbBadge = (
+        <span style={{ color: 'seagreen' }}>
+          OK · NIA consignment validates AND contractId == msg{' '}
+          (<code>{rv.contractId.slice(0, 16)}…</code>)
+        </span>
+      )
+    } else if (rv.kind === 'msg-mismatch') {
+      rgbBadge = (
+        <span style={{ color: '#c00' }}>
+          MISMATCH · consignment validates but contractId {rv.contractId.slice(0, 12)}… ≠ msg {rv.msgHex.slice(0, 12)}…
+        </span>
+      )
+    } else if (rv.kind === 'missing-msg') {
+      rgbBadge = (
+        <span style={{ color: '#c80' }}>
+          consignment present but envelope has no msgHex to cross-check
+        </span>
+      )
+    } else if (rv.kind === 'fail') {
+      rgbBadge = (
+        <span style={{ color: '#c00' }}>FAIL · {rv.message}</span>
+      )
+    }
+  }
+
   const sc = entry.signatureCheck
   let signatureBadge: ReactNode = null
   if (sc) {
@@ -1497,6 +1626,21 @@ function DecodedView({ entry }: { entry: DecodedConsignment }) {
               <div style={{ marginTop: 4 }}>
                 <span style={{ color: '#666' }}>leaf binding:</span> {leafBadge}
               </div>
+              {rgbBadge && (
+                <div style={{ marginTop: 4 }}>
+                  <span style={{ color: '#666' }}>rgb binding:</span> {rgbBadge}
+                </div>
+              )}
+              {leafRef.consignmentHex && (
+                <details style={{ marginTop: 4 }}>
+                  <summary style={{ color: '#666', cursor: 'pointer', fontSize: 12 }}>
+                    consignment ({leafRef.consignmentHex.length / 2} B)
+                  </summary>
+                  <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#555', wordBreak: 'break-all' }}>
+                    {leafRef.consignmentHex.slice(0, 200)}…
+                  </div>
+                </details>
+              )}
             </>
           )}
           {env.v === 4 && (

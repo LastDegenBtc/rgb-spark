@@ -2,6 +2,20 @@
 /* eslint-disable */
 
 /**
+ * JS handle around the result of a NIA issuance — carries both the
+ * deterministic contractId (the value we bind a Spark leaf to as `msg`)
+ * AND the strict-encoded genesis consignment bytes (what a receiver
+ * needs to validate the issuance client-side without trusting us).
+ */
+export class NiaIssuance {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    readonly consignmentHex: string;
+    readonly contractId: string;
+}
+
+/**
  * JS handle around [`SparkUtkProof`]. Round-trips through the same
  * strict-encoding the rgb-consensus validator consumes.
  */
@@ -46,39 +60,58 @@ export function deriveUTweaked(u_base_hex: string, msg_hex: string): string;
 export function deriveVerifyingKey(u_base_hex: string, msg_hex: string, operator_hex: string): string;
 
 /**
- * Build a Non-Inflatable Asset (NIA) contract genesis programmatically
- * and return the deterministic 32-byte contractId as hex.
+ * Build a Non-Inflatable Asset (NIA) contract genesis programmatically.
  *
- * The contractId is the canonical RGB identifier for the issued asset and
- * serves as the `msg` we bind a Spark leaf to via the Spark-UTK mint flow.
- * Same inputs always produce the same id (modulo `beneficiary_vout` and the
- * random nonce inside `GenesisSeal::new_random`, which IS non-deterministic;
- * callers wanting a reproducible id should round-trip the genesis instead).
+ * Returns `{ contractId, consignmentHex }`:
+ *   - `contractId`: 32-byte hex, the canonical RGB identifier — fed into
+ *     the Spark-UTK mint as `msg` so the leaf commits to this asset.
+ *   - `consignmentHex`: strict-encoded `Consignment<false>` bytes — sent
+ *     to the receiver alongside the Spark-UTK proof so they can validate
+ *     the issuance client-side via `validateNiaConsignment` below.
  *
- * `ticker` / `name`: human-readable asset metadata (e.g. "TEST", "Test Asset").
- * `supply`: issued supply at genesis (allocated entirely to the beneficiary).
+ * `ticker` / `name`: human-readable metadata.
+ * `supply`: issued supply (allocated entirely to the beneficiary).
  * `beneficiary_txid_hex` / `beneficiary_vout`: the L1 outpoint that will
- * receive the asset at issuance. For Spark-UTK use, this is typically a
- * dummy/placeholder outpoint — we care about the contractId, not the seal.
+ * receive the asset at issuance. For UTK msg-binding use, a placeholder
+ * is fine — what matters is the deterministic contractId.
  * `timestamp_secs`: unix timestamp for the genesis (caller-provided to
- * avoid relying on chrono's wasm time source).
+ * avoid chrono's wasm time path).
  */
-export function issueNiaContract(ticker: string, name: string, supply: bigint, beneficiary_txid_hex: string, beneficiary_vout: number, timestamp_secs: bigint): string;
+export function issueNiaContract(ticker: string, name: string, supply: bigint, beneficiary_txid_hex: string, beneficiary_vout: number, timestamp_secs: bigint): NiaIssuance;
+
+/**
+ * Decode + validate a strict-encoded NIA genesis consignment (hex).
+ * Returns the contractId (32-byte hex) extracted from the validated
+ * consignment, so the receiver can compare it against the `msgHex`
+ * the Spark-UTK proof was bound to. Validation runs the full
+ * rgb-consensus pipeline against `NonInflatableAsset::types()` as the
+ * trusted typesystem — i.e. the receiver verifies the asset against
+ * the canonical NIA schema, not a sender-supplied one.
+ *
+ * Uses `NoResolver` because a genesis-only consignment has no witness
+ * transactions to look up; transition consignments (chunk-γ session 2+)
+ * will need a real resolver.
+ */
+export function validateNiaConsignment(consignment_hex: string): string;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly __wbg_niaissuance_free: (a: number, b: number) => void;
     readonly __wbg_sparkutkproofjs_free: (a: number, b: number) => void;
     readonly deriveOutputXonly: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly deriveUTweaked: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly deriveVerifyingKey: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
-    readonly issueNiaContract: (a: number, b: number, c: number, d: number, e: bigint, f: number, g: number, h: number, i: bigint) => [number, number, number, number];
+    readonly issueNiaContract: (a: number, b: number, c: number, d: number, e: bigint, f: number, g: number, h: number, i: bigint) => [number, number, number];
+    readonly niaissuance_consignmentHex: (a: number) => [number, number];
+    readonly niaissuance_contractId: (a: number) => [number, number];
     readonly sparkutkproofjs_decode: (a: number, b: number) => [number, number, number];
     readonly sparkutkproofjs_encode: (a: number) => [number, number, number, number];
     readonly sparkutkproofjs_new: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly sparkutkproofjs_operator: (a: number) => [number, number];
     readonly sparkutkproofjs_uBase: (a: number) => [number, number];
+    readonly validateNiaConsignment: (a: number, b: number) => [number, number, number, number];
     readonly rustsecp256k1_v0_10_0_context_create: (a: number) => number;
     readonly rustsecp256k1_v0_10_0_context_destroy: (a: number) => void;
     readonly rustsecp256k1_v0_10_0_default_error_callback_fn: (a: number, b: number) => void;

@@ -7,7 +7,7 @@
 
 import { SparkWallet, KeyDerivationType } from '@buildonspark/spark-sdk';
 import type { SparkSigner } from '@buildonspark/spark-sdk';
-import { setPathTweak, clearPathTweak } from './rgbAwareSigner';
+import { setPathTweak, clearPathTweak, RgbAwareSparkSigner } from './rgbAwareSigner';
 
 type Network = 'MAINNET' | 'REGTEST' | 'TESTNET';
 
@@ -369,6 +369,7 @@ interface SparkWalletInternals {
 export async function mintViaSelfTransfer(
   leafId: string,
   msgBytes: Uint8Array,
+  consignmentHex?: string,
 ): Promise<MintViaSelfTransferResult> {
   if (!walletInstance) throw new Error('Wallet not initialized');
   if (msgBytes.length !== 32) {
@@ -380,17 +381,13 @@ export async function mintViaSelfTransfer(
   if (!sourceLeaf) {
     throw new Error(`leaf ${leafId} not found in wallet`);
   }
-  // Capture the source leaf's vanilla u_base (pre-mint). The post-mint leaf
-  // will carry U_tweaked as its ownerSigningPublicKey; we need to remember
-  // U_base for proof builders that reconstruct the Spark-UTK relation
-  //   verifyingKey = U_base + tagged_hash(U_base ‖ msg)·G + operator
-  // without having to talk back to the signer.
-  const sourceUBase = sourceLeaf.ownerSigningPublicKey as Uint8Array;
-  if (!(sourceUBase instanceof Uint8Array) || sourceUBase.length !== 33) {
+  const internalsForSigner = walletInstance as unknown as {
+    config?: { signer?: RgbAwareSparkSigner };
+  };
+  const signer = internalsForSigner.config?.signer;
+  if (!signer || typeof signer.getVanillaPublicKeyFromDerivation !== 'function') {
     throw new Error(
-      `source leaf ${leafId} ownerSigningPublicKey is not 33-byte compressed (got ${
-        sourceUBase instanceof Uint8Array ? `${sourceUBase.length} bytes` : typeof sourceUBase
-      })`,
+      'wallet signer is not RgbAwareSparkSigner — vanilla u_base capture would silently fall through',
     );
   }
 
@@ -411,7 +408,12 @@ export async function mintViaSelfTransfer(
     throw new Error('transferService not accessible on walletInstance');
   }
 
-  // 1. Send phase — pathTweaks empty, source signs vanilla.
+  // 1. Send phase — pathTweaks empty for the source path so the SDK
+  //    signs the source with the vanilla owner key the SE has on record.
+  //    (For an already-tweaked source, ownerSigningPublicKey ≠ vanilla,
+  //    but Spark's transfer flow doesn't gate on this — empirically the
+  //    send succeeds regardless. The signer-side tweak only kicks in on
+  //    the receiver's claim path below.)
   const leafKeyTweak = {
     leaf: sourceLeaf,
     keyDerivation: { type: KeyDerivationType.LEAF, path: leafId },
@@ -420,39 +422,74 @@ export async function mintViaSelfTransfer(
   };
   const transfer = await transferService.sendTransferV3([leafKeyTweak]);
 
-  // 2. Self-referencing tweak — during the claim, the SDK calls the signer
-  //    with newKeyDerivation = {LEAF, path: leafId}, where leafId is the
-  //    SOURCE leaf id (not the new one yet, which the SE only assigns later).
-  //    A self-ref entry (sourcePath == currentLeafId) makes the signer return
-  //    U_tweaked at that moment.
-  setPathTweak(leafId, leafId, msgBytes, sourceUBase);
+  // 2. Query the pending transfer to learn the DESTINATION leaf id the SDK
+  //    will use during claimTransferCore's newKeyDerivation = {LEAF, path: ???}.
+  //    We can't predict this from the source id: the SE assigns the destination
+  //    leaf id during sendTransferV3, and for tweaked-source self-transfers
+  //    it's NOT the same as the source id (bug observed 2026-05-12 chunk-γ
+  //    session 1: setting pathTweaks for source.id resulted in a vanilla
+  //    leaf because the SDK actually asked the signer for a different path).
+  interface PendingShape {
+    leaves?: Array<{ leaf?: { id?: string } }>;
+  }
+  const pending = (await transferService.queryTransfer(transfer.id)) as PendingShape;
+  if (!pending) {
+    throw new Error(`pending transfer ${transfer.id} not found after sendTransferV3`);
+  }
+  const destLeafId = pending.leaves?.[0]?.leaf?.id;
+  if (typeof destLeafId !== 'string' || destLeafId.length === 0) {
+    throw new Error(
+      `could not extract destination leaf id from pending transfer ${transfer.id}`,
+    );
+  }
+  // Capture the vanilla u_base for the DESTINATION path — this is what
+  // the signer's super.getSigningPrivateKeyFromDerivation will produce
+  // during the claim's newKeyDerivation lookup, and what the receiver
+  // needs in the proof to reconstruct U_tweaked via deriveVerifyingKey.
+  const destUBase = await signer.getVanillaPublicKeyFromDerivation({
+    type: KeyDerivationType.LEAF,
+    path: destLeafId,
+  });
+  if (destUBase.length !== 33) {
+    throw new Error(
+      `signer-derived vanilla u_base must be 33 bytes compressed, got ${destUBase.length}`,
+    );
+  }
+
+  // 3. Self-referencing tweak for the destination path — fires the tweak
+  //    during the claim's newKeyDerivation lookup. Keeping the entry alive
+  //    after claim turns it into the persistent record the receiver uses.
+  setPathTweak(destLeafId, destLeafId, msgBytes, destUBase, consignmentHex);
   let claimedNodes: SparkClaimedNode[];
   try {
-    const pending = await transferService.queryTransfer(transfer.id);
-    if (!pending) {
-      throw new Error(`pending transfer ${transfer.id} not found after sendTransferV3`);
-    }
     claimedNodes = await internals.claimTransfer({ transfer: pending, emit: false });
-  } finally {
-    // Always drop the self-ref so future getLeaves()/sync() asking for the
-    // source leaf's path returns vanilla. (The source leaf is spent anyway,
-    // but defensive — the SDK may still query that path during ack flows.)
-    clearPathTweak(leafId);
+  } catch (err) {
+    // On failure, the SE didn't persist a tweaked leaf — drop the entry so
+    // the in-memory state doesn't lie about a leaf that doesn't exist.
+    clearPathTweak(destLeafId);
+    throw err;
   }
 
   if (claimedNodes.length === 0) {
+    clearPathTweak(destLeafId);
     throw new Error(`claimTransfer returned no nodes for source ${leafId}`);
   }
-  // For a single-leaf self-transfer there should be exactly one new node.
   const expectedValue = Number(sourceLeaf.value ?? 0);
   const newNode =
     claimedNodes.find((n) => n.value === expectedValue) ?? claimedNodes[0];
 
-  // 3. Indirect persistent entry — for every future getPublicKeyFromDerivation
-  //    or getSigningPrivateKeyFromDerivation on the NEW leaf id, the signer
-  //    must return U_tweaked. Bind the new id back to the original sourcePath
-  //    so it can re-derive the base, then apply the same msg.
-  setPathTweak(String(newNode.id), leafId, msgBytes, sourceUBase);
+  // 4. Sanity check: the resulting leaf id should match the destination id
+  //    we predicted from the pending transfer. If it doesn't, the path the
+  //    SDK actually used for claim wasn't destLeafId, so our pathTweaks
+  //    entry is for the wrong path — surface this loudly rather than silently
+  //    producing a leaf that won't verify.
+  if (String(newNode.id) !== destLeafId) {
+    clearPathTweak(destLeafId);
+    throw new Error(
+      `destination leaf id from pending (${destLeafId}) doesn't match the ` +
+      `claim result id (${newNode.id}); SDK path-resolution drift — please report`,
+    );
+  }
 
   const newLeaf: SparkLeafRow = {
     id: String(newNode.id),
