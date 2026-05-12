@@ -74,6 +74,33 @@ export class SparkUtkProofJs {
 export function buildNiaTransition(genesis_hex: string, consume_index: number, amount: bigint, beneficiary_txid_hex: string, beneficiary_vout: number): NiaTransition;
 
 /**
+ * Build a NIA transition consuming the `no`-th `assetOwner` assignment
+ * of a PRIOR TRANSITION (not the genesis). The chain so far is
+ * `genesis → prev_transition`; this builds the next link
+ * `genesis → prev_transition → new_transition`.
+ *
+ * Used by the orderbook settlement flow: when a seller already has
+ * a transition T_1 binding them to the asset, completing a swap means
+ * producing T_2 that consumes T_1's output and allocates to the buyer
+ * — without T_2 the buyer has no chain-of-ownership artifact even if
+ * the Spark leaf is transferred via HTLC.
+ *
+ * `prev_transition_hex`: strict-encoded `Transition` (= prior link in
+ *                        the chain).
+ * `prev_genesis_hex`: the `Consignment<false>` of the contract's
+ *                     genesis (needed to recover contractId; for
+ *                     conservation checks the WASM schema validator
+ *                     in `validateNiaTransitionFromPrev` also re-runs
+ *                     the genesis through `validate_state`).
+ * `consume_index`: which assetOwner output of `prev_transition` to
+ *                  spend. `0` for the single-output case our
+ *                  `buildNiaTransition` produces.
+ * `amount`: must equal the prior allocation's amount (`svs OS_ASSET`
+ *           conservation — no split/merge yet at this layer).
+ */
+export function buildNiaTransitionFromPrev(prev_transition_hex: string, prev_genesis_hex: string, consume_index: number, amount: bigint, beneficiary_txid_hex: string, beneficiary_vout: number): NiaTransition;
+
+/**
  * Derive the L1 unilateral-exit BIP-341 noscript x-only output key.
  * Returns a 32-byte x-only pubkey (hex) — the same value that would
  * appear in the leaf's `verifyingKey`-tweaked p2tr output.
@@ -148,6 +175,22 @@ export function validateNiaConsignment(consignment_hex: string): string;
  */
 export function validateNiaTransition(transition_hex: string, genesis_hex: string): string;
 
+/**
+ * Validate a NIA transition chain of length 3: genesis → prev_transition
+ * → transition. Re-runs the rgb-consensus schema validator on every
+ * link (genesis schema check, prev_transition consumed-from-genesis
+ * check, transition consumed-from-prev_transition check) and returns
+ * `transition.id()` if all three validate.
+ *
+ * Same trust posture as `validateNiaTransition`: no L1 witness, no
+ * `ResolveWitness` — Spark replaces the transport layer (see
+ * `feedback_no_synthetic_l1_witness`). Witness metadata fed to
+ * `OrdOpRef::Transition(...)` is `strict_dumb` because the NIA AluVM
+ * scripts only inspect input/output assignments, never the witness
+ * txid.
+ */
+export function validateNiaTransitionFromPrev(transition_hex: string, prev_transition_hex: string, prev_genesis_hex: string): string;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -156,6 +199,7 @@ export interface InitOutput {
     readonly __wbg_niatransition_free: (a: number, b: number) => void;
     readonly __wbg_sparkutkproofjs_free: (a: number, b: number) => void;
     readonly buildNiaTransition: (a: number, b: number, c: number, d: bigint, e: number, f: number, g: number) => [number, number, number];
+    readonly buildNiaTransitionFromPrev: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number) => [number, number, number];
     readonly deriveOutputXonly: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly deriveUTweaked: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly deriveVerifyingKey: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
@@ -171,6 +215,7 @@ export interface InitOutput {
     readonly sparkutkproofjs_uBase: (a: number) => [number, number];
     readonly validateNiaConsignment: (a: number, b: number) => [number, number, number, number];
     readonly validateNiaTransition: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly validateNiaTransitionFromPrev: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly rustsecp256k1_v0_10_0_context_create: (a: number) => number;
     readonly rustsecp256k1_v0_10_0_context_destroy: (a: number) => void;
     readonly rustsecp256k1_v0_10_0_default_error_callback_fn: (a: number, b: number) => void;

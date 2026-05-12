@@ -260,6 +260,52 @@ export function buildNiaTransition(genesis_hex, consume_index, amount, beneficia
 }
 
 /**
+ * Build a NIA transition consuming the `no`-th `assetOwner` assignment
+ * of a PRIOR TRANSITION (not the genesis). The chain so far is
+ * `genesis → prev_transition`; this builds the next link
+ * `genesis → prev_transition → new_transition`.
+ *
+ * Used by the orderbook settlement flow: when a seller already has
+ * a transition T_1 binding them to the asset, completing a swap means
+ * producing T_2 that consumes T_1's output and allocates to the buyer
+ * — without T_2 the buyer has no chain-of-ownership artifact even if
+ * the Spark leaf is transferred via HTLC.
+ *
+ * `prev_transition_hex`: strict-encoded `Transition` (= prior link in
+ *                        the chain).
+ * `prev_genesis_hex`: the `Consignment<false>` of the contract's
+ *                     genesis (needed to recover contractId; for
+ *                     conservation checks the WASM schema validator
+ *                     in `validateNiaTransitionFromPrev` also re-runs
+ *                     the genesis through `validate_state`).
+ * `consume_index`: which assetOwner output of `prev_transition` to
+ *                  spend. `0` for the single-output case our
+ *                  `buildNiaTransition` produces.
+ * `amount`: must equal the prior allocation's amount (`svs OS_ASSET`
+ *           conservation — no split/merge yet at this layer).
+ * @param {string} prev_transition_hex
+ * @param {string} prev_genesis_hex
+ * @param {number} consume_index
+ * @param {bigint} amount
+ * @param {string} beneficiary_txid_hex
+ * @param {number} beneficiary_vout
+ * @returns {NiaTransition}
+ */
+export function buildNiaTransitionFromPrev(prev_transition_hex, prev_genesis_hex, consume_index, amount, beneficiary_txid_hex, beneficiary_vout) {
+    const ptr0 = passStringToWasm0(prev_transition_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(prev_genesis_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(beneficiary_txid_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.buildNiaTransitionFromPrev(ptr0, len0, ptr1, len1, consume_index, amount, ptr2, len2, beneficiary_vout);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return NiaTransition.__wrap(ret[0]);
+}
+
+/**
  * Derive the L1 unilateral-exit BIP-341 noscript x-only output key.
  * Returns a 32-byte x-only pubkey (hex) — the same value that would
  * appear in the leaf's `verifyingKey`-tweaked p2tr output.
@@ -473,6 +519,49 @@ export function validateNiaTransition(transition_hex, genesis_hex) {
         return getStringFromWasm0(ptr3, len3);
     } finally {
         wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+    }
+}
+
+/**
+ * Validate a NIA transition chain of length 3: genesis → prev_transition
+ * → transition. Re-runs the rgb-consensus schema validator on every
+ * link (genesis schema check, prev_transition consumed-from-genesis
+ * check, transition consumed-from-prev_transition check) and returns
+ * `transition.id()` if all three validate.
+ *
+ * Same trust posture as `validateNiaTransition`: no L1 witness, no
+ * `ResolveWitness` — Spark replaces the transport layer (see
+ * `feedback_no_synthetic_l1_witness`). Witness metadata fed to
+ * `OrdOpRef::Transition(...)` is `strict_dumb` because the NIA AluVM
+ * scripts only inspect input/output assignments, never the witness
+ * txid.
+ * @param {string} transition_hex
+ * @param {string} prev_transition_hex
+ * @param {string} prev_genesis_hex
+ * @returns {string}
+ */
+export function validateNiaTransitionFromPrev(transition_hex, prev_transition_hex, prev_genesis_hex) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const ptr0 = passStringToWasm0(transition_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(prev_transition_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(prev_genesis_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.validateNiaTransitionFromPrev(ptr0, len0, ptr1, len1, ptr2, len2);
+        var ptr4 = ret[0];
+        var len4 = ret[1];
+        if (ret[3]) {
+            ptr4 = 0; len4 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_free(deferred5_0, deferred5_1, 1);
     }
 }
 function __wbg_get_imports() {

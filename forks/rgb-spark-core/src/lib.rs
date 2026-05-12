@@ -324,6 +324,29 @@ fn genesis_asset_at(
     Ok(*value)
 }
 
+// Same as `genesis_asset_at`, but pulls from a `Transition`'s output
+// assignments instead. Used when building a transition that consumes
+// the output of a prior transition (chain depth ≥ 2): the new
+// `TransitionBuilder.add_input` needs the prior `RevealedValue` to
+// pass through to the schema validator's conservation check.
+fn transition_asset_at(
+    tr: &Transition,
+    no: u16,
+) -> Result<RevealedValue, JsError> {
+    let typed = tr
+        .assignments
+        .get(&OS_ASSET)
+        .ok_or_else(|| JsError::new("transition: missing OS_ASSET assignment"))?;
+    let fungibles = typed.as_fungible();
+    let entry = fungibles
+        .get(no as usize)
+        .ok_or_else(|| JsError::new(&format!("transition: no OS_ASSET assignment at index {no}")))?;
+    let (_seal, value) = entry
+        .as_revealed()
+        .ok_or_else(|| JsError::new("transition: OS_ASSET assignment is not revealed"))?;
+    Ok(*value)
+}
+
 /// Build a NIA `transfer` state transition consuming the `no`-th
 /// `assetOwner` assignment of a previously issued genesis, allocating
 /// `amount` units to a new beneficiary seal. Returns
@@ -507,6 +530,247 @@ pub fn validate_nia_transition(
     Ok(hex::encode(transition.id().to_byte_array()))
 }
 
+/// Build a NIA transition consuming the `no`-th `assetOwner` assignment
+/// of a PRIOR TRANSITION (not the genesis). The chain so far is
+/// `genesis → prev_transition`; this builds the next link
+/// `genesis → prev_transition → new_transition`.
+///
+/// Used by the orderbook settlement flow: when a seller already has
+/// a transition T_1 binding them to the asset, completing a swap means
+/// producing T_2 that consumes T_1's output and allocates to the buyer
+/// — without T_2 the buyer has no chain-of-ownership artifact even if
+/// the Spark leaf is transferred via HTLC.
+///
+/// `prev_transition_hex`: strict-encoded `Transition` (= prior link in
+///                        the chain).
+/// `prev_genesis_hex`: the `Consignment<false>` of the contract's
+///                     genesis (needed to recover contractId; for
+///                     conservation checks the WASM schema validator
+///                     in `validateNiaTransitionFromPrev` also re-runs
+///                     the genesis through `validate_state`).
+/// `consume_index`: which assetOwner output of `prev_transition` to
+///                  spend. `0` for the single-output case our
+///                  `buildNiaTransition` produces.
+/// `amount`: must equal the prior allocation's amount (`svs OS_ASSET`
+///           conservation — no split/merge yet at this layer).
+#[wasm_bindgen(js_name = buildNiaTransitionFromPrev)]
+pub fn build_nia_transition_from_prev(
+    prev_transition_hex: &str,
+    prev_genesis_hex: &str,
+    consume_index: u16,
+    amount: u64,
+    beneficiary_txid_hex: &str,
+    beneficiary_vout: u32,
+) -> Result<NiaTransition, JsError> {
+    let tr_bytes = hex::decode(prev_transition_hex).map_err(map_err("prev_transition hex decode"))?;
+    let tr_confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(tr_bytes)
+        .map_err(map_err("prev_transition size limit"))?;
+    let prev_transition = Transition::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(tr_confined)
+        .map_err(map_err("strict decode prev_transition"))?;
+
+    let g_bytes = hex::decode(prev_genesis_hex).map_err(map_err("prev_genesis hex decode"))?;
+    let g_confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(g_bytes)
+        .map_err(map_err("prev_genesis size limit"))?;
+    let genesis_consignment =
+        Consignment::<false>::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(g_confined)
+            .map_err(map_err("strict decode prev_genesis"))?;
+
+    let contract_id = genesis_consignment.contract_id();
+    if prev_transition.contract_id != contract_id {
+        return Err(JsError::new(&format!(
+            "prev_transition.contract_id {} != prev_genesis.contract_id {}",
+            prev_transition.contract_id, contract_id
+        )));
+    }
+
+    let prev_value = transition_asset_at(&prev_transition, consume_index)?;
+    let prev_amount: Amount = prev_value.into();
+    if Amount::from(amount) != prev_amount {
+        return Err(JsError::new(&format!(
+            "amount {amount} != prev allocation {prev_amount}; split/merge not supported"
+        )));
+    }
+
+    let prev_opid = prev_transition.id();
+    let txid = Txid::from_str(beneficiary_txid_hex)
+        .map_err(|e| JsError::new(&format!("beneficiary_txid parse: {e}")))?;
+    let beneficiary = GraphSeal::new_random(txid, beneficiary_vout);
+
+    let mut builder = TransitionBuilder::named_transition(
+        contract_id,
+        NonInflatableAsset::schema(),
+        "transfer",
+        NonInflatableAsset::types(),
+    )
+    .map_err(map_err("TransitionBuilder::named_transition"))?;
+
+    let opout = Opout::new(prev_opid, OS_ASSET, consume_index);
+    builder = builder
+        .add_input(opout, AllocatedState::Amount(prev_value))
+        .map_err(map_err("add_input"))?;
+    builder = builder
+        .add_fungible_state("assetOwner", beneficiary, Amount::from(amount))
+        .map_err(map_err("add_fungible_state"))?;
+
+    let transition = builder
+        .complete_transition()
+        .map_err(map_err("complete_transition"))?;
+    let opid = transition.id();
+    let bytes = transition
+        .to_strict_serialized::<CONSIGNMENT_MAX_LEN>()
+        .map_err(map_err("strict encode transition"))?;
+
+    Ok(NiaTransition {
+        transition_hex: hex::encode(bytes.release()),
+        commit_id_hex: hex::encode(opid.to_byte_array()),
+    })
+}
+
+/// Validate a NIA transition chain of length 3: genesis → prev_transition
+/// → transition. Re-runs the rgb-consensus schema validator on every
+/// link (genesis schema check, prev_transition consumed-from-genesis
+/// check, transition consumed-from-prev_transition check) and returns
+/// `transition.id()` if all three validate.
+///
+/// Same trust posture as `validateNiaTransition`: no L1 witness, no
+/// `ResolveWitness` — Spark replaces the transport layer (see
+/// `feedback_no_synthetic_l1_witness`). Witness metadata fed to
+/// `OrdOpRef::Transition(...)` is `strict_dumb` because the NIA AluVM
+/// scripts only inspect input/output assignments, never the witness
+/// txid.
+#[wasm_bindgen(js_name = validateNiaTransitionFromPrev)]
+pub fn validate_nia_transition_from_prev(
+    transition_hex: &str,
+    prev_transition_hex: &str,
+    prev_genesis_hex: &str,
+) -> Result<String, JsError> {
+    let tr_bytes = hex::decode(transition_hex).map_err(map_err("transition hex decode"))?;
+    let tr_confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(tr_bytes)
+        .map_err(map_err("transition size limit"))?;
+    let transition = Transition::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(tr_confined)
+        .map_err(map_err("strict decode transition"))?;
+
+    let prev_bytes = hex::decode(prev_transition_hex).map_err(map_err("prev_transition hex decode"))?;
+    let prev_confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(prev_bytes)
+        .map_err(map_err("prev_transition size limit"))?;
+    let prev_transition = Transition::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(prev_confined)
+        .map_err(map_err("strict decode prev_transition"))?;
+
+    let g_bytes = hex::decode(prev_genesis_hex).map_err(map_err("prev_genesis hex decode"))?;
+    let g_confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(g_bytes)
+        .map_err(map_err("prev_genesis size limit"))?;
+    let genesis_consignment =
+        Consignment::<false>::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(g_confined)
+            .map_err(map_err("strict decode prev_genesis"))?;
+
+    let genesis = genesis_consignment.genesis();
+    let contract_id = genesis_consignment.contract_id();
+    let genesis_opid = genesis.id();
+    let prev_opid = prev_transition.id();
+
+    if transition.contract_id != contract_id {
+        return Err(JsError::new(&format!(
+            "transition.contract_id {} != prev_genesis.contract_id {}",
+            transition.contract_id, contract_id
+        )));
+    }
+    if prev_transition.contract_id != contract_id {
+        return Err(JsError::new(&format!(
+            "prev_transition.contract_id {} != prev_genesis.contract_id {}",
+            prev_transition.contract_id, contract_id
+        )));
+    }
+
+    // prev_state for `transition`: each input must reference prev_transition.
+    let mut tr_prev_state: BTreeMap<AssignmentType, Vec<RevealedState>> = BTreeMap::new();
+    for input in &transition.inputs {
+        if input.op != prev_opid {
+            return Err(JsError::new(&format!(
+                "transition input opid {} does not match prev_transition opid {}",
+                input.op, prev_opid
+            )));
+        }
+        let typed = prev_transition
+            .assignments
+            .get(&input.ty)
+            .ok_or_else(|| JsError::new(&format!("prev_transition missing assignment type {}", input.ty)))?;
+        let revealed = typed
+            .to_revealed_assign_at(input.no, None)
+            .map_err(|_| JsError::new(&format!("prev_transition input out of range: {input}")))?;
+        let (_seal, state) = revealed
+            .into_revealed()
+            .ok_or_else(|| JsError::new(&format!("prev_transition input not revealed: {input}")))?;
+        tr_prev_state.entry(input.ty).or_default().push(state);
+    }
+
+    // prev_state for prev_transition: each input must reference the genesis.
+    let mut prev_prev_state: BTreeMap<AssignmentType, Vec<RevealedState>> = BTreeMap::new();
+    for input in &prev_transition.inputs {
+        if input.op != genesis_opid {
+            return Err(JsError::new(&format!(
+                "prev_transition input opid {} does not match genesis opid {}; \
+                 chain longer than (genesis → prev_transition → transition) not yet supported",
+                input.op, genesis_opid
+            )));
+        }
+        let typed = genesis
+            .assignments
+            .get(&input.ty)
+            .ok_or_else(|| JsError::new(&format!("genesis missing assignment type {}", input.ty)))?;
+        let revealed = typed
+            .to_revealed_assign_at(input.no, None)
+            .map_err(|_| JsError::new(&format!("genesis input out of range: {input}")))?;
+        let (_seal, state) = revealed
+            .into_revealed()
+            .ok_or_else(|| JsError::new(&format!("genesis input not revealed: {input}")))?;
+        prev_prev_state.entry(input.ty).or_default().push(state);
+    }
+
+    let schema = NonInflatableAsset::schema();
+    let types = NonInflatableAsset::types();
+    let scripts = NonInflatableAsset::scripts();
+    let contract_state = Rc::new(RefCell::new(MemContract::init((&schema, contract_id))));
+
+    let witness_txid = Txid::strict_dumb();
+    let witness_ord = WitnessOrd::strict_dumb();
+    let bundle_id = BundleId::strict_dumb();
+
+    schema
+        .validate_state(
+            &types,
+            &scripts,
+            genesis,
+            OrdOpRef::Genesis(genesis),
+            contract_state.clone(),
+            &BTreeMap::new(),
+        )
+        .map_err(|e| JsError::new(&format!("genesis re-validation: {e:?}")))?;
+
+    schema
+        .validate_state(
+            &types,
+            &scripts,
+            genesis,
+            OrdOpRef::Transition(&prev_transition, witness_txid, witness_ord, bundle_id),
+            contract_state.clone(),
+            &prev_prev_state,
+        )
+        .map_err(|e| JsError::new(&format!("prev_transition validation: {e:?}")))?;
+
+    schema
+        .validate_state(
+            &types,
+            &scripts,
+            genesis,
+            OrdOpRef::Transition(&transition, witness_txid, witness_ord, bundle_id),
+            contract_state,
+            &tr_prev_state,
+        )
+        .map_err(|e| JsError::new(&format!("transition validation: {e:?}")))?;
+
+    Ok(hex::encode(transition.id().to_byte_array()))
+}
+
 // ---- helpers ----
 
 fn parse_pk(s: &str, field: &str) -> Result<CompressedPk, JsError> {
@@ -635,6 +899,52 @@ mod tests {
             next_msg, trn.commit_id_hex,
             "receiver-derived nextMsg must equal sender commitId"
         );
+    }
+
+    #[test]
+    fn build_and_validate_transition_on_transition() {
+        // Chain: genesis → T_1 (seller's mint) → T_2 (sale transfer to buyer).
+        // Confirms the WASM API supports 3-op chains, with the validator
+        // accepting T_2 only when it cleanly consumes T_1's output.
+        let issued =
+            issue_nia_contract("CH", "Chain test", 500, FIXTURE_TXID, 0, 1_700_000_100)
+                .expect("issuance");
+
+        // T_1: genesis → seller. Reuses buildNiaTransition with the same
+        // placeholder beneficiary the genesis already used; what matters
+        // for the chain is the contract conservation, not the seal.
+        let t1 = build_nia_transition(
+            &issued.consignment_hex,
+            0,
+            500,
+            "1f29d0a35d36e3f9f44b94be77ba3f7e74e2b97ee8f57edf6f111d2d6f8a4c10",
+            1,
+        )
+        .expect("build T_1");
+
+        // T_2: prev_transition (T_1) → buyer.
+        let t2 = build_nia_transition_from_prev(
+            &t1.transition_hex,
+            &issued.consignment_hex,
+            0,
+            500,
+            "2f29d0a35d36e3f9f44b94be77ba3f7e74e2b97ee8f57edf6f111d2d6f8a4c10",
+            2,
+        )
+        .expect("build T_2 on T_1");
+        assert_eq!(t2.commit_id_hex.len(), 64);
+        assert!(t2.commit_id_hex.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(t2.commit_id_hex, t1.commit_id_hex, "T_2 != T_1");
+
+        // Validate T_2 with the chain (genesis, T_1) — must return T_2.id().
+        let validated = validate_nia_transition_from_prev(
+            &t2.transition_hex,
+            &t1.transition_hex,
+            &issued.consignment_hex,
+        )
+        .expect("validate T_2 on T_1");
+        assert_eq!(validated, t2.commit_id_hex,
+            "validator-returned commit_id must equal T_2.id()");
     }
 
     #[cfg(target_arch = "wasm32")]
