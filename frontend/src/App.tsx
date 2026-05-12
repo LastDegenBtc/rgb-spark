@@ -35,11 +35,29 @@ import {
 } from './lib/htlcProbe'
 import {
   runSellerFlow,
+  runBuyerFlow,
   lockUnderHash,
   newPreimagePair,
   bytesToHex as htlcBytesToHex,
   type SwapState,
 } from './lib/htlcSwap'
+import {
+  postOrder,
+  listOrders,
+  cancelOrder,
+  signOrder,
+  uuidV7,
+  type OrderPayload,
+  type StoredOrder,
+  type PlaceResult,
+} from './lib/orderbookRelay'
+import {
+  attachOrderSecrets,
+  detachOrderSecrets,
+  addOrderSecret,
+  getOrderSecret,
+  removeOrderSecret,
+} from './lib/orderPreimageStash'
 import { RgbAwareSparkSigner, clearRgbIntent, listPathTweaks, getPathTweak } from './lib/rgbAwareSigner'
 import { attachPathTweakStorage, detachPathTweakStorage } from './lib/pathTweakStorage'
 import {
@@ -193,6 +211,7 @@ function App() {
       // re-add them — they'd need another sync round to come back.
       attachPathTweakStorage(parsed.npub)
       attachStash(parsed.npub)
+      attachOrderSecrets(parsed.npub)
       setState({ kind: 'loading', stage: `initializing Spark wallet on ${net}` })
       const wallet = await initSparkWallet(parsed.sparkSeed, net, new RgbAwareSparkSigner())
       setState({ kind: 'ready', parsed, wallet, balanceSats: 'pending', cameFromVault, vaultJustSaved: false })
@@ -237,6 +256,7 @@ function App() {
     clearVault()
     detachPathTweakStorage()
     detachStash()
+    detachOrderSecrets()
     setSecret('')
     setState({ kind: 'idle' })
   }
@@ -349,6 +369,12 @@ function App() {
 
           <RgbStashPanel />
 
+          <OrderBookPanel
+            myNpub={state.parsed.npub}
+            myNostrPrivkeyHex={state.parsed.nostrPrivkeyHex}
+            mySparkIdentityPubkey={state.wallet.identityPubkey}
+          />
+
           <details style={{ marginTop: 28, borderTop: '2px solid #ccc', paddingTop: 12 }}>
             <summary style={{ cursor: 'pointer', fontSize: 13, color: '#666', fontWeight: 'bold' }}>
               Developer lab · Spark-UTK mint + NIA consignment round-trip
@@ -368,6 +394,521 @@ function App() {
         </div>
       )}
     </section>
+  )
+}
+
+// ---- OrderBook panel (Phase 1C session 3) ----------------------------------
+//
+// Surfaces the relay's signed orderbook in the wallet UX. Lets the user:
+//   - Pick an asset from their RGB stash.
+//   - Place an ask (sell asset) or bid (buy asset) signed by their nsec.
+//   - See the current book for that asset (open + matched orders).
+//   - When their own order matches, kick off the appropriate HTLC swap
+//     flow (`runSellerFlow` / `runBuyerFlow`) wired to the counterparty
+//     details returned by the relay.
+//
+// Cross-wallet end-to-end settlement is testable across two devices /
+// browsers — the relay refuses self-match by npub, so a single wallet
+// can verify all placement / cancellation / signature paths but not
+// settlement. Phase 1C session 1 already validated the orchestrator
+// state machine via self-receive; combined with the relay smoke test
+// (16/16 server-side assertions), the full path is covered piecewise.
+
+interface OrderBookPanelProps {
+  myNpub: string
+  myNostrPrivkeyHex: string
+  mySparkIdentityPubkey: string
+}
+
+function OrderBookPanel({
+  myNpub,
+  myNostrPrivkeyHex,
+  mySparkIdentityPubkey,
+}: OrderBookPanelProps) {
+  const [contracts, setContracts] = useState<StashContract[]>([])
+  const [selectedAssetId, setSelectedAssetId] = useState<string>('')
+  const [book, setBook] = useState<StoredOrder[]>([])
+  const [bookErr, setBookErr] = useState<string | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
+
+  // Live subscribe to the stash so the asset dropdown picks up new
+  // issuances without a page refresh.
+  useEffect(() => {
+    const unsub = subscribeStash((snap) => {
+      setContracts(snap.contracts)
+      setSelectedAssetId((prev) => prev || snap.contracts[0]?.contractId || '')
+    })
+    return () => { unsub() }
+  }, [])
+
+  const refresh = useCallback(async () => {
+    if (!selectedAssetId) {
+      setBook([])
+      return
+    }
+    setRefreshing(true)
+    setBookErr(null)
+    try {
+      const list = await listOrders(selectedAssetId)
+      setBook(list)
+    } catch (e) {
+      setBookErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setRefreshing(false)
+    }
+  }, [selectedAssetId])
+
+  useEffect(() => {
+    void refresh()
+    // Poll every 5 s while the panel is mounted so match-status flips
+    // surface without a manual refresh.
+    const t = setInterval(() => void refresh(), 5_000)
+    return () => clearInterval(t)
+  }, [refresh])
+
+  const selectedContract = contracts.find((c) => c.contractId === selectedAssetId)
+
+  return (
+    <fieldset style={{ marginTop: 16, border: '1px solid #ddd', padding: '8px 12px' }}>
+      <legend style={{ fontSize: 12, color: '#666' }}>
+        Order book · {book.length} order{book.length === 1 ? '' : 's'}
+      </legend>
+
+      {contracts.length === 0 ? (
+        <div style={{ fontSize: 12, color: '#888', padding: '6px 0' }}>
+          No issued contracts yet — issue an NIA from the Developer lab below to
+          enable trading.
+        </div>
+      ) : (
+        <>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <label style={{ fontSize: 12, color: '#666' }}>asset:</label>
+            <select
+              value={selectedAssetId}
+              onChange={(e) => setSelectedAssetId(e.target.value)}
+              style={{ fontSize: 12, padding: 4, fontFamily: 'monospace', flex: 1, minWidth: 200 }}
+            >
+              {contracts.map((c) => (
+                <option key={c.contractId} value={c.contractId}>
+                  {c.ticker} · {c.name} · {c.contractId.slice(0, 10)}…
+                </option>
+              ))}
+            </select>
+            <button onClick={() => void refresh()} disabled={refreshing} style={{ fontSize: 11 }}>
+              {refreshing ? '…' : 'refresh'}
+            </button>
+          </div>
+
+          <PlaceOrderForms
+            assetId={selectedAssetId}
+            selectedContract={selectedContract}
+            myNpub={myNpub}
+            myNostrPrivkeyHex={myNostrPrivkeyHex}
+            mySparkIdentityPubkey={mySparkIdentityPubkey}
+            onPosted={() => void refresh()}
+          />
+
+          {bookErr && (
+            <pre style={{ color: 'crimson', fontSize: 11, whiteSpace: 'pre-wrap', marginTop: 8 }}>
+              {bookErr}
+            </pre>
+          )}
+
+          <div style={{ marginTop: 10, fontFamily: 'monospace', fontSize: 11 }}>
+            {book.length === 0 ? (
+              <div style={{ color: '#888' }}>(no open orders for this asset)</div>
+            ) : (
+              <>
+                <div style={{ display: 'grid', gridTemplateColumns: '50px 80px 80px 110px 80px 1fr', gap: 4, color: '#888', fontWeight: 'bold', borderBottom: '1px solid #eee', paddingBottom: 4 }}>
+                  <div>side</div>
+                  <div>price</div>
+                  <div>amount</div>
+                  <div>poster</div>
+                  <div>status</div>
+                  <div>actions</div>
+                </div>
+                {book.map((so) => (
+                  <OrderRow
+                    key={so.order.id}
+                    so={so}
+                    myNpub={myNpub}
+                    myNostrPrivkeyHex={myNostrPrivkeyHex}
+                    mySparkIdentityPubkey={mySparkIdentityPubkey}
+                    onChanged={() => void refresh()}
+                  />
+                ))}
+              </>
+            )}
+          </div>
+
+          <div style={{ marginTop: 8, fontSize: 11, color: '#888' }}>
+            Cross-wallet settlement: relay refuses self-match by npub —
+            test the end-to-end swap from a second device with a different
+            nsec.
+          </div>
+        </>
+      )}
+    </fieldset>
+  )
+}
+
+function PlaceOrderForms({
+  assetId,
+  selectedContract,
+  myNpub,
+  myNostrPrivkeyHex,
+  mySparkIdentityPubkey,
+  onPosted,
+}: {
+  assetId: string
+  selectedContract: StashContract | undefined
+  myNpub: string
+  myNostrPrivkeyHex: string
+  mySparkIdentityPubkey: string
+  onPosted: () => void
+}) {
+  const [side, setSide] = useState<'ask' | 'bid'>('ask')
+  const [amount, setAmount] = useState('')
+  const [priceSats, setPriceSats] = useState('')
+  const [expiryMin, setExpiryMin] = useState('60')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [lastPlaced, setLastPlaced] = useState<PlaceResult | null>(null)
+
+  useEffect(() => {
+    if (selectedContract && !amount) setAmount(selectedContract.supply)
+  }, [selectedContract, amount])
+
+  async function place() {
+    setBusy(true)
+    setErr(null)
+    setLastPlaced(null)
+    try {
+      if (!assetId) throw new Error('select an asset first')
+      if (!/^[0-9]+$/.test(amount.trim()) || BigInt(amount.trim()) <= 0n) {
+        throw new Error('amount must be a positive integer')
+      }
+      const price = Number(priceSats.trim())
+      if (!Number.isSafeInteger(price) || price <= 0) {
+        throw new Error('priceSats must be a positive integer')
+      }
+      const expMin = Number(expiryMin.trim())
+      if (!Number.isSafeInteger(expMin) || expMin <= 0 || expMin > 24 * 60) {
+        throw new Error('expiry must be 1–1440 minutes')
+      }
+      const now = new Date()
+      const expiry = new Date(now.getTime() + expMin * 60_000).toISOString()
+
+      // Ask side: generate paymentHash now (seller controls the preimage).
+      // Preimage is persisted in orderPreimageStash so the seller can fire
+      // runSellerFlow when a bid matches, even after a browser reload.
+      const orderId = uuidV7()
+      let paymentHash: string | undefined
+      let preimageHex: string | undefined
+      if (side === 'ask') {
+        const pair = newPreimagePair()
+        paymentHash = htlcBytesToHex(pair.paymentHash)
+        preimageHex = htlcBytesToHex(pair.preimage)
+      }
+
+      const payload: OrderPayload = {
+        id: orderId,
+        side,
+        posterNpub: myNpub,
+        posterSparkIdentityPubkey: mySparkIdentityPubkey,
+        assetId,
+        amount: amount.trim(),
+        priceSats: price,
+        expiryTime: expiry,
+        createdAt: now.toISOString(),
+        ...(paymentHash ? { paymentHash } : {}),
+      }
+      const signed = signOrder(payload, myNostrPrivkeyHex)
+      // Save preimage BEFORE posting so a network glitch between
+      // post-success and secret-save doesn't strand the preimage.
+      // Idempotent if the order id is reused.
+      if (preimageHex) addOrderSecret(orderId, preimageHex)
+      const result = await postOrder(signed)
+      setLastPlaced(result)
+      onPosted()
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <fieldset style={{ marginTop: 8, border: '1px solid #eee', padding: '6px 10px' }}>
+      <legend style={{ fontSize: 11, color: '#888' }}>place order</legend>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', fontSize: 11 }}>
+        <label>
+          <input
+            type="radio"
+            checked={side === 'ask'}
+            onChange={() => setSide('ask')}
+          />
+          ask (sell)
+        </label>
+        <label>
+          <input
+            type="radio"
+            checked={side === 'bid'}
+            onChange={() => setSide('bid')}
+          />
+          bid (buy)
+        </label>
+        <label style={{ color: '#666' }}>amount</label>
+        <input
+          value={amount}
+          onChange={(e) => setAmount(e.target.value)}
+          inputMode="numeric"
+          placeholder="units"
+          style={{ width: 90, fontSize: 12, padding: 3, fontFamily: 'monospace' }}
+          disabled={busy}
+        />
+        <label style={{ color: '#666' }}>price (sats)</label>
+        <input
+          value={priceSats}
+          onChange={(e) => setPriceSats(e.target.value)}
+          inputMode="numeric"
+          placeholder="total"
+          style={{ width: 80, fontSize: 12, padding: 3, fontFamily: 'monospace' }}
+          disabled={busy}
+        />
+        <label style={{ color: '#666' }}>expiry (min)</label>
+        <input
+          value={expiryMin}
+          onChange={(e) => setExpiryMin(e.target.value)}
+          inputMode="numeric"
+          style={{ width: 50, fontSize: 12, padding: 3, fontFamily: 'monospace' }}
+          disabled={busy}
+        />
+        <button onClick={() => void place()} disabled={busy || !assetId}>
+          {busy ? '…' : `Place ${side}`}
+        </button>
+      </div>
+      {err && (
+        <pre style={{ color: 'crimson', fontSize: 11, whiteSpace: 'pre-wrap', marginTop: 4 }}>
+          {err}
+        </pre>
+      )}
+      {lastPlaced && (
+        <div
+          style={{
+            marginTop: 4,
+            padding: 4,
+            background: lastPlaced.status === 'matched' ? '#e8f5e9' : '#f0f4ff',
+            border: lastPlaced.status === 'matched' ? '1px solid #a5d6a7' : '1px solid #b3c5e3',
+            fontSize: 11,
+            fontFamily: 'monospace',
+          }}
+        >
+          <div>
+            posted · status: <strong>{lastPlaced.status}</strong> · id{' '}
+            <code>{lastPlaced.id.slice(0, 8)}…</code>
+          </div>
+          {lastPlaced.status === 'matched' && (
+            <div style={{ color: 'seagreen' }}>
+              🟢 matched with {lastPlaced.counterpartyNpub?.slice(0, 16)}…
+              {lastPlaced.paymentHash && (
+                <> · paymentHash {lastPlaced.paymentHash.slice(0, 16)}…</>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </fieldset>
+  )
+}
+
+function OrderRow({
+  so,
+  myNpub,
+  myNostrPrivkeyHex: _myNostrPrivkeyHex,
+  mySparkIdentityPubkey: _mySparkIdentityPubkey,
+  onChanged,
+}: {
+  so: StoredOrder
+  myNpub: string
+  myNostrPrivkeyHex: string
+  mySparkIdentityPubkey: string
+  onChanged: () => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [swapLog, setSwapLog] = useState<SwapState[]>([])
+  const isMine = so.order.posterNpub === myNpub
+  const isMatched = so.status === 'matched'
+
+  async function doCancel() {
+    setBusy(true)
+    try {
+      await cancelOrder(so.order.assetId, so.order.id, myNpub)
+      onChanged()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function runMySwap() {
+    if (!isMine || !isMatched) return
+    setBusy(true)
+    setSwapLog([])
+    try {
+      const wallet = getSparkWallet()
+      if (!wallet) throw new Error('wallet not initialized')
+
+      // Resolve the counterparty pubkey: it's NOT on `so` directly; the
+      // matched counterparty's order is also in `book` (same assetId).
+      // Fetch fresh to be safe.
+      const list = await listOrders(so.order.assetId)
+      const counterpart = list.find((x) => x.order.id === so.matchedWith)
+      if (!counterpart) throw new Error('counterparty order not found in book')
+      const counterpartyPubkeyHex = counterpart.order.posterSparkIdentityPubkey
+      const counterpartyPubkeyBytes = new Uint8Array(33)
+      for (let i = 0; i < 33; i++) {
+        counterpartyPubkeyBytes[i] = parseInt(counterpartyPubkeyHex.substr(i * 2, 2), 16)
+      }
+
+      // T_seller_expiry > T_buyer_expiry per HTLC asymmetry. v0 default:
+      // seller 1 h, buyer 30 min — gives buyer a 30-min poll window
+      // after reveal.
+      if (so.order.side === 'ask') {
+        // We're the seller. Recover the preimage we generated at order
+        // placement from the orderPreimageStash.
+        const secret = getOrderSecret(so.order.id)
+        if (!secret) {
+          throw new Error(
+            `no stored preimage for order ${so.order.id.slice(0, 8)}…. ` +
+            'Was the order placed from a different browser/wallet?',
+          )
+        }
+        const preimage = new Uint8Array(32)
+        for (let i = 0; i < 32; i++) {
+          preimage[i] = parseInt(secret.preimageHex.substr(i * 2, 2), 16)
+        }
+        const allLeaves = await (wallet as unknown as {
+          getLeaves: (b?: boolean) => Promise<Array<{ id: string; value: number }>>
+        }).getLeaves(true)
+        if (allLeaves.length === 0) throw new Error('no leaves to commit as asset')
+        // v0 leaf selection: pick the smallest leaf in the wallet as the
+        // asset leg. Real UX should resolve which leaf binds to this
+        // contractId via pathTweaks lookup (msg == contractId or
+        // commitId chain). Future session.
+        const assetLeaf = ([...allLeaves].sort((a, b) => a.value - b.value)[0] as unknown) as Parameters<typeof lockUnderHash>[1]['leaves'][number]
+        const sellerExpiry = new Date(Date.now() + 60 * 60_000)
+        const result = await runSellerFlow(wallet, {
+          assetLeaves: [assetLeaf],
+          counterpartyPubkey: counterpartyPubkeyBytes,
+          expectedSatsFromBuyer: so.order.priceSats,
+          expiryTime: sellerExpiry,
+          preimage,
+          pollIntervalMs: 3_000,
+          onState: (s) => setSwapLog((p) => [...p, s]),
+        })
+        if (result.outcome === 'completed') {
+          // Settlement done — preimage no longer needed; drop from local storage.
+          removeOrderSecret(so.order.id)
+        }
+      } else {
+        // We're the buyer. Counterparty is the seller; their paymentHash
+        // is on counterpart.order.
+        const paymentHashHex = counterpart.order.paymentHash
+        if (!paymentHashHex) throw new Error('matched ask has no paymentHash')
+        const paymentHashBytes = new Uint8Array(32)
+        for (let i = 0; i < 32; i++) {
+          paymentHashBytes[i] = parseInt(paymentHashHex.substr(i * 2, 2), 16)
+        }
+        const allLeaves = await (wallet as unknown as {
+          getLeaves: (b?: boolean) => Promise<Array<{ id: string; value: number }>>
+        }).getLeaves(true)
+        // Pick a single leaf >= priceSats. v0: no aggregation.
+        const sufficient = allLeaves
+          .filter((l) => l.value >= so.order.priceSats)
+          .sort((a, b) => a.value - b.value)[0]
+        if (!sufficient) {
+          throw new Error(`no single leaf >= ${so.order.priceSats} sats (v0: no aggregation)`)
+        }
+        const satsLeaves = [sufficient] as unknown as Parameters<typeof lockUnderHash>[1]['leaves']
+        const buyerExpiry = new Date(Date.now() + 30 * 60_000)
+        await runBuyerFlow(wallet, {
+          satsLeaves,
+          counterpartyPubkey: counterpartyPubkeyBytes,
+          paymentHash: paymentHashBytes,
+          expiryTime: buyerExpiry,
+          pollIntervalMs: 3_000,
+          onState: (s) => setSwapLog((p) => [...p, s]),
+        })
+      }
+    } catch (e) {
+      setSwapLog((p) => [
+        ...p,
+        {
+          phase: 'failed',
+          paymentHashHex: so.order.paymentHash ?? '',
+          message: `swap failed to start: ${e instanceof Error ? e.message : String(e)}`,
+          updatedAt: new Date().toISOString(),
+          ourExpiry: new Date(),
+          cause: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+        },
+      ])
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const statusColor: Record<typeof so.status, string> = {
+    open: '#444',
+    matched: 'seagreen',
+    cancelled: '#888',
+    expired: '#888',
+  }
+
+  return (
+    <>
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: '50px 80px 80px 110px 80px 1fr',
+          gap: 4,
+          padding: '3px 0',
+          borderBottom: '1px dashed #eee',
+          color: statusColor[so.status],
+          alignItems: 'center',
+        }}
+      >
+        <div>{so.order.side}</div>
+        <div>{so.order.priceSats}</div>
+        <div>{so.order.amount}</div>
+        <div title={so.order.posterNpub}>
+          {isMine ? <strong>me</strong> : so.order.posterNpub.slice(0, 10) + '…'}
+        </div>
+        <div>{so.status}</div>
+        <div style={{ display: 'flex', gap: 4 }}>
+          {isMine && so.status === 'open' && (
+            <button onClick={() => void doCancel()} disabled={busy} style={{ fontSize: 10 }}>
+              cancel
+            </button>
+          )}
+          {isMine && isMatched && (
+            <button onClick={() => void runMySwap()} disabled={busy} style={{ fontSize: 10 }}>
+              {busy ? '…' : 'Run swap →'}
+            </button>
+          )}
+        </div>
+      </div>
+      {swapLog.length > 0 && (
+        <div style={{ paddingLeft: 12, fontSize: 10, color: '#444' }}>
+          {swapLog.map((s, i) => (
+            <div key={i}>
+              <strong>{s.phase}</strong> · {s.message}
+            </div>
+          ))}
+        </div>
+      )}
+    </>
   )
 }
 
