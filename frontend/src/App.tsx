@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, type ReactNode } from 'react'
+import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react'
 import { generateSecretKey, nip19 } from 'nostr-tools'
 import { addPublicKeys } from '@buildonspark/spark-sdk'
 import { parseLoginSecret, type ParsedLogin } from './lib/nostrKey'
@@ -61,6 +61,12 @@ import {
   removeOrderSecret,
 } from './lib/orderPreimageStash'
 import { RgbAwareSparkSigner, clearRgbIntent, listPathTweaks, getPathTweak } from './lib/rgbAwareSigner'
+import {
+  captureSettlementSnapshot,
+  runAutoEmit,
+  type AutoEmitOutcome,
+  type SettlementSnapshot,
+} from './lib/settlementAutoEmit'
 import { attachPathTweakStorage, detachPathTweakStorage } from './lib/pathTweakStorage'
 import {
   attachStash,
@@ -385,7 +391,11 @@ function App() {
               <PathTweaksDebug />
               <HtlcProbe />
               <HtlcSelfSwap />
-              <SettlementAutoEmitProbe />
+              <SettlementAutoEmitProbe
+                myNpub={state.parsed.npub}
+                myNostrPrivkeyHex={state.parsed.nostrPrivkeyHex}
+                mySparkIdentityPubkey={state.wallet.identityPubkey}
+              />
               <ConsignmentLab
                 myNpub={state.parsed.npub}
                 myIdentityPubkey={state.wallet.identityPubkey}
@@ -1581,11 +1591,25 @@ function HtlcSelfSwap() {
 // matched order. A standalone probe lets us validate the lookup in isolation
 // against the persisted pathTweaks, including across reloads.
 
-function SettlementAutoEmitProbe() {
+interface SettlementAutoEmitProbeProps {
+  myNpub: string
+  myNostrPrivkeyHex: string
+  mySparkIdentityPubkey: string
+}
+
+function SettlementAutoEmitProbe({
+  myNpub,
+  myNostrPrivkeyHex,
+  mySparkIdentityPubkey,
+}: SettlementAutoEmitProbeProps) {
   const [allTweaks, setAllTweaks] = useState(() => listPathTweaks())
   const [selectedLeafId, setSelectedLeafId] = useState<string>('')
   const [buyerNpub, setBuyerNpub] = useState<string>('')
   const [npubError, setNpubError] = useState<string | null>(null)
+  const [snapshot, setSnapshot] = useState<SettlementSnapshot | null>(null)
+  const [snapshotErr, setSnapshotErr] = useState<string | null>(null)
+  const [emitting, setEmitting] = useState(false)
+  const [emitResult, setEmitResult] = useState<AutoEmitOutcome | null>(null)
 
   useEffect(() => {
     // Same polling cadence as PathTweaksDebug — pathTweaks is module-level
@@ -1593,6 +1617,29 @@ function SettlementAutoEmitProbe() {
     const t = setInterval(() => setAllTweaks(listPathTweaks()), 2_000)
     return () => clearInterval(t)
   }, [])
+
+  // Monotonic counter via ref — discards stale captures when the user picks a
+  // new leaf before the previous capture resolves. A useState counter would
+  // hit closure-staleness because the handler re-renders before the await.
+  const captureGenRef = useRef(0)
+
+  async function onLeafChange(newId: string) {
+    const myGen = ++captureGenRef.current
+    setSelectedLeafId(newId)
+    setSnapshot(null)
+    setSnapshotErr(null)
+    setEmitResult(null)
+    if (!newId) return
+    const r = await captureSettlementSnapshot(newId)
+    if (myGen !== captureGenRef.current) return // a newer capture started
+    if (r.ok) {
+      setSnapshot(r.snapshot)
+      setSnapshotErr(null)
+    } else {
+      setSnapshot(null)
+      setSnapshotErr(r.reason)
+    }
+  }
 
   // Only entries with an RGB payload are emit-ready. A pathTweak with neither
   // transitionHex nor consignmentHex means the leaf was bound to some msg the
@@ -1655,13 +1702,16 @@ function SettlementAutoEmitProbe() {
   return (
     <fieldset style={{ marginTop: 10, border: '1px solid #ddd', padding: '8px 12px' }}>
       <legend style={{ fontSize: 12, color: '#666' }}>
-        Settlement auto-emit probe · Phase 1C/clean session 5.1
+        Settlement auto-emit probe · Phase 1C/clean session 5.2
       </legend>
       <div style={{ fontSize: 12, color: '#666', marginBottom: 8 }}>
-        Read-only check: given a leaf still bound by pathTweaks, confirm we
-        recover the RGB payload (transition/genesis bytes) we'd need to emit
-        T_2 over T_1 to the buyer at swap settlement. No POST, no
-        emission — just inspection of the post-settlement lookup.
+        Given a leaf still bound by pathTweaks + a target buyer npub,
+        simulate the settlement auto-emit: build T_new on top of the
+        recovered chain, compose a BIP-340-signed envelope v4 with{' '}
+        <code>kind: settlement-consignment-v1</code>, POST to{' '}
+        <code>/consignment/&lt;buyerNpub&gt;</code>. The leaf does NOT need
+        to have been sold — this is a dry-run-flavored real emission so
+        session 5.3's buyer-side poll can validate its end-to-end shape.
       </div>
 
       <div style={{ fontSize: 11, color: '#555', marginBottom: 6 }}>
@@ -1674,7 +1724,7 @@ function SettlementAutoEmitProbe() {
       </label>
       <select
         value={selectedLeafId}
-        onChange={(e) => setSelectedLeafId(e.target.value)}
+        onChange={(e) => void onLeafChange(e.target.value)}
         style={{ width: '100%', fontFamily: 'monospace', fontSize: 11, padding: 4 }}
       >
         <option value=''>— select —</option>
@@ -1777,8 +1827,119 @@ function SettlementAutoEmitProbe() {
             wordBreak: 'break-all',
           }}
         >
-          <div style={{ marginBottom: 2, color: '#666' }}>session 5.2 would POST here:</div>
+          <div style={{ marginBottom: 2, color: '#666' }}>relay URL the emit will hit:</div>
           {wouldPostUrl}
+        </div>
+      )}
+
+      {snapshotErr && selectedLeafId && (
+        <div
+          style={{
+            marginTop: 8,
+            padding: 6,
+            background: '#ffebee',
+            border: '1px solid #ef9a9a',
+            fontSize: 11,
+            color: 'crimson',
+          }}
+        >
+          snapshot failed: {snapshotErr}
+        </div>
+      )}
+
+      {snapshot && (
+        <div
+          style={{
+            marginTop: 8,
+            padding: 6,
+            background: '#f1f8e9',
+            border: '1px solid #c5e1a5',
+            fontSize: 11,
+            fontFamily: 'monospace',
+            wordBreak: 'break-all',
+          }}
+        >
+          <div style={{ marginBottom: 4, color: '#33691e', fontWeight: 'bold' }}>
+            snapshot captured · ready to emit
+          </div>
+          <div>contractId: {snapshot.contractId}</div>
+          <div>amount: {snapshot.amount.toString()}</div>
+          <div>operator: {snapshot.operatorPublicKeyHex.slice(0, 16)}…{snapshot.operatorPublicKeyHex.slice(-8)}</div>
+          <div>verifyingKey: {snapshot.verifyingPublicKeyHex.slice(0, 16)}…{snapshot.verifyingPublicKeyHex.slice(-8)}</div>
+          <div>
+            chain: genesis ({snapshot.genesisHex.length / 2}B)
+            {snapshot.prevTransitionHex && (
+              <>
+                {' '}→ prevTransition ({snapshot.prevTransitionHex.length / 2}B)
+              </>
+            )}
+            {' '}→ T_new (built on emit)
+          </div>
+        </div>
+      )}
+
+      <div style={{ marginTop: 10 }}>
+        <button
+          onClick={() => {
+            if (!snapshot || !buyerNpubOk) return
+            setEmitting(true)
+            setEmitResult(null)
+            void (async () => {
+              const r = await runAutoEmit({
+                snapshot,
+                myNpub,
+                myNostrPrivkeyHex,
+                mySparkIdentityPubkey,
+                buyerNpub: buyerNpub.trim(),
+              })
+              setEmitResult(r)
+              setEmitting(false)
+            })()
+          }}
+          disabled={emitting || !snapshot || !buyerNpubOk}
+          style={{ fontSize: 12 }}
+        >
+          {emitting ? 'emitting…' : 'Simulate emit (build + sign + POST)'}
+        </button>
+        {!snapshot && selectedLeafId && !snapshotErr && (
+          <span style={{ marginLeft: 8, fontSize: 11, color: '#999' }}>capturing…</span>
+        )}
+      </div>
+
+      {emitResult && emitResult.status === 'emitted' && (
+        <div
+          style={{
+            marginTop: 8,
+            padding: 8,
+            background: '#e8f5e9',
+            border: '1px solid #a5d6a7',
+            fontSize: 11,
+            fontFamily: 'monospace',
+            wordBreak: 'break-all',
+          }}
+        >
+          <div style={{ marginBottom: 4, color: 'seagreen', fontWeight: 'bold' }}>
+            🟢 emitted · envelope queued at relay
+          </div>
+          <div>envelopeId: {emitResult.envelopeId}</div>
+          <div>bytes posted: {emitResult.bytesPosted}</div>
+          <div>newCommitIdHex: {emitResult.newCommitIdHex}</div>
+          <div>payload: {emitResult.payloadKind}</div>
+        </div>
+      )}
+
+      {emitResult && emitResult.status === 'failed' && (
+        <div
+          style={{
+            marginTop: 8,
+            padding: 6,
+            background: '#ffebee',
+            border: '1px solid #ef9a9a',
+            fontSize: 11,
+            color: 'crimson',
+          }}
+        >
+          emit failed: {emitResult.reason}
         </div>
       )}
     </fieldset>

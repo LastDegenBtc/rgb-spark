@@ -27,6 +27,15 @@ export interface LeafReferenceField {
   consignmentHex?: string;
   transitionHex?: string;
   prevGenesisHex?: string;
+  /** Optional intermediate transition for depth-3 chains
+   *  (genesis → prev_transition → transition). Used by settlement-
+   *  consignment envelopes when the seller's bound leaf was already a
+   *  T_1 over genesis and we emit T_2 over T_1 (Phase 1C/clean session 5.2).
+   *  Buyer-side dispatch: if present, validate via
+   *  `validateNiaTransitionFromPrev(transitionHex, prevTransitionHex,
+   *  prevGenesisHex)`; otherwise fall back to the existing two-input
+   *  `validateNiaTransition(transitionHex, prevGenesisHex)` path. */
+  prevTransitionHex?: string;
 }
 
 /** Envelope fields that participate in the signature. Excludes senderSignature. */
