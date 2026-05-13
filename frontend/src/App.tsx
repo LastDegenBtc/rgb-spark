@@ -20,7 +20,6 @@ import {
   transferToSpark,
   mintViaSelfTransfer,
   getSparkWallet,
-  ensureLeafOfExactSize,
   type WalletInitResult,
   type SparkLeafRow,
 } from './lib/sparkWallet'
@@ -1079,15 +1078,33 @@ function OrderRow({
             onState: (s) => setSwapLog((p) => [...p, s]),
           })
         } else {
-          // Phase 1C/clean session sprk.11: lock EXACTLY priceSats.
-          // ensureLeafOfExactSize splits via transferToSpark(priceSats,
-          // self) when no exact-size leaf exists. The SDK coin-selects
-          // across multiple small leaves so an aggregating case
-          // (= many leaves summing to priceSats) works transparently —
-          // fixes both the whole-leaf overpay AND the "no single leaf
-          // ≥ priceSats" rejection that used to block partial fills.
-          const exactLeaf = await ensureLeafOfExactSize(so.order.priceSats)
-          const satsLeaves = [exactLeaf] as unknown as Parameters<typeof lockUnderHash>[1]['leaves']
+          // sprk.11c: priceSats exact-size lock is a known open issue.
+          // The previous ensureLeafOfExactSize path relied on a SE swap
+          // that doesn't reliably trigger via self-transfer. Until we
+          // redesign (power-of-2 quantized pricing or multi-leaf HTLC),
+          // we pick the smallest vanilla leaf covering priceSats and
+          // warn about the overpay.
+          const allLeaves = await listSparkLeaves()
+          const boundLeafIds = new Set(listPathTweaks().map((t) => t.currentLeafId))
+          const vanilla = allLeaves.filter((l) => !boundLeafIds.has(l.id))
+          const candidates = vanilla
+            .filter((l) => l.value >= so.order.priceSats)
+            .sort((a, b) => a.value - b.value)
+          if (candidates.length === 0) {
+            throw new Error(
+              `no vanilla leaf in wallet covers priceSats ${so.order.priceSats}`,
+            )
+          }
+          const lockLeaf = candidates[0]
+          if (lockLeaf.value !== so.order.priceSats) {
+            setSwapLog((p) => [
+              ...p,
+              { stage: 'warning', message:
+                `overpay: locking ${lockLeaf.value}-sat leaf for ${so.order.priceSats}-sat trade. ` +
+                `Exact-size lock not yet implemented (sprk.12).` } as never,
+            ])
+          }
+          const satsLeaves = [lockLeaf] as unknown as Parameters<typeof lockUnderHash>[1]['leaves']
           await runBuyerFlow(wallet, {
             satsLeaves,
             counterpartyPubkey: counterpartyPubkeyBytes,

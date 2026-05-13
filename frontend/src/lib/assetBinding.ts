@@ -29,10 +29,8 @@ import {
   type StashTransition,
 } from './rgbStash';
 import {
-  ensureLeafOfExactSize,
   listSparkLeaves,
   mintViaSelfTransfer,
-  SPARK_DUST_THRESHOLD,
   type SparkLeafRow,
 } from './sparkWallet';
 
@@ -206,11 +204,12 @@ export async function lazyRebindIfNeeded(contractId: string): Promise<RebindOutc
       }
     }
 
-    // Source leaf for the self-transfer. sprk.11: keep the source
-    // dust-sized so the resulting bound asset leaf doesn't carry
-    // excess sats — those sats would leak as overpay at HTLC swap
-    // time. ensureLeafOfExactSize splits via transferToSpark when
-    // needed; the SDK coin-selects across multiple small leaves.
+    // Source leaf for the self-transfer. sprk.11c: pick the smallest
+    // vanilla leaf available — splitting via transferToSpark to an
+    // exact size isn't reliably triggered on mainnet (see
+    // [[reference-spark-leaf-denominations]]), so we accept whatever
+    // small leaf we have. The bound leaf will carry those sats as
+    // the per-swap handover; small = less overpay at HTLC time.
     const leaves = await listSparkLeaves();
     if (leaves.length === 0) {
       return {
@@ -230,21 +229,9 @@ export async function lazyRebindIfNeeded(contractId: string): Promise<RebindOutc
         reason: 'every leaf in the wallet is already bound — nothing left to use as a vanilla carrier',
       };
     }
-    // Fast path: a dust-sized vanilla leaf already exists.
-    const dustVanilla = vanillaLeaves.find((l) => l.value === SPARK_DUST_THRESHOLD);
-    let sourceLeaf: SparkLeafRow;
-    if (dustVanilla) {
-      sourceLeaf = dustVanilla;
-    } else {
-      try {
-        sourceLeaf = await ensureLeafOfExactSize(SPARK_DUST_THRESHOLD);
-      } catch (e) {
-        return {
-          status: 'no-source-leaf',
-          reason: `couldn't prepare a dust-sized source leaf: ${e instanceof Error ? e.message : String(e)}`,
-        };
-      }
-    }
+    const sourceLeaf: SparkLeafRow = vanillaLeaves.reduce(
+      (min, l) => (l.value < min.value ? l : min),
+    );
 
     const msgBytes = hexToBytes(newCommitIdHex);
     // v0 rebind uses single-output T_n+1, so consumeIndex is always 0.
