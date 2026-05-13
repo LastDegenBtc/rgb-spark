@@ -1787,6 +1787,11 @@ function SettlementAutoEmitProbe({
   const [snapshotErr, setSnapshotErr] = useState<string | null>(null)
   const [emitting, setEmitting] = useState(false)
   const [emitResult, setEmitResult] = useState<AutoEmitOutcome | null>(null)
+  // Phase 1C/clean session 7.3b: user input for the partial-fill amount.
+  // String form so empty input stays distinguishable from 0. On submit we
+  // parse to bigint and validate against snapshot.amount.
+  const [buyerAmountInput, setBuyerAmountInput] = useState<string>('')
+  const [buyerAmountErr, setBuyerAmountErr] = useState<string | null>(null)
 
   useEffect(() => {
     // Same polling cadence as PathTweaksDebug — pathTweaks is module-level
@@ -1806,17 +1811,56 @@ function SettlementAutoEmitProbe({
     setSnapshot(null)
     setSnapshotErr(null)
     setEmitResult(null)
+    setBuyerAmountInput('')
+    setBuyerAmountErr(null)
     if (!newId) return
     const r = await captureSettlementSnapshot(newId)
     if (myGen !== captureGenRef.current) return // a newer capture started
     if (r.ok) {
       setSnapshot(r.snapshot)
       setSnapshotErr(null)
+      // Default to a full transfer; user can edit down for partial fill.
+      setBuyerAmountInput(r.snapshot.amount.toString())
     } else {
       setSnapshot(null)
       setSnapshotErr(r.reason)
     }
   }
+
+  function onBuyerAmountChange(s: string) {
+    setBuyerAmountInput(s)
+    if (!snapshot || s.trim() === '') {
+      setBuyerAmountErr(null)
+      return
+    }
+    if (!/^[0-9]+$/.test(s.trim())) {
+      setBuyerAmountErr('must be a non-negative integer')
+      return
+    }
+    const v = BigInt(s.trim())
+    if (v <= 0n) {
+      setBuyerAmountErr('must be > 0')
+      return
+    }
+    if (v > snapshot.amount) {
+      setBuyerAmountErr(`exceeds leaf holding (${snapshot.amount})`)
+      return
+    }
+    setBuyerAmountErr(null)
+  }
+
+  const buyerAmountOk =
+    snapshot !== null &&
+    buyerAmountInput.trim() !== '' &&
+    buyerAmountErr === null
+
+  const splitPreview: { buyer: bigint; change: bigint } | null =
+    snapshot && buyerAmountOk
+      ? (() => {
+          const buyer = BigInt(buyerAmountInput.trim())
+          return { buyer, change: snapshot.amount - buyer }
+        })()
+      : null
 
   // Only entries with an RGB payload are emit-ready. A pathTweak with neither
   // transitionHex nor consignmentHex means the leaf was bound to some msg the
@@ -2040,7 +2084,7 @@ function SettlementAutoEmitProbe({
             snapshot captured · ready to emit
           </div>
           <div>contractId: {snapshot.contractId}</div>
-          <div>amount: {snapshot.amount.toString()}</div>
+          <div>leaf holding: {snapshot.amount.toString()} units</div>
           <div>operator: {snapshot.operatorPublicKeyHex.slice(0, 16)}…{snapshot.operatorPublicKeyHex.slice(-8)}</div>
           <div>verifyingKey: {snapshot.verifyingPublicKeyHex.slice(0, 16)}…{snapshot.verifyingPublicKeyHex.slice(-8)}</div>
           <div>
@@ -2055,10 +2099,46 @@ function SettlementAutoEmitProbe({
         </div>
       )}
 
+      {snapshot && (
+        <>
+          <label style={{ display: 'block', fontSize: 12, marginTop: 8 }}>
+            buyer amount (units to transfer · ≤ leaf holding)
+          </label>
+          <input
+            value={buyerAmountInput}
+            onChange={(e) => onBuyerAmountChange(e.target.value)}
+            inputMode='numeric'
+            placeholder={snapshot.amount.toString()}
+            style={{
+              width: 200,
+              fontFamily: 'monospace',
+              fontSize: 11,
+              padding: 4,
+              borderColor: buyerAmountErr ? 'crimson' : undefined,
+            }}
+          />
+          {buyerAmountErr && (
+            <div style={{ fontSize: 11, color: 'crimson', marginTop: 2 }}>{buyerAmountErr}</div>
+          )}
+          {splitPreview && splitPreview.change > 0n && (
+            <div style={{ fontSize: 11, color: '#666', marginTop: 4, fontFamily: 'monospace' }}>
+              split: <strong>{splitPreview.buyer.toString()}</strong> to buyer ·{' '}
+              <strong>{splitPreview.change.toString()}</strong> change leaf for you
+            </div>
+          )}
+          {splitPreview && splitPreview.change === 0n && (
+            <div style={{ fontSize: 11, color: '#666', marginTop: 4, fontFamily: 'monospace' }}>
+              full transfer: no change leaf
+            </div>
+          )}
+        </>
+      )}
+
       <div style={{ marginTop: 10 }}>
         <button
           onClick={() => {
-            if (!snapshot || !buyerNpubOk) return
+            if (!snapshot || !buyerNpubOk || !buyerAmountOk) return
+            const orderAmount = BigInt(buyerAmountInput.trim())
             setEmitting(true)
             setEmitResult(null)
             void (async () => {
@@ -2068,15 +2148,13 @@ function SettlementAutoEmitProbe({
                 myNostrPrivkeyHex,
                 mySparkIdentityPubkey,
                 buyerNpub: buyerNpub.trim(),
-                // Session 7.3a: default to full transfer (no split). The
-                // partial-fill UI input lands in 7.3b.
-                orderAmount: snapshot.amount,
+                orderAmount,
               })
               setEmitResult(r)
               setEmitting(false)
             })()
           }}
-          disabled={emitting || !snapshot || !buyerNpubOk}
+          disabled={emitting || !snapshot || !buyerNpubOk || !buyerAmountOk}
           style={{ fontSize: 12 }}
         >
           {emitting ? 'emitting…' : 'Simulate emit (build + sign + POST)'}
@@ -2105,6 +2183,25 @@ function SettlementAutoEmitProbe({
           <div>bytes posted: {emitResult.bytesPosted}</div>
           <div>newCommitIdHex: {emitResult.newCommitIdHex}</div>
           <div>payload: {emitResult.payloadKind}</div>
+          <div>
+            outputs: {emitResult.outputCount}
+            {emitResult.outputCount > 1 && (
+              <>
+                {' · buyerIndex='}{emitResult.buyerOutputIndex}
+                {' · change='}{emitResult.changeAmount.toString()}
+              </>
+            )}
+          </div>
+          {emitResult.changeLeafId && (
+            <div style={{ color: '#33691e' }}>
+              ↳ change leaf minted: {emitResult.changeLeafId.slice(0, 12)}…{emitResult.changeLeafId.slice(-6)}
+            </div>
+          )}
+          {emitResult.postEmitWarning && (
+            <div style={{ color: '#c80', marginTop: 4 }}>
+              ⚠ {emitResult.postEmitWarning}
+            </div>
+          )}
         </div>
       )}
 

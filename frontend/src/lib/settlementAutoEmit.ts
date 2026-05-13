@@ -28,10 +28,20 @@
 //     and signs an envelope v4, POSTs to /consignment/:buyerNpub.
 
 import { ensureSparkCoreReady } from './sparkCore';
-import { getPathTweak } from './rgbAwareSigner';
-import { listSparkLeaves } from './sparkWallet';
+import { clearPathTweak, getPathTweak, listPathTweaks } from './rgbAwareSigner';
+import { listSparkLeaves, mintViaSelfTransfer } from './sparkWallet';
 import { postConsignment } from './consignmentRelay';
+import { addTransition } from './rgbStash';
 import { signEnvelope, type UnsignedEnvelopeV4 } from './envelopeSign';
+
+function hexToBytes(hex: string): Uint8Array {
+  const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
 
 function bytesToHex(b: Uint8Array): string {
   let out = '';
@@ -192,6 +202,14 @@ export type AutoEmitOutcome =
       /** Change amount that went back to the seller as T_new[outputCount-1].
        *  Zero when full transfer. */
       changeAmount: bigint;
+      /** New Spark leaf the seller minted bound to T_new's change output.
+       *  Set only on partial fills (changeAmount > 0). Phase 1C/clean
+       *  session 7.3b. */
+      changeLeafId?: string;
+      /** Non-fatal post-emit warning (e.g. change-leaf mint failed but
+       *  the envelope is still queued at the relay). Lets the UI render
+       *  partial success. */
+      postEmitWarning?: string;
     }
   | { status: 'failed'; reason: string };
 
@@ -348,6 +366,73 @@ export async function runAutoEmit(ctx: AutoEmitContext): Promise<AutoEmitOutcome
     const bodyBytes = new TextEncoder().encode(JSON.stringify(signed));
     const meta = await postConsignment(ctx.buyerNpub, bodyBytes);
 
+    // -------- Post-emit local wallet state mutations (session 7.3b) ---------
+    //
+    // From this point on the envelope is queued at the relay and the chain
+    // is committed. Failures in the steps below leave the relay state
+    // intact and surface as `postEmitWarning` — the caller can recover by
+    // running lazyRebindIfNeeded manually.
+
+    let postEmitWarning: string | undefined;
+
+    // 1. Persist T_new in the seller's local rgbStash so subsequent
+    //    `scanBinding` / `lazyRebindIfNeeded` calls see it as the chain
+    //    head. Idempotent on commitId; safe to re-run on retries.
+    try {
+      const outputs = isSplit
+        ? [{ amount: orderAmount.toString() }, { amount: changeAmount.toString() }]
+        : [{ amount: orderAmount.toString() }];
+      addTransition({
+        commitId: newCommitIdHex.toLowerCase(),
+        prevContractId: ctx.snapshot.contractId,
+        outputs,
+        transitionHex: newTransitionHex,
+        createdAt: new Date().toISOString(),
+      });
+    } catch (e) {
+      postEmitWarning =
+        `addTransition failed: ${e instanceof Error ? e.message : String(e)}`;
+    }
+
+    // 2. The source leaf's binding is now spent (chain says so). Clear
+    //    its pathTweak entry to keep the wallet view consistent with the
+    //    emitted chain. In the future OrderBookPanel HTLC flow this is a
+    //    no-op (the leaf is gone from the wallet anyway); in the current
+    //    probe flow it's what avoids the "source leaf still claims its
+    //    units" inconsistency.
+    clearPathTweak(ctx.snapshot.lockedLeafId);
+
+    // 3. On a partial fill, mint a fresh seller leaf bound to T_new's
+    //    change output so the seller still has a live binding for their
+    //    remaining units. Picks any vanilla leaf as carrier (the just-
+    //    cleared source leaf is usually the natural candidate).
+    let changeLeafId: string | undefined;
+    if (isSplit) {
+      try {
+        const leaves = await listSparkLeaves();
+        const boundIds = new Set(listPathTweaks().map((t) => t.currentLeafId));
+        const vanillaCandidates = leaves.filter((l) => !boundIds.has(l.id));
+        if (vanillaCandidates.length === 0) {
+          postEmitWarning =
+            'change-leaf mint skipped: no vanilla source leaf available — ' +
+            'rebind manually later via the Order book panel.';
+        } else {
+          const source = [...vanillaCandidates].sort((a, b) => a.value - b.value)[0];
+          const mintResult = await mintViaSelfTransfer(
+            source.id,
+            hexToBytes(newCommitIdHex),
+            changeAmount,
+            /* consumeIndex= */ 1,
+            { transitionHex: newTransitionHex, prevGenesisHex: ctx.snapshot.genesisHex },
+          );
+          changeLeafId = mintResult.leaf.id;
+        }
+      } catch (e) {
+        postEmitWarning =
+          `change-leaf mint failed: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+
     return {
       status: 'emitted',
       envelopeId: meta.id,
@@ -358,6 +443,8 @@ export async function runAutoEmit(ctx: AutoEmitContext): Promise<AutoEmitOutcome
       outputCount: isSplit ? 2 : 1,
       buyerOutputIndex,
       changeAmount,
+      ...(changeLeafId ? { changeLeafId } : {}),
+      ...(postEmitWarning ? { postEmitWarning } : {}),
     };
   } catch (e) {
     return {
