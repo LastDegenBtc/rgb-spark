@@ -209,7 +209,9 @@ export async function lazyRebindIfNeeded(contractId: string): Promise<RebindOutc
     const sourceLeaf = [...vanillaLeaves].sort((a, b) => a.value - b.value)[0];
 
     const msgBytes = hexToBytes(newCommitIdHex);
-    const result = await mintViaSelfTransfer(sourceLeaf.id, msgBytes, {
+    // v0 rebind uses single-output T_n+1, so consumeIndex is always 0.
+    // Multi-output rebind (split-merge UX path) lands in a later session.
+    const result = await mintViaSelfTransfer(sourceLeaf.id, msgBytes, amount, 0, {
       transitionHex: newTransitionHex,
       prevGenesisHex: genesisHex,
     });

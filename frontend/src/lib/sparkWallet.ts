@@ -379,11 +379,32 @@ export interface MintRgbPayload {
 export async function mintViaSelfTransfer(
   leafId: string,
   msgBytes: Uint8Array,
+  /**
+   * Units of the asset this newly-minted leaf will carry. Required as
+   * of Phase 1C/clean session 7.2 — written into the pathTweak entry's
+   * `amount` field so downstream code (settlement auto-emit, asset
+   * binding rebind, UI) can reason about fractional ownership without
+   * looking the supply up from rgbStash.
+   */
+  amount: bigint,
+  /**
+   * Which output of the bound transition this leaf maps to. For a
+   * single-output transition (today's only flow) always 0. Multi-output
+   * transitions (session 7.3+) will pass the index of the recipient
+   * this mint corresponds to.
+   */
+  consumeIndex: number,
   rgb?: MintRgbPayload,
 ): Promise<MintViaSelfTransferResult> {
   if (!walletInstance) throw new Error('Wallet not initialized');
   if (msgBytes.length !== 32) {
     throw new Error(`mint msg must be 32 bytes, got ${msgBytes.length}`);
+  }
+  if (amount <= 0n) {
+    throw new Error(`mint amount must be > 0, got ${amount}`);
+  }
+  if (!Number.isInteger(consumeIndex) || consumeIndex < 0) {
+    throw new Error(`mint consumeIndex must be a non-negative integer, got ${consumeIndex}`);
   }
 
   const allLeaves = await walletInstance.getLeaves(true);
@@ -472,7 +493,7 @@ export async function mintViaSelfTransfer(
   if (rgb?.transitionHex && !rgb.prevGenesisHex) {
     throw new Error('mintViaSelfTransfer: transitionHex requires prevGenesisHex');
   }
-  setPathTweak(destLeafId, destLeafId, msgBytes, destUBase, {
+  setPathTweak(destLeafId, destLeafId, msgBytes, destUBase, amount, consumeIndex, {
     consignmentHex: rgb?.consignmentHex,
     transitionHex: rgb?.transitionHex,
     prevGenesisHex: rgb?.prevGenesisHex,

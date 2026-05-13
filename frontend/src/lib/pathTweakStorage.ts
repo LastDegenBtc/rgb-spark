@@ -25,6 +25,11 @@ interface PersistedShape {
     sourcePath: string;
     msgHex: string;
     uBaseHex: string;
+    /** Decimal-encoded u64 — added in Phase 1C/clean session 7.2.
+     *  Required field; legacy entries that lack it are dropped at boot. */
+    amountDec?: string;
+    /** Output index within msg's transition — added in 7.2. */
+    consumeIndex?: number;
     consignmentHex?: string;
     transitionHex?: string;
     prevGenesisHex?: string;
@@ -67,17 +72,30 @@ function writeRaw(payload: PersistedShape | null): void {
  * boot, after the user is authenticated.
  */
 export function attachPathTweakStorage(npub: string): void {
-  // Restore matching tweaks. Entries persisted before uBase was added (pre
-  // session 6) won't have uBaseHex; we skip those rather than guessing.
+  // Restore matching tweaks. Entries persisted before uBase was added
+  // (pre session 6) or before amount/consumeIndex were added (pre 7.2)
+  // are missing fields we can't sensibly default — we skip those rather
+  // than guessing wrong. User has confirmed clearing legacy on the 7.2
+  // bump (the live mainnet wallets only had a handful of bound leaves).
   const persisted = readRaw();
   if (persisted && persisted.npub === npub) {
-    const usable = persisted.entries.filter((e) => typeof e.uBaseHex === 'string' && e.uBaseHex.length === 66);
+    const usable = persisted.entries.filter(
+      (e) =>
+        typeof e.uBaseHex === 'string' &&
+        e.uBaseHex.length === 66 &&
+        typeof e.amountDec === 'string' &&
+        e.amountDec.length > 0 &&
+        typeof e.consumeIndex === 'number' &&
+        e.consumeIndex >= 0,
+    );
     restorePathTweaks(
       usable.map((e) => ({
         currentLeafId: e.currentLeafId,
         sourcePath: e.sourcePath,
         msg: hexToBytes(e.msgHex),
         uBase: hexToBytes(e.uBaseHex),
+        amount: BigInt(e.amountDec!),
+        consumeIndex: e.consumeIndex!,
         consignmentHex: e.consignmentHex,
         transitionHex: e.transitionHex,
         prevGenesisHex: e.prevGenesisHex,
@@ -94,6 +112,8 @@ export function attachPathTweakStorage(npub: string): void {
       sourcePath: e.sourcePath,
       msgHex: bytesToHex(e.msg),
       uBaseHex: bytesToHex(e.uBase),
+      amountDec: e.amount.toString(),
+      consumeIndex: e.consumeIndex,
       ...(e.consignmentHex ? { consignmentHex: e.consignmentHex } : {}),
       ...(e.transitionHex ? { transitionHex: e.transitionHex } : {}),
       ...(e.prevGenesisHex ? { prevGenesisHex: e.prevGenesisHex } : {}),

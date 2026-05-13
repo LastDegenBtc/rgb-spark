@@ -2449,9 +2449,31 @@ function SparkUtkMintViaTransfer() {
                 prevGenesisHex: pendingRgb.prevGenesisHex,
               }
             : undefined
+      // Phase 1C/clean session 7.2: derive `amount` from the bound chain
+      // when we have one. Dev-lab raw-msg mints with no RGB payload have
+      // no meaningful asset amount — use 1 as a token placeholder so the
+      // pathTweak entry is still valid.
+      let mintAmount: bigint = 1n
+      if (pendingRgb?.kind === 'genesis') {
+        const meta = core.niaGenesisMetadata(pendingRgb.consignmentHex)
+        try {
+          mintAmount = BigInt(meta.supply)
+        } finally {
+          meta.free()
+        }
+      } else if (pendingRgb?.kind === 'transition') {
+        const meta = core.niaGenesisMetadata(pendingRgb.prevGenesisHex)
+        try {
+          mintAmount = BigInt(meta.supply)
+        } finally {
+          meta.free()
+        }
+      }
       const { transferId, leaf } = await mintViaSelfTransfer(
         selectedLeafId,
         msgBytes,
+        mintAmount,
+        0,
         rgbPayload,
       )
 

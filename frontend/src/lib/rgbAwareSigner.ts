@@ -51,6 +51,22 @@ export interface PathTweakEntry {
    *  Spark-UTK relation `verifyingKey = U_base + tagged_hash(U_base‖msg)·G + operator`
    *  without re-querying the signer. Stored as 33-byte compressed pubkey bytes. */
   uBase: Uint8Array;
+  /** Units of the asset this leaf carries (Phase 1C/clean session 7.2).
+   *  For depth-1 leaves bound to genesis, equals the contract supply.
+   *  For depth-N leaves bound to a transition, equals the amount of the
+   *  specific output (indexed by `consumeIndex`) the leaf maps to. The
+   *  field is mandatory: legacy pre-7.2 entries that lack it are
+   *  dropped at boot rather than guessed at. */
+  amount: bigint;
+  /** Which output of `msg`'s transition this leaf is bound to
+   *  (Phase 1C/clean session 7.2). For a single-output transition,
+   *  always 0. For a future multi-output transition that splits an
+   *  asset between buyer and seller-as-change, the seller's bound
+   *  leaf would have `consumeIndex = 1` (or whichever the change
+   *  output ended up at). This is the index `buildNiaTransitionFromPrev`
+   *  later passes as `consume_index` when consuming this leaf to build
+   *  the next transition. */
+  consumeIndex: number;
   /** Optional RGB consignment (hex) whose contractId == msg. Present only
    *  when the leaf was minted bound to a real RGB issuance via
    *  IssueNiaInline. Lets the sender attach the consignment to the
@@ -91,6 +107,8 @@ export function setPathTweak(
   sourcePath: string,
   msg: Uint8Array,
   uBase: Uint8Array,
+  amount: bigint,
+  consumeIndex: number,
   extras?: {
     consignmentHex?: string;
     transitionHex?: string;
@@ -103,6 +121,12 @@ export function setPathTweak(
   if (uBase.length !== 33) {
     throw new Error(`RGB tweak uBase must be 33 bytes compressed, got ${uBase.length}`);
   }
+  if (amount <= 0n) {
+    throw new Error(`RGB tweak amount must be > 0, got ${amount}`);
+  }
+  if (!Number.isInteger(consumeIndex) || consumeIndex < 0) {
+    throw new Error(`RGB tweak consumeIndex must be a non-negative integer, got ${consumeIndex}`);
+  }
   if (extras?.transitionHex && !extras.prevGenesisHex) {
     throw new Error('setPathTweak: transitionHex requires prevGenesisHex for receiver replay');
   }
@@ -110,6 +134,8 @@ export function setPathTweak(
     sourcePath,
     msg,
     uBase,
+    amount,
+    consumeIndex,
     consignmentHex: extras?.consignmentHex,
     transitionHex: extras?.transitionHex,
     prevGenesisHex: extras?.prevGenesisHex,
@@ -137,6 +163,8 @@ export function listPathTweaks(): Array<{ currentLeafId: string } & PathTweakEnt
     sourcePath: e.sourcePath,
     msg: e.msg,
     uBase: e.uBase,
+    amount: e.amount,
+    consumeIndex: e.consumeIndex,
     consignmentHex: e.consignmentHex,
     transitionHex: e.transitionHex,
     prevGenesisHex: e.prevGenesisHex,
@@ -154,6 +182,8 @@ export function restorePathTweaks(
     sourcePath: string;
     msg: Uint8Array;
     uBase: Uint8Array;
+    amount: bigint;
+    consumeIndex: number;
     consignmentHex?: string;
     transitionHex?: string;
     prevGenesisHex?: string;
@@ -165,6 +195,8 @@ export function restorePathTweaks(
       sourcePath: e.sourcePath,
       msg: e.msg,
       uBase: e.uBase,
+      amount: e.amount,
+      consumeIndex: e.consumeIndex,
       consignmentHex: e.consignmentHex,
       transitionHex: e.transitionHex,
       prevGenesisHex: e.prevGenesisHex,
