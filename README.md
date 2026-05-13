@@ -28,6 +28,10 @@ issue → bind → trade → atomic settlement → cross-wallet delivery →
 re-sell. See [`RGB-ON-SPARK.md`](./RGB-ON-SPARK.md) for what ships
 today, product positioning, and the L1 ⇄ Spark bridge design.
 
+The downstream consumer product — **RGB-SPK**, a pure-P2P trading
+platform built on these primitives — is scoped in
+[`RGB-SPK.md`](./RGB-SPK.md) (separate codebase, future work).
+
 ## Layout
 
 ```
