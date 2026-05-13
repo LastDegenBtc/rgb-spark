@@ -200,6 +200,24 @@ export function listContracts(): StashContract[] {
   return state.contracts.slice();
 }
 
+/**
+ * Remove a contract + all its transitions from the stash. Used by the
+ * UI to clean up orphan entries (= contracts whose mint flow failed
+ * mid-way, leaving no bound leaf but a stash entry). No on-chain
+ * effect — purely local stash cleanup. Idempotent: removing a
+ * contract that doesn't exist is a no-op.
+ */
+export function removeContract(contractId: string): void {
+  const id = contractId.toLowerCase();
+  const beforeLen = state.contracts.length;
+  state.contracts = state.contracts.filter((c) => c.contractId.toLowerCase() !== id);
+  state.transitions = state.transitions.filter((t) => t.prevContractId.toLowerCase() !== id);
+  if (state.contracts.length !== beforeLen) {
+    writeRaw();
+    notify();
+  }
+}
+
 export function listTransitionsFor(contractId: string): StashTransition[] {
   return state.transitions.filter((t) => t.prevContractId === contractId);
 }
