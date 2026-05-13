@@ -241,6 +241,165 @@ async function main() {
     selfMatchResp.body,
   )
 
+
+  // ---- Partial-fill phase (Phase 1C/clean session 8.1) ----
+  //
+  // The relay now accepts bids whose amount is < ask amount, provided
+  // the UNIT price matches exactly. The ask is consumed in full from
+  // the orderbook side; the seller's wallet handles the change via the
+  // split-merge pipeline (session 7.3).
+  console.log('Phase 11: partial fill — bid 200 X / 10k sats against ask 1000 X / 50k sats.')
+  const assetId3 = bytesToHex(randomBytes(32))
+  const ask3 = signOrder(
+    {
+      id: uuidV7(),
+      side: 'ask' as const,
+      posterNpub: alice.npub,
+      posterSparkIdentityPubkey: alice.sparkCompressed,
+      assetId: assetId3,
+      amount: '1000',
+      priceSats: 50_000,
+      paymentHash: bytesToHex(randomBytes(32)),
+      expiryTime: expiry,
+      createdAt: new Date().toISOString(),
+    },
+    alice.priv,
+  )
+  await postOrder(assetId3, ask3)
+
+  const partialBid = signOrder(
+    {
+      id: uuidV7(),
+      side: 'bid' as const,
+      posterNpub: bob.npub,
+      posterSparkIdentityPubkey: bob.sparkCompressed,
+      assetId: assetId3,
+      amount: '200',
+      // Same unit price: 50_000 / 1000 == 10_000 / 200 == 50 sats per X.
+      priceSats: 10_000,
+      expiryTime: expiry,
+      createdAt: new Date().toISOString(),
+    },
+    bob.priv,
+  )
+  const partialResp = await postOrder(assetId3, partialBid)
+  await expect('partial bid matches', partialResp.body.status === 'matched', partialResp.body)
+  await expect(
+    'matchedAmount == bid amount (200)',
+    partialResp.body.matchedAmount === '200',
+    partialResp.body,
+  )
+  await expect(
+    'matchedWith == ask3 id',
+    partialResp.body.matchedWith === ask3.id,
+    partialResp.body,
+  )
+
+  console.log('Phase 12: a subsequent bid against the SAME ask is refused (single-shot).')
+  const ask4 = signOrder(
+    {
+      id: uuidV7(),
+      side: 'ask' as const,
+      posterNpub: alice.npub,
+      posterSparkIdentityPubkey: alice.sparkCompressed,
+      assetId: assetId3,
+      amount: '500',
+      priceSats: 25_000,
+      paymentHash: bytesToHex(randomBytes(32)),
+      expiryTime: expiry,
+      createdAt: new Date().toISOString(),
+    },
+    alice.priv,
+  )
+  // Try to bid 100 X against ask3 specifically — ask3 is already matched,
+  // so this should fall through to ask4 (still open, same unit price).
+  const partialBid2 = signOrder(
+    {
+      id: uuidV7(),
+      side: 'bid' as const,
+      posterNpub: bob.npub,
+      posterSparkIdentityPubkey: bob.sparkCompressed,
+      assetId: assetId3,
+      amount: '100',
+      priceSats: 5_000, // 50 sats per X — same unit price
+      expiryTime: expiry,
+      createdAt: new Date().toISOString(),
+    },
+    bob.priv,
+  )
+  // Post ask4 first, then partial bid.
+  await postOrder(assetId3, ask4)
+  const partialBid2Resp = await postOrder(assetId3, partialBid2)
+  await expect(
+    'second partial bid matches the still-open ask4',
+    partialBid2Resp.body.status === 'matched' && partialBid2Resp.body.matchedWith === ask4.id,
+    partialBid2Resp.body,
+  )
+
+  console.log('Phase 13: unit-price MISMATCH is refused.')
+  const ask5 = signOrder(
+    {
+      id: uuidV7(),
+      side: 'ask' as const,
+      posterNpub: alice.npub,
+      posterSparkIdentityPubkey: alice.sparkCompressed,
+      assetId: assetId3,
+      amount: '1000',
+      priceSats: 50_000,
+      paymentHash: bytesToHex(randomBytes(32)),
+      expiryTime: expiry,
+      createdAt: new Date().toISOString(),
+    },
+    alice.priv,
+  )
+  await postOrder(assetId3, ask5)
+
+  // 200 X for 11_000 sats = 55 sats per X — different from ask5's 50.
+  const mispricedBid = signOrder(
+    {
+      id: uuidV7(),
+      side: 'bid' as const,
+      posterNpub: bob.npub,
+      posterSparkIdentityPubkey: bob.sparkCompressed,
+      assetId: assetId3,
+      amount: '200',
+      priceSats: 11_000,
+      expiryTime: expiry,
+      createdAt: new Date().toISOString(),
+    },
+    bob.priv,
+  )
+  const mispricedResp = await postOrder(assetId3, mispricedBid)
+  await expect(
+    'mismatched unit price stays open (no match)',
+    mispricedResp.body.status === 'open',
+    mispricedResp.body,
+  )
+
+  console.log('Phase 14: bid amount > ask amount is refused.')
+  // Ask5 still open (mispriced bid above did not consume it).
+  const overbid = signOrder(
+    {
+      id: uuidV7(),
+      side: 'bid' as const,
+      posterNpub: bob.npub,
+      posterSparkIdentityPubkey: bob.sparkCompressed,
+      assetId: assetId3,
+      amount: '1500', // > ask5.amount = 1000
+      // Same unit price: 50_000/1000 == 75_000/1500 == 50.
+      priceSats: 75_000,
+      expiryTime: expiry,
+      createdAt: new Date().toISOString(),
+    },
+    bob.priv,
+  )
+  const overbidResp = await postOrder(assetId3, overbid)
+  await expect(
+    'overbid (bid amount > ask amount) stays open',
+    overbidResp.body.status === 'open',
+    overbidResp.body,
+  )
+
   console.log('\nAll orderbook smoke tests passed.')
 }
 

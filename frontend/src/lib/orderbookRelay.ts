@@ -49,6 +49,10 @@ export interface PlaceResult {
   counterpartyNpub?: string;
   paymentHash?: string;
   counterpartyOrder?: SignedOrder;
+  /** Decimal-encoded amount actually transacted (Phase 1C/clean session 8.1).
+   *  Equals `min(askAmount, bidAmount)` per the partial-fill model on the
+   *  relay (bids never exceed asks). Absent on open orders. */
+  matchedAmount?: string;
 }
 
 // ----- Error / base URL plumbing (same posture as consignmentRelay) ---------

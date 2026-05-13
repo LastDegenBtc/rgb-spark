@@ -253,24 +253,46 @@ function gcExpired(b: Map<string, StoredOrder>) {
 }
 
 /**
- * Find an open opposing order at the EXACT same price level (FIFO within
- * the price). Returns the StoredOrder to match against, or null.
+ * Find an open opposing order at the same UNIT price (FIFO within the
+ * price). Returns the StoredOrder to match against, or null.
  *
- * Per `feedback_exact_price_matching`: NO sweep / NO price improvement.
- * A bid at 5 sats only fills against asks at exactly 5 sats. Same logic
- * the other way. If a future flow needs aggressive matching, it must be
- * an explicit per-order flag, never the default.
+ * Per [[feedback_exact_price_matching]]: NO sweep / NO price improvement.
+ * Same unit price means `bid.priceSats * ask.amount == ask.priceSats *
+ * bid.amount` exactly (cross-multiplication avoids floating-point
+ * rounding) — so a bid at 5 sats/X only fills against asks at exactly
+ * 5 sats/X, regardless of lot size.
+ *
+ * Partial fills (Phase 1C/clean session 8.1): a bid can request less
+ * than an ask offers. When matched, the bid is fully consumed and the
+ * ask is consumed in full from the orderbook side (status → matched).
+ * The seller's wallet still holds the change (via the split-merge
+ * pipeline from session 7.3); to keep selling, the seller re-posts a
+ * fresh ask with a NEW paymentHash for the remaining amount. We do NOT
+ * keep the ask partially-open here because the seller's paymentHash is
+ * single-use — matching a second bid against the same ask would let
+ * both buyers race for the same preimage.
+ *
+ * Symmetric for ask-side: an incoming ask cannot offer LESS than a
+ * resting bid wants. (An incoming ask offering MORE than a resting bid
+ * is the same partial-fill case, just with roles swapped — also valid.)
  */
-function findExactMatch(b: Map<string, StoredOrder>, incoming: SignedOrder): StoredOrder | null {
+function findCompatibleMatch(b: Map<string, StoredOrder>, incoming: SignedOrder): StoredOrder | null {
   const opposingSide: OrderSide = incoming.side === 'ask' ? 'bid' : 'ask'
   let bestMatch: StoredOrder | null = null
   let bestTs = Infinity
+  const incomingAmount = BigInt(incoming.amount)
   for (const so of b.values()) {
     if (so.status !== 'open') continue
     if (so.order.side !== opposingSide) continue
-    if (so.order.priceSats !== incoming.priceSats) continue
     if (so.order.assetId.toLowerCase() !== incoming.assetId.toLowerCase()) continue
-    if (so.order.amount !== incoming.amount) continue
+    const soAmount = BigInt(so.order.amount)
+    // Unit-price equality (cross-multiplication, exact integer arithmetic).
+    if (BigInt(incoming.priceSats) * soAmount !== BigInt(so.order.priceSats) * incomingAmount) continue
+    // Partial-fill constraint: the BID side must not exceed the ASK side's
+    // amount. Determine which is bid/ask and check.
+    const askAmount = incoming.side === 'ask' ? incomingAmount : soAmount
+    const bidAmount = incoming.side === 'bid' ? incomingAmount : soAmount
+    if (bidAmount > askAmount) continue
     // Don't match an order against itself (same posterNpub). Allowing
     // self-trades would let a single user exfiltrate trust signals.
     if (so.order.posterNpub === incoming.posterNpub) continue
@@ -297,6 +319,12 @@ export interface PlaceResult {
   paymentHash?: string
   /** Counterparty's full signed payload, so the client can independently verify. */
   counterpartyOrder?: SignedOrder
+  /** Decimal-encoded amount actually transacted (Phase 1C/clean session 8.1).
+   *  Equals `min(askAmount, bidAmount)` = the bid's amount in our partial-fill
+   *  model where bids never exceed asks. Lets the seller know how much they
+   *  sold (might be less than they offered) and the buyer confirm they got
+   *  what they wanted. Absent on open orders. */
+  matchedAmount?: string
 }
 
 export function placeOrder(assetId: string, signed: SignedOrder): PlaceResult {
@@ -317,7 +345,7 @@ export function placeOrder(assetId: string, signed: SignedOrder): PlaceResult {
     throw Object.assign(new Error('orderbook full for asset'), { http: 429 })
   }
 
-  const match = findExactMatch(b, signed)
+  const match = findCompatibleMatch(b, signed)
   const now = new Date().toISOString()
   if (match) {
     // Flip both to matched.
@@ -337,6 +365,9 @@ export function placeOrder(assetId: string, signed: SignedOrder): PlaceResult {
       // We do NOT mutate the signed payload (signature would break). The
       // matched paymentHash is conveyed via the result, not via mutation.
     }
+    // Matched amount = min(bid.amount, ask.amount) = the bid's amount
+    // because findCompatibleMatch rejects bid > ask.
+    const bidAmt = signed.side === 'bid' ? signed.amount : match.order.amount
     return {
       status: 'matched',
       id: signed.id,
@@ -345,6 +376,7 @@ export function placeOrder(assetId: string, signed: SignedOrder): PlaceResult {
       counterpartyNpub: match.order.posterNpub,
       paymentHash: match.order.paymentHash ?? signed.paymentHash,
       counterpartyOrder: match.order,
+      matchedAmount: bidAmt,
     }
   }
 
