@@ -171,6 +171,13 @@ interface LeafReference {
    *  map from the genesis assignments to feed Schema::validate_state. */
   transitionHex?: string
   prevGenesisHex?: string
+  /** When present (hex of a strict-encoded `Transition`), the receiver
+   *  validates a depth-3 chain `genesis → prevTransition → transition`
+   *  via `core.validateNiaTransitionFromPrev`. Shipped by
+   *  settlement-consignment-v1 envelopes; msgHex on those refers to
+   *  prevTransition.id() (the seller's pre-swap binding), not the new
+   *  transition. See `frontend/src/lib/envelopeSign.ts`. */
+  prevTransitionHex?: string
 }
 
 type ConsignmentEnvelope =
@@ -2759,7 +2766,7 @@ type LeafVerification =
 //                   rebuilt from a prev-genesis consignment. No witness
 //                   resolver, no L1 — see feedback_no_synthetic_l1_witness.
 //                   Expected msg == returned transition.id().
-type RgbBindingKind = 'genesis' | 'transition'
+type RgbBindingKind = 'genesis' | 'transition' | 'transition-on-transition'
 
 type RgbValidation =
   | { kind: 'none' }                                                        // no RGB payload attached
@@ -3010,7 +3017,57 @@ function ConsignmentLab({
           }
         }
         let rgbValidation: RgbValidation = { kind: 'none' }
-        if (leafRef?.transitionHex && leafRef?.prevGenesisHex) {
+        if (leafRef?.transitionHex && leafRef?.prevGenesisHex && leafRef?.prevTransitionHex) {
+          // Depth-3 chain: genesis → prevTransition → transition. Shipped
+          // by settlement-consignment-v1 envelopes (Phase 1C/clean session 5.2).
+          // Validation contract:
+          //   - validateNiaTransitionFromPrev(transition, prevTransition, genesis)
+          //     re-runs schema on every link, returns transition.id() — this is
+          //     the NEW state the buyer is being handed (T_new).
+          //   - msgHex carried on the envelope refers to the SELLER's pre-swap
+          //     binding (= prevTransition.id() = T_n.id()), NOT T_new. So the
+          //     cross-check we expose to the user is `prevTransition.id() ==
+          //     msgHex`, derived via a separate validateNiaTransition call on
+          //     prevTransitionHex against the genesis.
+          try {
+            // First confirm the full chain validates — without this the
+            // prevTransition could be in isolation but unrelated to genesis.
+            core
+              .validateNiaTransitionFromPrev(
+                leafRef.transitionHex,
+                leafRef.prevTransitionHex,
+                leafRef.prevGenesisHex,
+              )
+              .toLowerCase()
+            // Then recover prevTransition.id() so we can cross-check msgHex
+            // against the seller's pre-swap binding.
+            const prevCommitted = core
+              .validateNiaTransition(leafRef.prevTransitionHex, leafRef.prevGenesisHex)
+              .toLowerCase()
+            if (!leafRef.msgHex) {
+              rgbValidation = { kind: 'missing-msg', binding: 'transition-on-transition' }
+            } else if (leafRef.msgHex.toLowerCase() === prevCommitted) {
+              rgbValidation = {
+                kind: 'ok',
+                binding: 'transition-on-transition',
+                committed: prevCommitted,
+              }
+            } else {
+              rgbValidation = {
+                kind: 'msg-mismatch',
+                binding: 'transition-on-transition',
+                committed: prevCommitted,
+                msgHex: leafRef.msgHex.toLowerCase(),
+              }
+            }
+          } catch (e) {
+            rgbValidation = {
+              kind: 'fail',
+              binding: 'transition-on-transition',
+              message: e instanceof Error ? e.message : String(e),
+            }
+          }
+        } else if (leafRef?.transitionHex && leafRef?.prevGenesisHex) {
           // Spark-native transition validation: schema-only, no resolver,
           // no synthetic L1 witness. The returned hex is transition.id(),
           // which must match msgHex to close the chunk-α leaf-binding loop.
@@ -3397,12 +3454,16 @@ function DecodedView({ entry }: { entry: DecodedConsignment }) {
   let rgbBadge: ReactNode = null
   if (rv && rv.kind !== 'none') {
     const label = rv.kind === 'ok' || rv.kind === 'msg-mismatch' || rv.kind === 'missing-msg' || rv.kind === 'fail'
-      ? rv.binding === 'transition'
-        ? 'NIA transition'
-        : 'NIA genesis'
+      ? rv.binding === 'transition-on-transition'
+        ? 'NIA chain (genesis → T_n → T_new)'
+        : rv.binding === 'transition'
+          ? 'NIA transition'
+          : 'NIA genesis'
       : ''
     const committedLabel = (binding: RgbBindingKind) =>
-      binding === 'transition' ? 'transition.id()' : 'contractId'
+      binding === 'transition' || binding === 'transition-on-transition'
+        ? 'transition.id()'
+        : 'contractId'
     if (rv.kind === 'ok') {
       rgbBadge = (
         <span style={{ color: 'seagreen' }}>

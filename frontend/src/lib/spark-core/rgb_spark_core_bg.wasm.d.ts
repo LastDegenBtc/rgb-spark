@@ -1,6 +1,7 @@
 /* tslint:disable */
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
+export const __wbg_niagenesismetadata_free: (a: number, b: number) => void;
 export const __wbg_niaissuance_free: (a: number, b: number) => void;
 export const __wbg_niatransition_free: (a: number, b: number) => void;
 export const __wbg_sparkutkproofjs_free: (a: number, b: number) => void;
@@ -10,6 +11,11 @@ export const deriveOutputXonly: (a: number, b: number, c: number, d: number, e: 
 export const deriveUTweaked: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const deriveVerifyingKey: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const issueNiaContract: (a: number, b: number, c: number, d: number, e: bigint, f: number, g: number, h: number, i: bigint) => [number, number, number];
+export const niaGenesisMetadata: (a: number, b: number) => [number, number, number];
+export const niagenesismetadata_contractId: (a: number) => [number, number];
+export const niagenesismetadata_name: (a: number) => [number, number];
+export const niagenesismetadata_supply: (a: number) => [number, number];
+export const niagenesismetadata_ticker: (a: number) => [number, number];
 export const niaissuance_consignmentHex: (a: number) => [number, number];
 export const niaissuance_contractId: (a: number) => [number, number];
 export const niatransition_commitIdHex: (a: number) => [number, number];

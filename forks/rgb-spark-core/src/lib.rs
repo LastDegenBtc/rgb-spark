@@ -33,7 +33,7 @@ use rgbstd::{
     Amount, AssignmentType, BundleId, ChainNet, GenesisSeal, GraphSeal, Identity, Operation,
     Opout, Precision, RevealedState, RevealedValue, Transition, Txid,
 };
-use schemata::{NonInflatableAsset, OS_ASSET};
+use schemata::{NonInflatableAsset, GS_ISSUED_SUPPLY, GS_NOMINAL, OS_ASSET};
 use strict_encoding::{StrictDeserialize, StrictDumb, StrictSerialize};
 use wasm_bindgen::prelude::*;
 
@@ -277,6 +277,111 @@ pub fn validate_nia_consignment(consignment_hex: &str) -> Result<String, JsError
         .map_err(|e| JsError::new(&format!("consignment validation: {e:?}")))?;
 
     Ok(hex::encode(valid.contract_id().to_byte_array()))
+}
+
+/// JS handle around the human-readable + supply metadata extracted from a
+/// validated NIA genesis. Lets the buyer-side inbox auto-populate the
+/// `StashContract` shape without trusting the seller's envelope claims —
+/// ticker, name, supply are all schema-validated bytes from the genesis.
+#[wasm_bindgen]
+pub struct NiaGenesisMetadata {
+    contract_id_hex: String,
+    ticker: String,
+    name: String,
+    // u64 returned as decimal string to dodge JS Number precision (>2^53).
+    supply: String,
+}
+
+#[wasm_bindgen]
+impl NiaGenesisMetadata {
+    #[wasm_bindgen(getter, js_name = contractId)]
+    pub fn contract_id(&self) -> String { self.contract_id_hex.clone() }
+
+    #[wasm_bindgen(getter)]
+    pub fn ticker(&self) -> String { self.ticker.clone() }
+
+    #[wasm_bindgen(getter)]
+    pub fn name(&self) -> String { self.name.clone() }
+
+    /// Decimal string. JS side parses as BigInt or compares as string.
+    #[wasm_bindgen(getter)]
+    pub fn supply(&self) -> String { self.supply.clone() }
+}
+
+/// Decode a NIA genesis consignment and extract the metadata fields a
+/// receiver needs to register the contract in their rgbStash without
+/// trusting the sender. Re-validates the consignment internally, so any
+/// caller can pass arbitrary bytes from the wire without a prior check.
+///
+/// Returns `{contractId, ticker, name, supply}`. The `supply` value comes
+/// back as a decimal string (u64 outside JS Number's safe-integer range
+/// would silently truncate otherwise).
+#[wasm_bindgen(js_name = niaGenesisMetadata)]
+pub fn nia_genesis_metadata(consignment_hex: &str) -> Result<NiaGenesisMetadata, JsError> {
+    let bytes = hex::decode(consignment_hex).map_err(map_err("hex decode"))?;
+    let confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(bytes)
+        .map_err(map_err("size limit"))?;
+    let consignment = Consignment::<false>::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(confined)
+        .map_err(map_err("strict decode consignment"))?;
+
+    // Re-run schema validation rather than trusting the bytes: a malformed
+    // genesis could be syntactically decodable but schema-invalid, and we
+    // don't want to surface ticker/name/supply that would never round-trip
+    // through the validator. `Consignment::validate` consumes `self`, so we
+    // hand it a clone and keep the original to read globals from.
+    let validation_config = ValidationConfig {
+        chain_net: ChainNet::BitcoinMainnet,
+        trusted_typesystem: NonInflatableAsset::types(),
+        ..Default::default()
+    };
+    let valid = consignment
+        .clone()
+        .validate(&GenesisOnlyResolver, &validation_config)
+        .map_err(|e| JsError::new(&format!("consignment validation: {e:?}")))?;
+    let contract_id_hex = hex::encode(valid.contract_id().to_byte_array());
+
+    let genesis = consignment.genesis();
+    let globals = &genesis.globals;
+
+    // Spec under GS_NOMINAL — AssetSpec carries ticker + name + precision.
+    // GlobalValues derefs to Confined<Vec<RevealedData>>; indexing into [0]
+    // is safe because the schema requires Occurrences::Once on GS_NOMINAL
+    // (= validated above).
+    let spec_values = globals
+        .get(&GS_NOMINAL)
+        .ok_or_else(|| JsError::new("genesis: missing GS_NOMINAL global"))?;
+    let spec_blob = spec_values
+        .first()
+        .ok_or_else(|| JsError::new("genesis: GS_NOMINAL has no values"))?;
+    // RevealedData wraps SmallBlob; its `#[wrapper(AsSlice, ...)]` macro
+    // generates `as_slice() -> &[u8]` for us.
+    let spec_bytes: Vec<u8> = spec_blob.as_slice().to_vec();
+    let spec_confined =
+        Confined::<Vec<u8>, 0, { u16::MAX as usize }>::try_from(spec_bytes)
+            .map_err(map_err("AssetSpec confined"))?;
+    let spec = AssetSpec::from_strict_serialized::<{ u16::MAX as usize }>(spec_confined)
+        .map_err(map_err("strict decode AssetSpec"))?;
+
+    // Supply under GS_ISSUED_SUPPLY — Amount carries the u64 value.
+    let supply_values = globals
+        .get(&GS_ISSUED_SUPPLY)
+        .ok_or_else(|| JsError::new("genesis: missing GS_ISSUED_SUPPLY global"))?;
+    let supply_blob = supply_values
+        .first()
+        .ok_or_else(|| JsError::new("genesis: GS_ISSUED_SUPPLY has no values"))?;
+    let supply_bytes: Vec<u8> = supply_blob.as_slice().to_vec();
+    let supply_confined =
+        Confined::<Vec<u8>, 0, { u16::MAX as usize }>::try_from(supply_bytes)
+            .map_err(map_err("Amount confined"))?;
+    let amount = Amount::from_strict_serialized::<{ u16::MAX as usize }>(supply_confined)
+        .map_err(map_err("strict decode Amount"))?;
+
+    Ok(NiaGenesisMetadata {
+        contract_id_hex,
+        ticker: spec.ticker.to_string(),
+        name: spec.name.to_string(),
+        supply: amount.value().to_string(),
+    })
 }
 
 /// JS handle around the result of building a NIA `Transition`. Carries
@@ -875,6 +980,29 @@ mod tests {
             validated_id, issued.contract_id_hex,
             "receiver-derived contractId must equal sender contractId"
         );
+    }
+
+    #[test]
+    fn nia_genesis_metadata_returns_ticker_name_supply() {
+        // Issue a contract with known fields, then decode the metadata
+        // out of the produced consignment bytes. Round-trip must be exact:
+        // the ticker / name / supply you encoded come back byte-for-byte.
+        let issued = issue_nia_contract(
+            "SPRK",
+            "Spark RGB Test",
+            314_159,
+            FIXTURE_TXID,
+            0,
+            1_700_000_200,
+        )
+        .expect("issuance");
+        let meta = nia_genesis_metadata(&issued.consignment_hex)
+            .expect("metadata extraction");
+        assert_eq!(meta.contract_id_hex, issued.contract_id_hex,
+            "metadata contractId must equal issuance contractId");
+        assert_eq!(meta.ticker, "SPRK");
+        assert_eq!(meta.name, "Spark RGB Test");
+        assert_eq!(meta.supply, "314159");
     }
 
     #[test]

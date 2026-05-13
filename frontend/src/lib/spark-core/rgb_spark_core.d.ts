@@ -2,6 +2,25 @@
 /* eslint-disable */
 
 /**
+ * JS handle around the human-readable + supply metadata extracted from a
+ * validated NIA genesis. Lets the buyer-side inbox auto-populate the
+ * `StashContract` shape without trusting the seller's envelope claims —
+ * ticker, name, supply are all schema-validated bytes from the genesis.
+ */
+export class NiaGenesisMetadata {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    readonly contractId: string;
+    readonly name: string;
+    /**
+     * Decimal string. JS side parses as BigInt or compares as string.
+     */
+    readonly supply: string;
+    readonly ticker: string;
+}
+
+/**
  * JS handle around the result of a NIA issuance — carries both the
  * deterministic contractId (the value we bind a Spark leaf to as `msg`)
  * AND the strict-encoded genesis consignment bytes (what a receiver
@@ -144,6 +163,18 @@ export function deriveVerifyingKey(u_base_hex: string, msg_hex: string, operator
 export function issueNiaContract(ticker: string, name: string, supply: bigint, beneficiary_txid_hex: string, beneficiary_vout: number, timestamp_secs: bigint): NiaIssuance;
 
 /**
+ * Decode a NIA genesis consignment and extract the metadata fields a
+ * receiver needs to register the contract in their rgbStash without
+ * trusting the sender. Re-validates the consignment internally, so any
+ * caller can pass arbitrary bytes from the wire without a prior check.
+ *
+ * Returns `{contractId, ticker, name, supply}`. The `supply` value comes
+ * back as a decimal string (u64 outside JS Number's safe-integer range
+ * would silently truncate otherwise).
+ */
+export function niaGenesisMetadata(consignment_hex: string): NiaGenesisMetadata;
+
+/**
  * Decode + validate a strict-encoded NIA genesis consignment (hex).
  * Returns the contractId (32-byte hex) extracted from the validated
  * consignment, so the receiver can compare it against the `msgHex`
@@ -195,6 +226,7 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly __wbg_niagenesismetadata_free: (a: number, b: number) => void;
     readonly __wbg_niaissuance_free: (a: number, b: number) => void;
     readonly __wbg_niatransition_free: (a: number, b: number) => void;
     readonly __wbg_sparkutkproofjs_free: (a: number, b: number) => void;
@@ -204,6 +236,11 @@ export interface InitOutput {
     readonly deriveUTweaked: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly deriveVerifyingKey: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly issueNiaContract: (a: number, b: number, c: number, d: number, e: bigint, f: number, g: number, h: number, i: bigint) => [number, number, number];
+    readonly niaGenesisMetadata: (a: number, b: number) => [number, number, number];
+    readonly niagenesismetadata_contractId: (a: number) => [number, number];
+    readonly niagenesismetadata_name: (a: number) => [number, number];
+    readonly niagenesismetadata_supply: (a: number) => [number, number];
+    readonly niagenesismetadata_ticker: (a: number) => [number, number];
     readonly niaissuance_consignmentHex: (a: number) => [number, number];
     readonly niaissuance_contractId: (a: number) => [number, number];
     readonly niatransition_commitIdHex: (a: number) => [number, number];

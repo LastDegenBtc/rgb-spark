@@ -1,6 +1,93 @@
 /* @ts-self-types="./rgb_spark_core.d.ts" */
 
 /**
+ * JS handle around the human-readable + supply metadata extracted from a
+ * validated NIA genesis. Lets the buyer-side inbox auto-populate the
+ * `StashContract` shape without trusting the seller's envelope claims —
+ * ticker, name, supply are all schema-validated bytes from the genesis.
+ */
+export class NiaGenesisMetadata {
+    static __wrap(ptr) {
+        const obj = Object.create(NiaGenesisMetadata.prototype);
+        obj.__wbg_ptr = ptr;
+        NiaGenesisMetadataFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        NiaGenesisMetadataFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_niagenesismetadata_free(ptr, 0);
+    }
+    /**
+     * @returns {string}
+     */
+    get contractId() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.niagenesismetadata_contractId(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {string}
+     */
+    get name() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.niagenesismetadata_name(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * Decimal string. JS side parses as BigInt or compares as string.
+     * @returns {string}
+     */
+    get supply() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.niagenesismetadata_supply(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {string}
+     */
+    get ticker() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.niagenesismetadata_ticker(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+}
+if (Symbol.dispose) NiaGenesisMetadata.prototype[Symbol.dispose] = NiaGenesisMetadata.prototype.free;
+
+/**
  * JS handle around the result of a NIA issuance — carries both the
  * deterministic contractId (the value we bind a Spark leaf to as `msg`)
  * AND the strict-encoded genesis consignment bytes (what a receiver
@@ -446,6 +533,28 @@ export function issueNiaContract(ticker, name, supply, beneficiary_txid_hex, ben
 }
 
 /**
+ * Decode a NIA genesis consignment and extract the metadata fields a
+ * receiver needs to register the contract in their rgbStash without
+ * trusting the sender. Re-validates the consignment internally, so any
+ * caller can pass arbitrary bytes from the wire without a prior check.
+ *
+ * Returns `{contractId, ticker, name, supply}`. The `supply` value comes
+ * back as a decimal string (u64 outside JS Number's safe-integer range
+ * would silently truncate otherwise).
+ * @param {string} consignment_hex
+ * @returns {NiaGenesisMetadata}
+ */
+export function niaGenesisMetadata(consignment_hex) {
+    const ptr0 = passStringToWasm0(consignment_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.niaGenesisMetadata(ptr0, len0);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return NiaGenesisMetadata.__wrap(ret[0]);
+}
+
+/**
  * Decode + validate a strict-encoded NIA genesis consignment (hex).
  * Returns the contractId (32-byte hex) extracted from the validated
  * consignment, so the receiver can compare it against the `msgHex`
@@ -593,6 +702,9 @@ function __wbg_get_imports() {
     };
 }
 
+const NiaGenesisMetadataFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_niagenesismetadata_free(ptr, 1));
 const NiaIssuanceFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_niaissuance_free(ptr, 1));

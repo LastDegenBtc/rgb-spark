@@ -29,7 +29,6 @@
 
 import { ensureSparkCoreReady } from './sparkCore';
 import { getPathTweak } from './rgbAwareSigner';
-import { getContractById } from './rgbStash';
 import { listSparkLeaves } from './sparkWallet';
 import { postConsignment } from './consignmentRelay';
 import { signEnvelope, type UnsignedEnvelopeV4 } from './envelopeSign';
@@ -115,22 +114,24 @@ export async function captureSettlementSnapshot(
 
   const core = await ensureSparkCoreReady();
   const genesisHex = entry.transitionHex ? entry.prevGenesisHex! : entry.consignmentHex!;
+  // niaGenesisMetadata re-validates the consignment AND returns ticker/name/
+  // supply/contractId in one shot. Trustless: extracted from the schema-
+  // validated bytes themselves, not from a local stash that may be empty
+  // or stale (e.g. on a wallet that pre-dates rgbStash persistence).
   let contractId: string;
+  let supply: bigint;
   try {
-    contractId = core.validateNiaConsignment(genesisHex);
+    const meta = core.niaGenesisMetadata(genesisHex);
+    try {
+      contractId = meta.contractId;
+      supply = BigInt(meta.supply);
+    } finally {
+      meta.free();
+    }
   } catch (e) {
     return {
       ok: false,
-      reason: `validateNiaConsignment failed on pathTweak genesis: ${e instanceof Error ? e.message : String(e)}`,
-    };
-  }
-  const contract = getContractById(contractId);
-  if (!contract) {
-    return {
-      ok: false,
-      reason:
-        `no stash contract for ${contractId.slice(0, 12)}… — the genesis exists in pathTweaks ` +
-        'but rgbStash has no matching entry. Issue the contract via the Developer lab to seed it.',
+      reason: `niaGenesisMetadata failed on pathTweak genesis: ${e instanceof Error ? e.message : String(e)}`,
     };
   }
 
@@ -147,7 +148,7 @@ export async function captureSettlementSnapshot(
       msgHex: bytesToHex(entry.msg),
       genesisHex,
       prevTransitionHex: entry.transitionHex,
-      amount: BigInt(contract.supply),
+      amount: supply,
       contractId,
       payloadKind: entry.transitionHex ? 'transition' : 'genesis',
     },
