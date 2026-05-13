@@ -731,6 +731,221 @@ pub fn build_nia_transition_from_prev(
     })
 }
 
+/// Multi-output sibling of `buildNiaTransition`. Builds a NIA
+/// `transfer` transition consuming the `no`-th genesis assetOwner
+/// assignment and allocating to N beneficiary seals with arbitrary
+/// per-output amounts. The schema validator enforces `sum(out) ==
+/// sum(in)` via AluVM; we also pre-check it here to fail fast on
+/// caller mistakes.
+///
+/// Parallel arrays `amounts_dec` / `beneficiary_txids_hex` /
+/// `beneficiary_vouts` MUST have equal length (== number of outputs).
+/// `amounts_dec` values are decimal-encoded u64 strings (dodge JS
+/// Number precision for amounts > 2^53).
+///
+/// This is the load-bearing primitive for split-merge support in
+/// RGB-SPK (Phase 1C/clean session 7.1): fractional ownership requires
+/// that one transition assigns N units to a buyer and M units back to
+/// the seller as change. `buildNiaTransition` (the 1-output API) stays
+/// in place for backward compatibility while the wallet migrates.
+#[wasm_bindgen(js_name = buildNiaTransitionMultiOutput)]
+pub fn build_nia_transition_multi_output(
+    genesis_hex: &str,
+    consume_index: u16,
+    amounts_dec: Vec<String>,
+    beneficiary_txids_hex: Vec<String>,
+    beneficiary_vouts: Vec<u32>,
+) -> Result<NiaTransition, JsError> {
+    let n = amounts_dec.len();
+    if n == 0 {
+        return Err(JsError::new("at least one output is required"));
+    }
+    if beneficiary_txids_hex.len() != n || beneficiary_vouts.len() != n {
+        return Err(JsError::new(&format!(
+            "parallel arrays must have equal length: amounts={n}, txids={}, vouts={}",
+            beneficiary_txids_hex.len(),
+            beneficiary_vouts.len()
+        )));
+    }
+
+    let amounts: Vec<u64> = amounts_dec
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            s.parse::<u64>()
+                .map_err(|e| JsError::new(&format!("amounts_dec[{i}] parse: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let bytes = hex::decode(genesis_hex).map_err(map_err("genesis hex decode"))?;
+    let confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(bytes)
+        .map_err(map_err("size limit"))?;
+    let genesis_consignment =
+        Consignment::<false>::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(confined)
+            .map_err(map_err("strict decode genesis"))?;
+
+    let prev_value = genesis_asset_at(&genesis_consignment, consume_index)?;
+    let prev_amount: Amount = prev_value.into();
+    // u64 sum can overflow if N outputs total > u64::MAX, but since each
+    // amount fits in u64 and we cap at `prev_amount` (itself u64), a
+    // checked_sum is sufficient.
+    let sum_amounts: u64 = amounts
+        .iter()
+        .try_fold(0u64, |acc, &a| acc.checked_add(a))
+        .ok_or_else(|| JsError::new("sum of output amounts overflows u64"))?;
+    if Amount::from(sum_amounts) != prev_amount {
+        return Err(JsError::new(&format!(
+            "sum of outputs {sum_amounts} != prev allocation {prev_amount}; conservation violated"
+        )));
+    }
+
+    let contract_id = genesis_consignment.contract_id();
+    let genesis_opid = genesis_consignment.genesis().id();
+
+    let mut builder = TransitionBuilder::named_transition(
+        contract_id,
+        NonInflatableAsset::schema(),
+        "transfer",
+        NonInflatableAsset::types(),
+    )
+    .map_err(map_err("TransitionBuilder::named_transition"))?;
+
+    let opout = Opout::new(genesis_opid, OS_ASSET, consume_index);
+    builder = builder
+        .add_input(opout, AllocatedState::Amount(prev_value))
+        .map_err(map_err("add_input"))?;
+
+    for i in 0..n {
+        let txid = Txid::from_str(&beneficiary_txids_hex[i])
+            .map_err(|e| JsError::new(&format!("beneficiary_txids_hex[{i}] parse: {e}")))?;
+        let beneficiary = GraphSeal::new_random(txid, beneficiary_vouts[i]);
+        builder = builder
+            .add_fungible_state("assetOwner", beneficiary, Amount::from(amounts[i]))
+            .map_err(map_err("add_fungible_state"))?;
+    }
+
+    let transition = builder
+        .complete_transition()
+        .map_err(map_err("complete_transition"))?;
+    let opid = transition.id();
+    let bytes = transition
+        .to_strict_serialized::<CONSIGNMENT_MAX_LEN>()
+        .map_err(map_err("strict encode transition"))?;
+
+    Ok(NiaTransition {
+        transition_hex: hex::encode(bytes.release()),
+        commit_id_hex: hex::encode(opid.to_byte_array()),
+    })
+}
+
+/// Multi-output sibling of `buildNiaTransitionFromPrev`. Same shape
+/// as `buildNiaTransitionMultiOutput` but consumes a prior transition's
+/// output instead of the genesis. Used in the orderbook settlement path
+/// when the seller's pre-swap leaf carries more units than the order
+/// amount — one output goes to the buyer, one back to the seller as
+/// change.
+#[wasm_bindgen(js_name = buildNiaTransitionMultiOutputFromPrev)]
+pub fn build_nia_transition_multi_output_from_prev(
+    prev_transition_hex: &str,
+    prev_genesis_hex: &str,
+    consume_index: u16,
+    amounts_dec: Vec<String>,
+    beneficiary_txids_hex: Vec<String>,
+    beneficiary_vouts: Vec<u32>,
+) -> Result<NiaTransition, JsError> {
+    let n = amounts_dec.len();
+    if n == 0 {
+        return Err(JsError::new("at least one output is required"));
+    }
+    if beneficiary_txids_hex.len() != n || beneficiary_vouts.len() != n {
+        return Err(JsError::new(&format!(
+            "parallel arrays must have equal length: amounts={n}, txids={}, vouts={}",
+            beneficiary_txids_hex.len(),
+            beneficiary_vouts.len()
+        )));
+    }
+
+    let amounts: Vec<u64> = amounts_dec
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            s.parse::<u64>()
+                .map_err(|e| JsError::new(&format!("amounts_dec[{i}] parse: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let tr_bytes =
+        hex::decode(prev_transition_hex).map_err(map_err("prev_transition hex decode"))?;
+    let tr_confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(tr_bytes)
+        .map_err(map_err("prev_transition size limit"))?;
+    let prev_transition = Transition::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(tr_confined)
+        .map_err(map_err("strict decode prev_transition"))?;
+
+    let g_bytes = hex::decode(prev_genesis_hex).map_err(map_err("prev_genesis hex decode"))?;
+    let g_confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(g_bytes)
+        .map_err(map_err("prev_genesis size limit"))?;
+    let genesis_consignment =
+        Consignment::<false>::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(g_confined)
+            .map_err(map_err("strict decode prev_genesis"))?;
+
+    let contract_id = genesis_consignment.contract_id();
+    if prev_transition.contract_id != contract_id {
+        return Err(JsError::new(&format!(
+            "prev_transition.contract_id {} != prev_genesis.contract_id {}",
+            prev_transition.contract_id, contract_id
+        )));
+    }
+
+    let prev_value = transition_asset_at(&prev_transition, consume_index)?;
+    let prev_amount: Amount = prev_value.into();
+    let sum_amounts: u64 = amounts
+        .iter()
+        .try_fold(0u64, |acc, &a| acc.checked_add(a))
+        .ok_or_else(|| JsError::new("sum of output amounts overflows u64"))?;
+    if Amount::from(sum_amounts) != prev_amount {
+        return Err(JsError::new(&format!(
+            "sum of outputs {sum_amounts} != prev allocation {prev_amount}; conservation violated"
+        )));
+    }
+
+    let prev_opid = prev_transition.id();
+
+    let mut builder = TransitionBuilder::named_transition(
+        contract_id,
+        NonInflatableAsset::schema(),
+        "transfer",
+        NonInflatableAsset::types(),
+    )
+    .map_err(map_err("TransitionBuilder::named_transition"))?;
+
+    let opout = Opout::new(prev_opid, OS_ASSET, consume_index);
+    builder = builder
+        .add_input(opout, AllocatedState::Amount(prev_value))
+        .map_err(map_err("add_input"))?;
+
+    for i in 0..n {
+        let txid = Txid::from_str(&beneficiary_txids_hex[i])
+            .map_err(|e| JsError::new(&format!("beneficiary_txids_hex[{i}] parse: {e}")))?;
+        let beneficiary = GraphSeal::new_random(txid, beneficiary_vouts[i]);
+        builder = builder
+            .add_fungible_state("assetOwner", beneficiary, Amount::from(amounts[i]))
+            .map_err(map_err("add_fungible_state"))?;
+    }
+
+    let transition = builder
+        .complete_transition()
+        .map_err(map_err("complete_transition"))?;
+    let opid = transition.id();
+    let bytes = transition
+        .to_strict_serialized::<CONSIGNMENT_MAX_LEN>()
+        .map_err(map_err("strict encode transition"))?;
+
+    Ok(NiaTransition {
+        transition_hex: hex::encode(bytes.release()),
+        commit_id_hex: hex::encode(opid.to_byte_array()),
+    })
+}
+
 /// Validate a NIA transition chain of length 3: genesis → prev_transition
 /// → transition. Re-runs the rgb-consensus schema validator on every
 /// link (genesis schema check, prev_transition consumed-from-genesis
@@ -1027,6 +1242,117 @@ mod tests {
             next_msg, trn.commit_id_hex,
             "receiver-derived nextMsg must equal sender commitId"
         );
+    }
+
+    #[test]
+    fn build_multi_output_genesis_two_outputs() {
+        // Issue with supply 1000, build a 2-output transition splitting
+        // 700 to one beneficiary, 300 to another. Conservation: 700+300
+        // == 1000.
+        let issued =
+            issue_nia_contract("MO2", "Multi-output 2", 1000, FIXTURE_TXID, 0, 1_700_000_300)
+                .expect("issuance");
+
+        let txid_a = "0000000000000000000000000000000000000000000000000000000000000001";
+        let txid_b = "0000000000000000000000000000000000000000000000000000000000000002";
+
+        let trn = build_nia_transition_multi_output(
+            &issued.consignment_hex,
+            0,
+            vec!["700".to_string(), "300".to_string()],
+            vec![txid_a.to_string(), txid_b.to_string()],
+            vec![0, 1],
+        )
+        .expect("build 2-output transition");
+
+        assert_eq!(trn.commit_id_hex.len(), 64);
+        assert!(trn.commit_id_hex.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // The existing validator must accept multi-output transitions
+        // without modification — it cares about conservation and
+        // schema, not output count.
+        let validated = validate_nia_transition(&trn.transition_hex, &issued.consignment_hex)
+            .expect("validate 2-output transition");
+        assert_eq!(validated, trn.commit_id_hex);
+    }
+
+    #[test]
+    fn build_multi_output_genesis_three_outputs() {
+        // Same as the 2-output test but with 3 beneficiaries: 500 + 300 +
+        // 200 == 1000. Verifies that the implementation correctly
+        // iterates over N outputs, not just hardcoded 2.
+        let issued =
+            issue_nia_contract("MO3", "Multi-output 3", 1000, FIXTURE_TXID, 0, 1_700_000_301)
+                .expect("issuance");
+
+        let trn = build_nia_transition_multi_output(
+            &issued.consignment_hex,
+            0,
+            vec!["500".to_string(), "300".to_string(), "200".to_string()],
+            vec![
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+                "0000000000000000000000000000000000000000000000000000000000000002".to_string(),
+                "0000000000000000000000000000000000000000000000000000000000000003".to_string(),
+            ],
+            vec![0, 1, 2],
+        )
+        .expect("build 3-output transition");
+
+        let validated = validate_nia_transition(&trn.transition_hex, &issued.consignment_hex)
+            .expect("validate 3-output transition");
+        assert_eq!(validated, trn.commit_id_hex);
+    }
+
+    // Note: negative tests (conservation violation, length mismatch) live
+    // only in the wasm32 target — JsError construction in our error path
+    // can't be exercised on native (`cannot call wasm-bindgen imported
+    // functions on non-wasm targets`). The positive tests below are
+    // sufficient evidence that the happy-path multi-output transitions
+    // build and validate correctly; the error paths are simple guard
+    // clauses that don't warrant wasm-only test infra.
+
+    #[test]
+    fn build_multi_output_from_prev_two_outputs() {
+        // Chain: genesis → T_1 (single-output, all 1000 to seller) →
+        // T_2 (multi-output: 200 to buyer, 800 back to seller as change).
+        // This is the exact pattern the orderbook settlement path will
+        // produce for partial fills.
+        let issued =
+            issue_nia_contract("MOP", "Multi-output prev", 1000, FIXTURE_TXID, 0, 1_700_000_304)
+                .expect("issuance");
+
+        // T_1: full balance to seller.
+        let t1 = build_nia_transition(
+            &issued.consignment_hex,
+            0,
+            1000,
+            "0000000000000000000000000000000000000000000000000000000000000010",
+            1,
+        )
+        .expect("build T_1");
+
+        // T_2: 200 to buyer, 800 back to seller.
+        let t2 = build_nia_transition_multi_output_from_prev(
+            &t1.transition_hex,
+            &issued.consignment_hex,
+            0,
+            vec!["200".to_string(), "800".to_string()],
+            vec![
+                "0000000000000000000000000000000000000000000000000000000000000020".to_string(),
+                "0000000000000000000000000000000000000000000000000000000000000021".to_string(),
+            ],
+            vec![0, 1],
+        )
+        .expect("build T_2 multi-output on T_1");
+
+        // Validate T_2 against the chain (genesis, T_1).
+        let validated = validate_nia_transition_from_prev(
+            &t2.transition_hex,
+            &t1.transition_hex,
+            &issued.consignment_hex,
+        )
+        .expect("validate T_2 multi-output");
+        assert_eq!(validated, t2.commit_id_hex);
     }
 
     #[test]

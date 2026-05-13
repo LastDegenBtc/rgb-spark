@@ -393,6 +393,80 @@ export function buildNiaTransitionFromPrev(prev_transition_hex, prev_genesis_hex
 }
 
 /**
+ * Multi-output sibling of `buildNiaTransition`. Builds a NIA
+ * `transfer` transition consuming the `no`-th genesis assetOwner
+ * assignment and allocating to N beneficiary seals with arbitrary
+ * per-output amounts. The schema validator enforces `sum(out) ==
+ * sum(in)` via AluVM; we also pre-check it here to fail fast on
+ * caller mistakes.
+ *
+ * Parallel arrays `amounts_dec` / `beneficiary_txids_hex` /
+ * `beneficiary_vouts` MUST have equal length (== number of outputs).
+ * `amounts_dec` values are decimal-encoded u64 strings (dodge JS
+ * Number precision for amounts > 2^53).
+ *
+ * This is the load-bearing primitive for split-merge support in
+ * RGB-SPK (Phase 1C/clean session 7.1): fractional ownership requires
+ * that one transition assigns N units to a buyer and M units back to
+ * the seller as change. `buildNiaTransition` (the 1-output API) stays
+ * in place for backward compatibility while the wallet migrates.
+ * @param {string} genesis_hex
+ * @param {number} consume_index
+ * @param {string[]} amounts_dec
+ * @param {string[]} beneficiary_txids_hex
+ * @param {Uint32Array} beneficiary_vouts
+ * @returns {NiaTransition}
+ */
+export function buildNiaTransitionMultiOutput(genesis_hex, consume_index, amounts_dec, beneficiary_txids_hex, beneficiary_vouts) {
+    const ptr0 = passStringToWasm0(genesis_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArrayJsValueToWasm0(amounts_dec, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passArrayJsValueToWasm0(beneficiary_txids_hex, wasm.__wbindgen_malloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passArray32ToWasm0(beneficiary_vouts, wasm.__wbindgen_malloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.buildNiaTransitionMultiOutput(ptr0, len0, consume_index, ptr1, len1, ptr2, len2, ptr3, len3);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return NiaTransition.__wrap(ret[0]);
+}
+
+/**
+ * Multi-output sibling of `buildNiaTransitionFromPrev`. Same shape
+ * as `buildNiaTransitionMultiOutput` but consumes a prior transition's
+ * output instead of the genesis. Used in the orderbook settlement path
+ * when the seller's pre-swap leaf carries more units than the order
+ * amount — one output goes to the buyer, one back to the seller as
+ * change.
+ * @param {string} prev_transition_hex
+ * @param {string} prev_genesis_hex
+ * @param {number} consume_index
+ * @param {string[]} amounts_dec
+ * @param {string[]} beneficiary_txids_hex
+ * @param {Uint32Array} beneficiary_vouts
+ * @returns {NiaTransition}
+ */
+export function buildNiaTransitionMultiOutputFromPrev(prev_transition_hex, prev_genesis_hex, consume_index, amounts_dec, beneficiary_txids_hex, beneficiary_vouts) {
+    const ptr0 = passStringToWasm0(prev_transition_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(prev_genesis_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passArrayJsValueToWasm0(amounts_dec, wasm.__wbindgen_malloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passArrayJsValueToWasm0(beneficiary_txids_hex, wasm.__wbindgen_malloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passArray32ToWasm0(beneficiary_vouts, wasm.__wbindgen_malloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ret = wasm.buildNiaTransitionMultiOutputFromPrev(ptr0, len0, ptr1, len1, consume_index, ptr2, len2, ptr3, len3, ptr4, len4);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return NiaTransition.__wrap(ret[0]);
+}
+
+/**
  * Derive the L1 unilateral-exit BIP-341 noscript x-only output key.
  * Returns a 32-byte x-only pubkey (hex) — the same value that would
  * appear in the leaf's `verifyingKey`-tweaked p2tr output.
@@ -680,6 +754,14 @@ function __wbg_get_imports() {
             const ret = Error(getStringFromWasm0(arg0, arg1));
             return ret;
         },
+        __wbg___wbindgen_string_get_d109740c0d18f4d7: function(arg0, arg1) {
+            const obj = arg1;
+            const ret = typeof(obj) === 'string' ? obj : undefined;
+            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            var len1 = WASM_VECTOR_LEN;
+            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+        },
         __wbg___wbindgen_throw_9c31b086c2b26051: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         },
@@ -726,8 +808,24 @@ function getArrayU8FromWasm0(ptr, len) {
     return getUint8ArrayMemory0().subarray(ptr / 1, ptr / 1 + len);
 }
 
+let cachedDataViewMemory0 = null;
+function getDataViewMemory0() {
+    if (cachedDataViewMemory0 === null || cachedDataViewMemory0.buffer.detached === true || (cachedDataViewMemory0.buffer.detached === undefined && cachedDataViewMemory0.buffer !== wasm.memory.buffer)) {
+        cachedDataViewMemory0 = new DataView(wasm.memory.buffer);
+    }
+    return cachedDataViewMemory0;
+}
+
 function getStringFromWasm0(ptr, len) {
     return decodeText(ptr >>> 0, len);
+}
+
+let cachedUint32ArrayMemory0 = null;
+function getUint32ArrayMemory0() {
+    if (cachedUint32ArrayMemory0 === null || cachedUint32ArrayMemory0.byteLength === 0) {
+        cachedUint32ArrayMemory0 = new Uint32Array(wasm.memory.buffer);
+    }
+    return cachedUint32ArrayMemory0;
 }
 
 let cachedUint8ArrayMemory0 = null;
@@ -745,6 +843,27 @@ function handleError(f, args) {
         const idx = addToExternrefTable0(e);
         wasm.__wbindgen_exn_store(idx);
     }
+}
+
+function isLikeNone(x) {
+    return x === undefined || x === null;
+}
+
+function passArray32ToWasm0(arg, malloc) {
+    const ptr = malloc(arg.length * 4, 4) >>> 0;
+    getUint32ArrayMemory0().set(arg, ptr / 4);
+    WASM_VECTOR_LEN = arg.length;
+    return ptr;
+}
+
+function passArrayJsValueToWasm0(array, malloc) {
+    const ptr = malloc(array.length * 4, 4) >>> 0;
+    for (let i = 0; i < array.length; i++) {
+        const add = addToExternrefTable0(array[i]);
+        getDataViewMemory0().setUint32(ptr + 4 * i, add, true);
+    }
+    WASM_VECTOR_LEN = array.length;
+    return ptr;
 }
 
 function passStringToWasm0(arg, malloc, realloc) {
@@ -824,6 +943,8 @@ function __wbg_finalize_init(instance, module) {
     wasmInstance = instance;
     wasm = instance.exports;
     wasmModule = module;
+    cachedDataViewMemory0 = null;
+    cachedUint32ArrayMemory0 = null;
     cachedUint8ArrayMemory0 = null;
     wasm.__wbindgen_start();
     return wasm;

@@ -120,6 +120,37 @@ export function buildNiaTransition(genesis_hex: string, consume_index: number, a
 export function buildNiaTransitionFromPrev(prev_transition_hex: string, prev_genesis_hex: string, consume_index: number, amount: bigint, beneficiary_txid_hex: string, beneficiary_vout: number): NiaTransition;
 
 /**
+ * Multi-output sibling of `buildNiaTransition`. Builds a NIA
+ * `transfer` transition consuming the `no`-th genesis assetOwner
+ * assignment and allocating to N beneficiary seals with arbitrary
+ * per-output amounts. The schema validator enforces `sum(out) ==
+ * sum(in)` via AluVM; we also pre-check it here to fail fast on
+ * caller mistakes.
+ *
+ * Parallel arrays `amounts_dec` / `beneficiary_txids_hex` /
+ * `beneficiary_vouts` MUST have equal length (== number of outputs).
+ * `amounts_dec` values are decimal-encoded u64 strings (dodge JS
+ * Number precision for amounts > 2^53).
+ *
+ * This is the load-bearing primitive for split-merge support in
+ * RGB-SPK (Phase 1C/clean session 7.1): fractional ownership requires
+ * that one transition assigns N units to a buyer and M units back to
+ * the seller as change. `buildNiaTransition` (the 1-output API) stays
+ * in place for backward compatibility while the wallet migrates.
+ */
+export function buildNiaTransitionMultiOutput(genesis_hex: string, consume_index: number, amounts_dec: string[], beneficiary_txids_hex: string[], beneficiary_vouts: Uint32Array): NiaTransition;
+
+/**
+ * Multi-output sibling of `buildNiaTransitionFromPrev`. Same shape
+ * as `buildNiaTransitionMultiOutput` but consumes a prior transition's
+ * output instead of the genesis. Used in the orderbook settlement path
+ * when the seller's pre-swap leaf carries more units than the order
+ * amount — one output goes to the buyer, one back to the seller as
+ * change.
+ */
+export function buildNiaTransitionMultiOutputFromPrev(prev_transition_hex: string, prev_genesis_hex: string, consume_index: number, amounts_dec: string[], beneficiary_txids_hex: string[], beneficiary_vouts: Uint32Array): NiaTransition;
+
+/**
  * Derive the L1 unilateral-exit BIP-341 noscript x-only output key.
  * Returns a 32-byte x-only pubkey (hex) — the same value that would
  * appear in the leaf's `verifyingKey`-tweaked p2tr output.
@@ -232,6 +263,8 @@ export interface InitOutput {
     readonly __wbg_sparkutkproofjs_free: (a: number, b: number) => void;
     readonly buildNiaTransition: (a: number, b: number, c: number, d: bigint, e: number, f: number, g: number) => [number, number, number];
     readonly buildNiaTransitionFromPrev: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number) => [number, number, number];
+    readonly buildNiaTransitionMultiOutput: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number, number];
+    readonly buildNiaTransitionMultiOutputFromPrev: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => [number, number, number];
     readonly deriveOutputXonly: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly deriveUTweaked: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly deriveVerifyingKey: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
@@ -257,11 +290,11 @@ export interface InitOutput {
     readonly rustsecp256k1_v0_10_0_context_destroy: (a: number) => void;
     readonly rustsecp256k1_v0_10_0_default_error_callback_fn: (a: number, b: number) => void;
     readonly rustsecp256k1_v0_10_0_default_illegal_callback_fn: (a: number, b: number) => void;
+    readonly __wbindgen_malloc: (a: number, b: number) => number;
+    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;
     readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
-    readonly __wbindgen_malloc: (a: number, b: number) => number;
-    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __externref_table_dealloc: (a: number) => void;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_start: () => void;
