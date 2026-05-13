@@ -150,6 +150,23 @@ function bytesToHex(u: Uint8Array): string {
   return out
 }
 
+/**
+ * Display-only formatter for the unit price of an order
+ * (Phase 1C/clean session 8.2 — orderbook UI for partial fills).
+ * Float math is OK here because the orderbook's actual matching uses
+ * BigInt cross-multiplication, so this is purely cosmetic. Big amounts
+ * lose precision in Number — acceptable for display, never for matching.
+ */
+function formatUnitPrice(priceSats: number, amountStr: string): string {
+  const amount = Number(amountStr)
+  if (!Number.isFinite(amount) || amount === 0) return '?'
+  const unit = priceSats / amount
+  if (unit >= 1000) return Math.round(unit) + ' sats/X'
+  if (unit >= 1) return unit.toFixed(2) + ' sats/X'
+  if (unit > 0) return unit.toFixed(4) + ' sats/X'
+  return '0 sats/X'
+}
+
 interface LeafReference {
   id: string
   treeId: string
@@ -596,10 +613,11 @@ function OrderBookPanel({
               <div style={{ color: '#888' }}>(no open orders for this asset)</div>
             ) : (
               <>
-                <div style={{ display: 'grid', gridTemplateColumns: '50px 80px 80px 110px 80px 1fr', gap: 4, color: '#888', fontWeight: 'bold', borderBottom: '1px solid #eee', paddingBottom: 4 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '50px 80px 80px 90px 110px 80px 1fr', gap: 4, color: '#888', fontWeight: 'bold', borderBottom: '1px solid #eee', paddingBottom: 4 }}>
                   <div>side</div>
                   <div>price</div>
                   <div>amount</div>
+                  <div>unit</div>
                   <div>poster</div>
                   <div>status</div>
                   <div>actions</div>
@@ -815,6 +833,9 @@ function PlaceOrderForms({
           {lastPlaced.status === 'matched' && (
             <div style={{ color: 'seagreen' }}>
               🟢 matched with {lastPlaced.counterpartyNpub?.slice(0, 16)}…
+              {lastPlaced.matchedAmount && (
+                <> · <code>{lastPlaced.matchedAmount}</code> units</>
+              )}
               {lastPlaced.paymentHash && (
                 <> · paymentHash {lastPlaced.paymentHash.slice(0, 16)}…</>
               )}
@@ -829,8 +850,8 @@ function PlaceOrderForms({
 function OrderRow({
   so,
   myNpub,
-  myNostrPrivkeyHex: _myNostrPrivkeyHex,
-  mySparkIdentityPubkey: _mySparkIdentityPubkey,
+  myNostrPrivkeyHex,
+  mySparkIdentityPubkey,
   onChanged,
 }: {
   so: StoredOrder
@@ -841,8 +862,34 @@ function OrderRow({
 }) {
   const [busy, setBusy] = useState(false)
   const [swapLog, setSwapLog] = useState<SwapState[]>([])
+  // Phase 1C/clean session 8.2: inline match form. When the user clicks
+  // "buy" on someone's ask (or "sell" on someone's bid), the row expands
+  // with an amount input and posts a proportional counter-order.
+  const [matchOpen, setMatchOpen] = useState(false)
+  const [matchAmount, setMatchAmount] = useState('')
+  const [matchBusy, setMatchBusy] = useState(false)
+  const [matchErr, setMatchErr] = useState<string | null>(null)
+  const [matchResult, setMatchResult] = useState<PlaceResult | null>(null)
+  const [matchRebindStatus, setMatchRebindStatus] = useState<string | null>(null)
+
   const isMine = so.order.posterNpub === myNpub
   const isMatched = so.status === 'matched'
+  const canMatch = !isMine && so.status === 'open'
+  const oppositeSide: 'ask' | 'bid' = so.order.side === 'ask' ? 'bid' : 'ask'
+
+  function toggleMatchForm() {
+    if (matchOpen) {
+      setMatchOpen(false)
+      return
+    }
+    setMatchOpen(true)
+    setMatchErr(null)
+    setMatchResult(null)
+    setMatchRebindStatus(null)
+    // Default to the order's full amount — covers the "I'll take the lot"
+    // case in one click. User can edit down for a partial fill.
+    if (matchAmount === '') setMatchAmount(so.order.amount)
+  }
 
   async function doCancel() {
     setBusy(true)
@@ -992,6 +1039,90 @@ function OrderRow({
     }
   }
 
+  /**
+   * Phase 1C/clean session 8.2: post a counter-order that takes some
+   * units off this row's order. Computes the proportional priceSats so
+   * the unit price matches exactly (cross-multiplication, no rounding).
+   * Generates a fresh paymentHash + persists the preimage if we end up
+   * posting as ask side. Runs lazyRebindIfNeeded on ask side so the
+   * counter-order is backed by a properly bound leaf.
+   */
+  async function postMatchCounter() {
+    setMatchBusy(true)
+    setMatchErr(null)
+    setMatchResult(null)
+    setMatchRebindStatus(null)
+    try {
+      if (!/^[0-9]+$/.test(matchAmount.trim())) {
+        throw new Error('amount must be a positive integer')
+      }
+      const want = BigInt(matchAmount.trim())
+      if (want <= 0n) throw new Error('amount must be > 0')
+      const orderAmt = BigInt(so.order.amount)
+      if (want > orderAmt) {
+        throw new Error(`amount ${want} exceeds order's offer of ${so.order.amount}`)
+      }
+      // Proportional priceSats: want * orderPrice / orderAmount, exact integer.
+      const product = BigInt(so.order.priceSats) * want
+      if (product % orderAmt !== 0n) {
+        throw new Error(
+          `amount ${want} doesn't divide evenly at this price level — try a different value`,
+        )
+      }
+      const priceSats = Number(product / orderAmt)
+      if (!Number.isSafeInteger(priceSats)) {
+        throw new Error('computed priceSats is too large for a safe integer')
+      }
+
+      // Ask side: ensure a leaf is bound to this asset (same as
+      // PlaceOrderForms.place). Buy-side bids don't need a binding.
+      if (oppositeSide === 'ask') {
+        setMatchRebindStatus('Preparing your sell order…')
+        const outcome = await lazyRebindIfNeeded(so.order.assetId)
+        if (outcome.status === 'rebound') {
+          setMatchRebindStatus('Ready · asset binding refreshed')
+        } else if (outcome.status === 'already-bound') {
+          setMatchRebindStatus(null)
+        } else {
+          throw new Error(`rebind ${outcome.status}: ${outcome.reason}`)
+        }
+      }
+
+      const orderId = uuidV7()
+      let paymentHash: string | undefined
+      let preimageHex: string | undefined
+      if (oppositeSide === 'ask') {
+        const pair = newPreimagePair()
+        paymentHash = htlcBytesToHex(pair.paymentHash)
+        preimageHex = htlcBytesToHex(pair.preimage)
+      }
+      const expiry = new Date(Date.now() + 60 * 60_000).toISOString()
+      const payload: OrderPayload = {
+        id: orderId,
+        side: oppositeSide,
+        posterNpub: myNpub,
+        posterSparkIdentityPubkey: mySparkIdentityPubkey,
+        assetId: so.order.assetId,
+        amount: want.toString(),
+        priceSats,
+        expiryTime: expiry,
+        createdAt: new Date().toISOString(),
+        ...(paymentHash ? { paymentHash } : {}),
+      }
+      const signed = signOrder(payload, myNostrPrivkeyHex)
+      // Save preimage BEFORE posting so a network glitch between
+      // post-success and secret-save doesn't strand the preimage.
+      if (preimageHex) addOrderSecret(orderId, preimageHex)
+      const result = await postOrder(signed)
+      setMatchResult(result)
+      onChanged()
+    } catch (e) {
+      setMatchErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setMatchBusy(false)
+    }
+  }
+
   const statusColor: Record<typeof so.status, string> = {
     open: '#444',
     matched: 'seagreen',
@@ -1004,7 +1135,7 @@ function OrderRow({
       <div
         style={{
           display: 'grid',
-          gridTemplateColumns: '50px 80px 80px 110px 80px 1fr',
+          gridTemplateColumns: '50px 80px 80px 90px 110px 80px 1fr',
           gap: 4,
           padding: '3px 0',
           borderBottom: '1px dashed #eee',
@@ -1015,6 +1146,7 @@ function OrderRow({
         <div>{so.order.side}</div>
         <div>{so.order.priceSats}</div>
         <div>{so.order.amount}</div>
+        <div style={{ color: '#666' }}>{formatUnitPrice(so.order.priceSats, so.order.amount)}</div>
         <div title={so.order.posterNpub}>
           {isMine ? <strong>me</strong> : so.order.posterNpub.slice(0, 10) + '…'}
         </div>
@@ -1030,8 +1162,98 @@ function OrderRow({
               {busy ? '…' : 'Run swap →'}
             </button>
           )}
+          {canMatch && (
+            <button onClick={toggleMatchForm} style={{ fontSize: 10 }}>
+              {matchOpen ? 'close' : oppositeSide === 'bid' ? 'buy' : 'sell'}
+            </button>
+          )}
         </div>
       </div>
+      {matchOpen && canMatch && (
+        <div
+          style={{
+            paddingLeft: 12,
+            paddingTop: 4,
+            paddingBottom: 6,
+            fontSize: 11,
+            background: '#fafafa',
+            borderBottom: '1px dashed #eee',
+          }}
+        >
+          <div style={{ marginBottom: 4, color: '#666' }}>
+            Take {so.order.side === 'ask' ? 'asset' : 'sats'} from this {so.order.side} ·{' '}
+            unit price <strong>{formatUnitPrice(so.order.priceSats, so.order.amount)}</strong>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+            <label style={{ color: '#888' }}>amount</label>
+            <input
+              value={matchAmount}
+              onChange={(e) => setMatchAmount(e.target.value)}
+              inputMode='numeric'
+              style={{ width: 90, fontSize: 11, padding: 3, fontFamily: 'monospace' }}
+              disabled={matchBusy}
+            />
+            <span style={{ color: '#888' }}>
+              of <code>{so.order.amount}</code>
+            </span>
+            {matchAmount.trim() !== '' && /^[0-9]+$/.test(matchAmount.trim()) && (() => {
+              try {
+                const want = BigInt(matchAmount.trim())
+                const orderAmt = BigInt(so.order.amount)
+                if (want <= 0n || want > orderAmt) return null
+                const product = BigInt(so.order.priceSats) * want
+                if (product % orderAmt !== 0n) {
+                  return (
+                    <span style={{ color: '#c80' }}>
+                      ⚠ doesn't divide evenly
+                    </span>
+                  )
+                }
+                const priceSats = Number(product / orderAmt)
+                return (
+                  <span style={{ color: '#666' }}>
+                    → priceSats <code>{priceSats}</code>
+                  </span>
+                )
+              } catch {
+                return null
+              }
+            })()}
+            <button onClick={() => void postMatchCounter()} disabled={matchBusy} style={{ fontSize: 10 }}>
+              {matchBusy ? '…' : `Place ${oppositeSide}`}
+            </button>
+          </div>
+          {matchRebindStatus && (
+            <div style={{ marginTop: 4, color: '#666', fontStyle: 'italic' }}>
+              {matchRebindStatus}
+            </div>
+          )}
+          {matchErr && (
+            <div style={{ marginTop: 4, color: 'crimson' }}>{matchErr}</div>
+          )}
+          {matchResult && (
+            <div
+              style={{
+                marginTop: 4,
+                padding: 4,
+                background: matchResult.status === 'matched' ? '#e8f5e9' : '#f0f4ff',
+                border: matchResult.status === 'matched' ? '1px solid #a5d6a7' : '1px solid #b3c5e3',
+                fontFamily: 'monospace',
+              }}
+            >
+              posted · status <strong>{matchResult.status}</strong>
+              {matchResult.status === 'matched' && (
+                <>
+                  {' '}· matched <code>{matchResult.matchedAmount}</code> units
+                  {matchResult.paymentHash && (
+                    <> · paymentHash <code>{matchResult.paymentHash.slice(0, 12)}…</code></>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      )}
       {swapLog.length > 0 && (
         <div style={{ paddingLeft: 12, fontSize: 10, color: '#444' }}>
           {swapLog.map((s, i) => (
