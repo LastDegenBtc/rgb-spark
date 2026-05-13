@@ -71,7 +71,6 @@ import {
   startInboxPoller,
   stopInboxPoller,
   subscribeInbox,
-  flushInboxNow,
   type InboxStatus,
 } from './lib/settlementInbox'
 import {
@@ -360,6 +359,7 @@ function App() {
 
       {state.kind === 'ready' && (
         <div style={{ marginTop: 16 }}>
+          <ToastHost />
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <h2 style={{ margin: 0 }}>booted · {state.wallet.network}</h2>
             <button onClick={() => void reset()}>
@@ -401,11 +401,16 @@ function App() {
 
           <RgbStashPanel />
 
-          <OrderBookPanel
-            myNpub={state.parsed.npub}
-            myNostrPrivkeyHex={state.parsed.nostrPrivkeyHex}
-            mySparkIdentityPubkey={state.wallet.identityPubkey}
-          />
+          <details style={{ marginTop: 16, borderTop: '1px solid #ddd', paddingTop: 8 }}>
+            <summary style={{ cursor: 'pointer', fontSize: 13, color: '#666' }}>
+              Order book
+            </summary>
+            <OrderBookPanel
+              myNpub={state.parsed.npub}
+              myNostrPrivkeyHex={state.parsed.nostrPrivkeyHex}
+              mySparkIdentityPubkey={state.wallet.identityPubkey}
+            />
+          </details>
 
           <details style={{ marginTop: 28, borderTop: '2px solid #ccc', paddingTop: 12 }}>
             <summary style={{ cursor: 'pointer', fontSize: 13, color: '#666', fontWeight: 'bold' }}>
@@ -682,10 +687,10 @@ function PlaceOrderForms({
       // a fresh T_n+1 over the latest known transition. Silent no-op when
       // a binding already exists.
       if (side === 'ask') {
-        setRebindStatus('checking asset binding…')
+        setRebindStatus('Preparing your sell order…')
         const outcome = await lazyRebindIfNeeded(assetId)
         if (outcome.status === 'rebound') {
-          setRebindStatus(`auto-rebound · new leaf ${outcome.newLeafId.slice(0, 12)}…`)
+          setRebindStatus('Ready · asset binding refreshed')
         } else if (outcome.status === 'already-bound') {
           setRebindStatus(null)
         } else {
@@ -1040,6 +1045,81 @@ function OrderRow({
   )
 }
 
+// ---- Toast host (UX-2) ------------------------------------------------------
+//
+// Lightweight notification banner: subscribes to the inbox status, fires
+// a transient toast whenever `acceptedCount` increments. Each toast auto-
+// dismisses after 4 s. Positioned fixed at top-center so it doesn't shift
+// the page layout. No close button — the auto-fade is the only dismiss.
+
+interface Toast {
+  id: number
+  message: string
+}
+
+function ToastHost() {
+  const [toasts, setToasts] = useState<Toast[]>([])
+  const prevAcceptedRef = useRef(0)
+  const nextIdRef = useRef(1)
+
+  useEffect(() => {
+    const unsub = subscribeInbox((s) => {
+      if (!s.attached) {
+        // Reset baseline when wallet disconnects so a reconnect with
+        // a non-zero acceptedCount doesn't pop a phantom toast.
+        prevAcceptedRef.current = 0
+        return
+      }
+      if (s.acceptedCount > prevAcceptedRef.current) {
+        const delta = s.acceptedCount - prevAcceptedRef.current
+        prevAcceptedRef.current = s.acceptedCount
+        const id = nextIdRef.current++
+        const message = delta === 1
+          ? '+1 asset received'
+          : `+${delta} assets received`
+        setToasts((prev) => [...prev, { id, message }])
+        setTimeout(() => {
+          setToasts((p) => p.filter((t) => t.id !== id))
+        }, 4_000)
+      }
+    })
+    return () => unsub()
+  }, [])
+
+  if (toasts.length === 0) return null
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        top: 16,
+        left: '50%',
+        transform: 'translateX(-50%)',
+        zIndex: 1000,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 6,
+        pointerEvents: 'none',
+      }}
+    >
+      {toasts.map((t) => (
+        <div
+          key={t.id}
+          style={{
+            padding: '8px 16px',
+            background: 'seagreen',
+            color: '#fff',
+            borderRadius: 4,
+            fontSize: 13,
+            boxShadow: '0 2px 8px rgba(0,0,0,0.18)',
+          }}
+        >
+          {t.message}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 // ---- RGB stash panel (product surface) -------------------------------------
 //
 // Lists the NIA contracts this wallet has issued plus the transitions built
@@ -1053,7 +1133,6 @@ function RgbStashPanel() {
   const [transitions, setTransitions] = useState<StashTransition[]>([])
   const [openContractId, setOpenContractId] = useState<string | null>(null)
   const [inbox, setInbox] = useState<InboxStatus | null>(null)
-  const [flushing, setFlushing] = useState(false)
 
   useEffect(() => {
     const unsubscribe = subscribeStash((snap) => {
@@ -1068,29 +1147,32 @@ function RgbStashPanel() {
     return () => { unsub() }
   }, [])
 
-  function inboxBadge() {
+  // Discrete inbox dot: shows only on errors or while a tick is in
+  // progress. Successful idle state is invisible — the user is notified
+  // of accepted assets via <ToastHost />, not via this badge.
+  function inboxDot() {
     if (!inbox || !inbox.attached) return null
-    const tickLabel = inbox.inProgress
-      ? '↻ checking inbox…'
-      : inbox.lastTickAt
-        ? `inbox · last check ${new Date(inbox.lastTickAt).toLocaleTimeString()}`
-        : 'inbox · ready'
-    const accepted = inbox.acceptedCount
-    const errored = inbox.lastError !== null
-    return (
-      <span
-        style={{
-          fontSize: 11,
-          marginLeft: 8,
-          color: errored ? 'crimson' : inbox.inProgress ? '#888' : '#2a6',
-        }}
-        title={inbox.lastError ?? (inbox.lastTick ? `${inbox.lastTick.fetched} envelope(s) seen on last tick` : '')}
-      >
-        {tickLabel}
-        {accepted > 0 && <> · {accepted} accepted</>}
-        {errored && <> · error</>}
-      </span>
-    )
+    if (inbox.lastError) {
+      return (
+        <span
+          style={{ fontSize: 11, marginLeft: 8, color: 'crimson' }}
+          title={inbox.lastError}
+        >
+          ⚠ inbox error
+        </span>
+      )
+    }
+    if (inbox.inProgress) {
+      return (
+        <span
+          style={{ fontSize: 11, marginLeft: 8, color: '#888' }}
+          title='Checking for incoming assets'
+        >
+          ↻
+        </span>
+      )
+    }
+    return null
   }
 
   return (
@@ -1100,20 +1182,7 @@ function RgbStashPanel() {
         {transitions.length > 0 && (
           <> · {transitions.length} transition{transitions.length === 1 ? '' : 's'}</>
         )}
-        {inboxBadge()}
-        {inbox?.attached && (
-          <button
-            onClick={() => {
-              setFlushing(true)
-              void flushInboxNow().finally(() => setFlushing(false))
-            }}
-            disabled={flushing || inbox.inProgress}
-            style={{ marginLeft: 6, fontSize: 10, padding: '0 6px' }}
-            title='Force an immediate inbox tick (bypasses the 8-s poll cadence).'
-          >
-            {flushing || inbox.inProgress ? '…' : 'check now'}
-          </button>
-        )}
+        {inboxDot()}
       </legend>
       {contracts.length === 0 ? (
         <div style={{ fontSize: 12, color: '#888', padding: '6px 0' }}>
