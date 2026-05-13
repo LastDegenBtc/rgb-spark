@@ -22,6 +22,7 @@
 import { ensureSparkCoreReady } from './sparkCore';
 import { listPathTweaks, type PathTweakEntry } from './rgbAwareSigner';
 import {
+  addTransition,
   getContractById,
   listTransitionsFor,
   type StashContract,
@@ -231,6 +232,21 @@ export async function lazyRebindIfNeeded(contractId: string): Promise<RebindOutc
       transitionHex: newTransitionHex,
       prevGenesisHex: genesisHex,
     });
+
+    // Persist T_n+1 in stash so subsequent scanBinding calls recognise
+    // the new pathTweak entry's msg (= T_n+1.id()) as belonging to this
+    // contract. Without this, the freshly-bound leaf shows up as
+    // "unbound" in any UI that walks stash transitions (notably the
+    // sprk.fun PortfolioView). addTransition is idempotent on commitId,
+    // so re-running the rebind path is safe.
+    addTransition({
+      commitId: newCommitIdHex.toLowerCase(),
+      prevContractId: scan.contract.contractId,
+      outputs: [{ amount: amount.toString() }],
+      transitionHex: newTransitionHex,
+      createdAt: new Date().toISOString(),
+    });
+
     return {
       status: 'rebound',
       newLeafId: result.leaf.id,
