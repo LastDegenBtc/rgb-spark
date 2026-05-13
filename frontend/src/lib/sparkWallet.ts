@@ -169,20 +169,27 @@ export async function ensureLeafOfExactSize(targetSats: number): Promise<SparkLe
   const beforeIds = new Set(beforeLeaves.map((l) => l.id))
   await transferToSpark(targetSats, sparkAddress)
 
-  // The transfer creates fresh leaf ids — find the one of exact size
-  // that wasn't in the wallet before.
-  const afterLeaves = await listSparkLeaves()
-  const newExact = afterLeaves.find((l) => l.value === targetSats && !beforeIds.has(l.id))
-  if (newExact) return newExact
-
-  // Fallback: any exact-sized leaf (= timing race where the same leaf
-  // appears in both snapshots).
-  const anyExact = afterLeaves.find((l) => l.value === targetSats)
-  if (anyExact) return anyExact
+  // Polling retry: transferToSpark may return before the receiver-side
+  // claim has fully materialized the new leaf in getLeaves(). Observed
+  // on Safari/iOS where the SDK's internal sync lags. Poll for up to
+  // ~10 s before giving up.
+  const POLL_INTERVAL_MS = 500
+  const POLL_MAX_TRIES = 20
+  for (let i = 0; i < POLL_MAX_TRIES; i++) {
+    const afterLeaves = await listSparkLeaves()
+    const newExact = afterLeaves.find((l) => l.value === targetSats && !beforeIds.has(l.id))
+    if (newExact) return newExact
+    // Fallback inside the loop: any exact-sized leaf (= the SDK may
+    // have shuffled ids in a way that confuses our before-snapshot).
+    const anyExact = afterLeaves.find((l) => l.value === targetSats)
+    if (anyExact) return anyExact
+    await new Promise<void>((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
+  }
 
   throw new Error(
-    `transferToSpark(${targetSats}) completed but no leaf of size ${targetSats} surfaced. ` +
-    `The Spark coordinator state may not have synced yet — retry after a few seconds.`,
+    `transferToSpark(${targetSats}) completed but no leaf of size ${targetSats} surfaced ` +
+    `after ${(POLL_INTERVAL_MS * POLL_MAX_TRIES) / 1000}s of polling. ` +
+    `The Spark coordinator state may need more time to sync — retry the action manually.`,
   )
 }
 
