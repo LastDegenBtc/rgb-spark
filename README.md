@@ -18,8 +18,15 @@ sees the embedded commitment.
 |---|---|
 | **0** — Scoping, prototype, deterministic vectors | ✅ done |
 | **1A** — Spark-UTK in `bp-dbc` + `rgb-consensus` | ✅ done |
-| **1B** — `rgb-spark-core` WASM wrapper + frontend pipeline | 🟡 in progress |
-| **1C** — Atomic swap (Spark-side, no channel) | gated |
+| **1B** — `rgb-spark-core` WASM wrapper + frontend pipeline | ✅ done |
+| **1C / chunk-γ** — Real NIA issuance + transitions over Spark | ✅ done |
+| **1C** — Atomic swap orderbook + HTLC settlement (Spark-side, no channel) | ✅ done |
+| **1C / clean** — Cross-wallet asset binding (settlement auto-emit + buyer auto-stash + lazy rebind) | ✅ done |
+
+The full RGB-on-Spark loop is mainnet-validated as of 2026-05-13:
+issue → bind → trade → atomic settlement → cross-wallet delivery →
+re-sell. See [`RGB-ON-SPARK.md`](./RGB-ON-SPARK.md) for what ships
+today, product positioning, and the L1 ⇄ Spark bridge design.
 
 ## Layout
 
