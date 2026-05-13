@@ -67,6 +67,13 @@ import {
   type AutoEmitOutcome,
   type SettlementSnapshot,
 } from './lib/settlementAutoEmit'
+import {
+  startInboxPoller,
+  stopInboxPoller,
+  subscribeInbox,
+  flushInboxNow,
+  type InboxStatus,
+} from './lib/settlementInbox'
 import { attachPathTweakStorage, detachPathTweakStorage } from './lib/pathTweakStorage'
 import {
   attachStash,
@@ -229,6 +236,11 @@ function App() {
       attachOrderSecrets(parsed.npub)
       setState({ kind: 'loading', stage: `initializing Spark wallet on ${net}` })
       const wallet = await initSparkWallet(parsed.sparkSeed, net, new RgbAwareSparkSigner())
+      // Settlement inbox poller — auto-stashes settlement-consignment-v1
+      // envelopes a counterparty has dropped on our relay queue. Starts
+      // AFTER initSparkWallet so the first tick has a chance to overlap
+      // the initial sync, and stops in reset() below.
+      startInboxPoller(parsed.npub)
       setState({ kind: 'ready', parsed, wallet, balanceSats: 'pending', cameFromVault, vaultJustSaved: false })
       try {
         const sats = await getBalance()
@@ -272,6 +284,7 @@ function App() {
     detachPathTweakStorage()
     detachStash()
     detachOrderSecrets()
+    stopInboxPoller()
     setSecret('')
     setState({ kind: 'idle' })
   }
@@ -1002,6 +1015,8 @@ function RgbStashPanel() {
   const [contracts, setContracts] = useState<StashContract[]>([])
   const [transitions, setTransitions] = useState<StashTransition[]>([])
   const [openContractId, setOpenContractId] = useState<string | null>(null)
+  const [inbox, setInbox] = useState<InboxStatus | null>(null)
+  const [flushing, setFlushing] = useState(false)
 
   useEffect(() => {
     const unsubscribe = subscribeStash((snap) => {
@@ -1011,12 +1026,56 @@ function RgbStashPanel() {
     return () => { unsubscribe() }
   }, [])
 
+  useEffect(() => {
+    const unsub = subscribeInbox((s) => { setInbox(s) })
+    return () => { unsub() }
+  }, [])
+
+  function inboxBadge() {
+    if (!inbox || !inbox.attached) return null
+    const tickLabel = inbox.inProgress
+      ? '↻ checking inbox…'
+      : inbox.lastTickAt
+        ? `inbox · last check ${new Date(inbox.lastTickAt).toLocaleTimeString()}`
+        : 'inbox · ready'
+    const accepted = inbox.acceptedCount
+    const errored = inbox.lastError !== null
+    return (
+      <span
+        style={{
+          fontSize: 11,
+          marginLeft: 8,
+          color: errored ? 'crimson' : inbox.inProgress ? '#888' : '#2a6',
+        }}
+        title={inbox.lastError ?? (inbox.lastTick ? `${inbox.lastTick.fetched} envelope(s) seen on last tick` : '')}
+      >
+        {tickLabel}
+        {accepted > 0 && <> · {accepted} accepted</>}
+        {errored && <> · error</>}
+      </span>
+    )
+  }
+
   return (
     <fieldset style={{ marginTop: 16, border: '1px solid #ddd', padding: '8px 12px' }}>
       <legend style={{ fontSize: 12, color: '#666' }}>
         RGB assets · {contracts.length} contract{contracts.length === 1 ? '' : 's'}
         {transitions.length > 0 && (
           <> · {transitions.length} transition{transitions.length === 1 ? '' : 's'}</>
+        )}
+        {inboxBadge()}
+        {inbox?.attached && (
+          <button
+            onClick={() => {
+              setFlushing(true)
+              void flushInboxNow().finally(() => setFlushing(false))
+            }}
+            disabled={flushing || inbox.inProgress}
+            style={{ marginLeft: 6, fontSize: 10, padding: '0 6px' }}
+            title='Force an immediate inbox tick (bypasses the 8-s poll cadence).'
+          >
+            {flushing || inbox.inProgress ? '…' : 'check now'}
+          </button>
         )}
       </legend>
       {contracts.length === 0 ? (
