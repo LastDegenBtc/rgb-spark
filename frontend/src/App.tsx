@@ -984,6 +984,27 @@ function OrderRow({
           ])
         }
 
+        // sprk.11d pre-flight: refuse the swap if the matched bid's
+        // amount exceeds the snapshot's bound asset amount — otherwise
+        // Spark settles, buyer locks, but auto-emit can't deliver. The
+        // buyer would end up stuck without their asset.
+        if (preSwapSnapshot) {
+          let bidAmount: bigint | null = null
+          try {
+            bidAmount = BigInt(counterpart.order.amount)
+          } catch {
+            bidAmount = null
+          }
+          if (bidAmount !== null && bidAmount > preSwapSnapshot.amount) {
+            throw new Error(
+              `matched bid wants ${bidAmount} units but you only hold ` +
+              `${preSwapSnapshot.amount} on this contract. Refusing the ` +
+              `swap. Cancel and re-post a smaller ask, or wait for a ` +
+              `smaller bid.`,
+            )
+          }
+        }
+
         const sellerExpiry = new Date(Date.now() + 60 * 60_000)
         const result = await runSellerFlow(wallet, {
           assetLeaves: [assetLeaf],
