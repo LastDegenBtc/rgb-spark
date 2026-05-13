@@ -84,7 +84,7 @@ nothing the user doesn't already have.
 This is the opposite end of the trust-spectrum from the **custodial
 PPwallet** at [`ppwallet`](https://github.com/LastDegenBtc/ppwallet)
 (`wallet.pprgb.app`), which keeps RGB allocations server-side for
-interop with the industry RGB ecosystem (Bitmask, rgb-lib). The two
+interop with the industry RGB ecosystem (rgb-lib). The two
 products are intentionally parallel and serve different users.
 
 ## Origin

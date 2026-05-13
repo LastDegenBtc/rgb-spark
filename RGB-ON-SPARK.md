@@ -210,9 +210,9 @@ What enables that UX:
 
 ### 2.2 Comparison with adjacent products
 
-| Product | Transport | Trust | Setup cost | Trade fee | Trade speed |
+| Stack | Transport | Trust | Setup cost | Trade fee | Trade speed |
 |---|---|---|---|---|---|
-| Bitmask (RGB on L1) | tapret on Bitcoin | Bitcoin consensus | none | L1 mining fee | 10 min |
+| rgb-lib (RGB on L1) | tapret on Bitcoin | Bitcoin consensus | none | L1 mining fee | 10 min |
 | rgb-lib + LN (Kaleidoswap) | RGB-on-LN with HTLC | Bitcoin + LN routing | Local node + channels | LN routing + RGB layer | seconds |
 | **rgb-spark** | Spark-UTK on Spark | Bitcoin + Spark operators | none (browser) | Spark coordinator (minimal) | seconds |
 | ppwallet (custodial sibling) | tapret on L1 server-side | Bitcoin + custodian | none | none (custodian eats it) | seconds (server-side) |
@@ -249,8 +249,8 @@ to L1.
 
 ### 3.1 Why bridging matters
 
-The dominant store of RGB value today is on L1 — Bitmask wallets,
-treasuries, OTC desks. Users who already hold L1 RGB are the most
+The dominant store of RGB value today is on L1 — rgb-lib-based
+wallets, treasuries, OTC desks. Users who already hold L1 RGB are the most
 addressable market for a P2P trading layer. If they can't bring
 their existing assets into the Spark experience, the product can't
 bootstrap.
