@@ -111,6 +111,81 @@ export class SparkTransferTimeoutError extends Error {
  * stream blocks without ever resolving or rejecting). Without this race the
  * UI sits on a forever-spinning "Paying…" with no escape.
  */
+/**
+ * Spark leaves have a dust threshold inherited from the L1 unilateral-
+ * exit refundTx — a leaf below this value can't be broadcast at refund
+ * time and so the SE refuses to create one. 1000 sats is a conservative
+ * heuristic: comfortable above the L1 P2WPKH/P2TR dust threshold
+ * (~330–546 sats depending on script type) plus headroom for the
+ * refundTx's input + fee floor. The actual Spark SE floor may differ;
+ * treat this as a UI-level guard and let the SDK / SE refuse tighter
+ * values if they arise.
+ */
+export const SPARK_DUST_THRESHOLD = 1000
+
+/**
+ * Ensure the wallet has a Spark leaf of exactly `targetSats` size,
+ * splitting via self-transfer when needed.
+ *
+ * Fast path: a leaf of the exact size already exists → return it.
+ * Slow path: `transferToSpark(targetSats, mySparkAddress)` — the SDK
+ *            does coin selection across the wallet's leaves, combines
+ *            as many small ones as needed to cover `targetSats + dust
+ *            change`, produces a fresh leaf of exactly `targetSats`,
+ *            and routes the remainder back to the wallet as change.
+ *
+ * Used by:
+ *   - runBuyerFlow before lockUnderHash, so the buyer locks EXACTLY
+ *     `priceSats` rather than overpaying with their smallest-leaf-≥-N.
+ *   - mintViaSelfTransfer's source-leaf selection (= dust-sized asset
+ *     leaves so the seller doesn't overpay from the other side).
+ *
+ * Errors propagate from the SDK transfer call:
+ *   - INSUFFICIENT_BALANCE: total sats < targetSats + dust headroom.
+ *   - DUST_VIOLATION: change would land below the SE's dust floor.
+ *
+ * Both surface as Error and should be caught + rendered by the caller.
+ */
+export async function ensureLeafOfExactSize(targetSats: number): Promise<SparkLeafRow> {
+  if (!walletInstance) throw new Error('Wallet not initialized')
+  if (!Number.isSafeInteger(targetSats) || targetSats <= 0) {
+    throw new Error(`targetSats must be a positive safe integer, got ${targetSats}`)
+  }
+  if (targetSats < SPARK_DUST_THRESHOLD) {
+    throw new Error(
+      `targetSats ${targetSats} below Spark dust threshold ${SPARK_DUST_THRESHOLD} — ` +
+      `the resulting leaf wouldn't be unilaterally-exitable on L1.`,
+    )
+  }
+
+  // Fast path: a leaf of exact size already exists.
+  const beforeLeaves = await listSparkLeaves()
+  const existingExact = beforeLeaves.find((l) => l.value === targetSats)
+  if (existingExact) return existingExact
+
+  // Slow path: ask Spark to split for us via a self-transfer. The SDK
+  // does coin selection so multiple small leaves can sum to targetSats.
+  const sparkAddress = await walletInstance.getSparkAddress()
+  const beforeIds = new Set(beforeLeaves.map((l) => l.id))
+  await transferToSpark(targetSats, sparkAddress)
+
+  // The transfer creates fresh leaf ids — find the one of exact size
+  // that wasn't in the wallet before.
+  const afterLeaves = await listSparkLeaves()
+  const newExact = afterLeaves.find((l) => l.value === targetSats && !beforeIds.has(l.id))
+  if (newExact) return newExact
+
+  // Fallback: any exact-sized leaf (= timing race where the same leaf
+  // appears in both snapshots).
+  const anyExact = afterLeaves.find((l) => l.value === targetSats)
+  if (anyExact) return anyExact
+
+  throw new Error(
+    `transferToSpark(${targetSats}) completed but no leaf of size ${targetSats} surfaced. ` +
+    `The Spark coordinator state may not have synced yet — retry after a few seconds.`,
+  )
+}
+
 export async function transferToSpark(
   amountSats: number,
   receiverSparkAddress: string,

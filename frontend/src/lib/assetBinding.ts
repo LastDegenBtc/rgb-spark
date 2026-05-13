@@ -28,7 +28,13 @@ import {
   type StashContract,
   type StashTransition,
 } from './rgbStash';
-import { listSparkLeaves, mintViaSelfTransfer, type SparkLeafRow } from './sparkWallet';
+import {
+  ensureLeafOfExactSize,
+  listSparkLeaves,
+  mintViaSelfTransfer,
+  SPARK_DUST_THRESHOLD,
+  type SparkLeafRow,
+} from './sparkWallet';
 
 function bytesToHex(u: Uint8Array): string {
   let s = '';
@@ -200,10 +206,11 @@ export async function lazyRebindIfNeeded(contractId: string): Promise<RebindOutc
       }
     }
 
-    // Source leaf for the self-transfer. We pick the smallest vanilla
-    // leaf so a) we don't tie up a larger leaf the user might need for
-    // bid-side sats, and b) `mintViaSelfTransfer` doesn't care about
-    // amount — only that a leaf exists to carry the transfer.
+    // Source leaf for the self-transfer. sprk.11: keep the source
+    // dust-sized so the resulting bound asset leaf doesn't carry
+    // excess sats — those sats would leak as overpay at HTLC swap
+    // time. ensureLeafOfExactSize splits via transferToSpark when
+    // needed; the SDK coin-selects across multiple small leaves.
     const leaves = await listSparkLeaves();
     if (leaves.length === 0) {
       return {
@@ -223,7 +230,21 @@ export async function lazyRebindIfNeeded(contractId: string): Promise<RebindOutc
         reason: 'every leaf in the wallet is already bound — nothing left to use as a vanilla carrier',
       };
     }
-    const sourceLeaf = [...vanillaLeaves].sort((a, b) => a.value - b.value)[0];
+    // Fast path: a dust-sized vanilla leaf already exists.
+    const dustVanilla = vanillaLeaves.find((l) => l.value === SPARK_DUST_THRESHOLD);
+    let sourceLeaf: SparkLeafRow;
+    if (dustVanilla) {
+      sourceLeaf = dustVanilla;
+    } else {
+      try {
+        sourceLeaf = await ensureLeafOfExactSize(SPARK_DUST_THRESHOLD);
+      } catch (e) {
+        return {
+          status: 'no-source-leaf',
+          reason: `couldn't prepare a dust-sized source leaf: ${e instanceof Error ? e.message : String(e)}`,
+        };
+      }
+    }
 
     const msgBytes = hexToBytes(newCommitIdHex);
     // v0 rebind uses single-output T_n+1, so consumeIndex is always 0.

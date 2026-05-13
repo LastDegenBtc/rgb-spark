@@ -20,6 +20,7 @@ import {
   transferToSpark,
   mintViaSelfTransfer,
   getSparkWallet,
+  ensureLeafOfExactSize,
   type WalletInitResult,
   type SparkLeafRow,
 } from './lib/sparkWallet'
@@ -1078,16 +1079,15 @@ function OrderRow({
             onState: (s) => setSwapLog((p) => [...p, s]),
           })
         } else {
-          const allLeaves = await (wallet as unknown as {
-            getLeaves: (b?: boolean) => Promise<Array<{ id: string; value: number }>>
-          }).getLeaves(true)
-          const sufficient = allLeaves
-            .filter((l) => l.value >= so.order.priceSats)
-            .sort((a, b) => a.value - b.value)[0]
-          if (!sufficient) {
-            throw new Error(`no single leaf >= ${so.order.priceSats} sats (v0: no aggregation)`)
-          }
-          const satsLeaves = [sufficient] as unknown as Parameters<typeof lockUnderHash>[1]['leaves']
+          // Phase 1C/clean session sprk.11: lock EXACTLY priceSats.
+          // ensureLeafOfExactSize splits via transferToSpark(priceSats,
+          // self) when no exact-size leaf exists. The SDK coin-selects
+          // across multiple small leaves so an aggregating case
+          // (= many leaves summing to priceSats) works transparently —
+          // fixes both the whole-leaf overpay AND the "no single leaf
+          // ≥ priceSats" rejection that used to block partial fills.
+          const exactLeaf = await ensureLeafOfExactSize(so.order.priceSats)
+          const satsLeaves = [exactLeaf] as unknown as Parameters<typeof lockUnderHash>[1]['leaves']
           await runBuyerFlow(wallet, {
             satsLeaves,
             counterpartyPubkey: counterpartyPubkeyBytes,
