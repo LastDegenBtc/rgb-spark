@@ -1078,17 +1078,16 @@ function OrderRow({
             onState: (s) => setSwapLog((p) => [...p, s]),
           })
         } else {
-          // sprk.11c: priceSats exact-size lock is a known open issue.
-          // The previous ensureLeafOfExactSize path relied on a SE swap
-          // that doesn't reliably trigger via self-transfer. Until we
-          // redesign (power-of-2 quantized pricing or multi-leaf HTLC),
-          // we pick the smallest vanilla leaf covering priceSats and
-          // warn about the overpay.
-          const allLeaves = await listSparkLeaves()
+          // sprk.11c: priceSats exact-size lock is a known open issue
+          // (sprk.12). Pick the smallest covering vanilla leaf and warn
+          // about overpay. CRITICAL: lockUnderHash takes the SDK's
+          // native TreeNode shape (Uint8Array fields), so pull from
+          // wallet.getLeaves(true) directly — listSparkLeaves returns
+          // a hex-stringed projection that crashes the FROST signer.
+          const sdkLeaves = await (wallet as { getLeaves: (b?: boolean) => Promise<{ id: string; value: number }[]> }).getLeaves(true)
           const boundLeafIds = new Set(listPathTweaks().map((t) => t.currentLeafId))
-          const vanilla = allLeaves.filter((l) => !boundLeafIds.has(l.id))
-          const candidates = vanilla
-            .filter((l) => l.value >= so.order.priceSats)
+          const candidates = (sdkLeaves as Array<{ id: string; value: number }>)
+            .filter((l) => !boundLeafIds.has(l.id) && l.value >= so.order.priceSats)
             .sort((a, b) => a.value - b.value)
           if (candidates.length === 0) {
             throw new Error(
