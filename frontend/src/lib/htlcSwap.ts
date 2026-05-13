@@ -323,9 +323,18 @@ export async function queryRevealedPreimage(
 export interface HtlcRecord {
   paymentHashHex: string;
   status: HtlcStatus;
+  /** Total sats locked under this HTLC by the sender, as reported by the
+   *  coordinator (sum of all leaves in the associated transfer). Used by
+   *  the seller side to verify the buyer locked at least the agreed
+   *  priceSats before revealing the preimage — without this check, a
+   *  malicious buyer can lock less than agreed and the seller would
+   *  still reveal, leading to underpay. Zero if the coordinator's
+   *  response had no transfer attached (e.g., querying a status the
+   *  swap left). */
+  lockedSats: number;
   /** Raw response from the coordinator — kept opaque (the SDK proto type
    *  isn't re-exported here). Useful for debugging; production logic
-   *  should rely on `status` + `paymentHashHex`. */
+   *  should rely on `status` + `paymentHashHex` + `lockedSats`. */
   raw: unknown;
 }
 
@@ -372,11 +381,21 @@ export async function queryPendingHtlcs(
     transferIds: [],
     matchRole,
   });
-  return resp.preimageRequests.map((r) => ({
-    paymentHashHex: r.paymentHash ? bytesToHex(r.paymentHash) : '',
-    status: decodeStatus(r.status),
-    raw: r,
-  }));
+  return resp.preimageRequests.map((r) => {
+    // The proto puts the actual lock amount on the nested Transfer's
+    // totalValue field. Sum is conceptual here — for a single-leaf or
+    // multi-leaf HTLC the SE returns one Transfer that already
+    // aggregates totalValue across all its leaves.
+    const transfer = (r as unknown as { transfer?: { totalValue?: number | bigint } }).transfer;
+    const rawTotal = transfer?.totalValue ?? 0;
+    const lockedSats = typeof rawTotal === 'bigint' ? Number(rawTotal) : Number(rawTotal);
+    return {
+      paymentHashHex: r.paymentHash ? bytesToHex(r.paymentHash) : '',
+      status: decodeStatus(r.status),
+      lockedSats,
+      raw: r,
+    };
+  });
 }
 
 // ----- Convenience: throwaway recipient pubkey -----------------------------
@@ -576,6 +595,59 @@ export async function runSellerFlow(
     state.updatedAt = nowIso();
     params.onState({ ...state });
     return { outcome: 'expired', state };
+  }
+
+  // sprk.12.1 security gate: before we reveal the preimage (which
+  // gives the buyer EVERYTHING they need to claim our asset), verify
+  // the buyer's lock totalValue >= expectedSatsFromBuyer. Without
+  // this a malicious buyer can lock e.g. 1 sat for a 1005-sat trade
+  // and we'd reveal anyway, leading to a 1004-sat underpay.
+  //
+  // The expectedSatsFromBuyer is what we COMMITTED to in our order
+  // (= our ask's priceSats, or the matching bid's priceSats). The
+  // coordinator reports the buyer's actual lock totalValue on the
+  // PreimageRequestWithTransfer.transfer.totalValue field, which we
+  // surface as HtlcRecord.lockedSats.
+  //
+  // We re-query the latest HtlcRecord here (instead of using the
+  // `incoming` snapshot from the polling loop) so the lockedSats is
+  // as fresh as possible — defensive against any race where the
+  // record was first seen before the buyer finished locking all
+  // their leaves.
+  {
+    const fresh = await queryPendingHtlcs(wallet, {
+      role: 'receiver',
+      paymentHashes: [paymentHash],
+      status: 'waiting',
+      limit: 5,
+    });
+    if (fresh.length === 0) {
+      state.phase = 'failed';
+      state.cause = 'buyer lock disappeared between detection and validation';
+      state.message = state.cause;
+      state.updatedAt = nowIso();
+      params.onState({ ...state });
+      return { outcome: 'failed', state };
+    }
+    const totalLocked = fresh.reduce((acc, r) => acc + r.lockedSats, 0);
+    if (totalLocked < params.expectedSatsFromBuyer) {
+      state.phase = 'failed';
+      state.cause =
+        `buyer locked ${totalLocked} sats but order required ${params.expectedSatsFromBuyer} — ` +
+        `refusing to reveal preimage. Our asset lock will refund automatically at expiry.`;
+      state.message = state.cause;
+      state.updatedAt = nowIso();
+      params.onState({ ...state });
+      return { outcome: 'failed', state };
+    }
+    // Log the over/exact-pay so it's visible in the swap log.
+    if (totalLocked > params.expectedSatsFromBuyer) {
+      state.message =
+        `buyer overpaid: locked ${totalLocked} sats for ${params.expectedSatsFromBuyer}-sat order. ` +
+        `Accepting and revealing preimage.`;
+      state.updatedAt = nowIso();
+      params.onState({ ...state });
+    }
   }
 
   // Phase 3: reveal preimage, claim counterparty's payment.
