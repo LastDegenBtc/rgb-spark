@@ -5,7 +5,7 @@
 // for the unified-seed rationale). Spark accepts a Uint8Array for
 // `mnemonicOrSeed` and runs its own HD derivation on top.
 
-import { SparkWallet, KeyDerivationType } from '@buildonspark/spark-sdk';
+import { SparkWallet, KeyDerivationType, SparkWalletEvent } from '@buildonspark/spark-sdk';
 import type { SparkSigner } from '@buildonspark/spark-sdk';
 import { setPathTweak, clearPathTweak, RgbAwareSparkSigner } from './rgbAwareSigner';
 
@@ -165,32 +165,91 @@ export async function ensureLeafOfExactSize(targetSats: number): Promise<SparkLe
 
   // Slow path: ask Spark to split for us via a self-transfer. The SDK
   // does coin selection so multiple small leaves can sum to targetSats.
+  //
+  // Race we have to tolerate: `transferToSpark` returns after the sender
+  // side completes, but receiver-side materialization happens inside the
+  // SDK's `claimTransfers` interval (every 5 s — see
+  // spark-wallet.ts:5972). Until that tick fires, `getLeaves()` returns
+  // pre-claim state, so a value-based scan finds nothing.
+  //
+  // Strategy: subscribe to `SparkWalletEvent.TransferClaimed` BEFORE the
+  // transfer so we don't miss an event that fires between the transfer
+  // resolving and us starting to wait. Match on the transferId we got
+  // back. If the event hasn't arrived after ~30 s, give up (something
+  // is genuinely wrong — claimTransfers should fire every 5 s).
   const sparkAddress = await walletInstance.getSparkAddress()
   const beforeIds = new Set(beforeLeaves.map((l) => l.id))
-  await transferToSpark(targetSats, sparkAddress)
 
-  // Polling retry: transferToSpark may return before the receiver-side
-  // claim has fully materialized the new leaf in getLeaves(). Observed
-  // on Safari/iOS where the SDK's internal sync lags. Poll for up to
-  // ~10 s before giving up.
-  const POLL_INTERVAL_MS = 500
-  const POLL_MAX_TRIES = 20
-  for (let i = 0; i < POLL_MAX_TRIES; i++) {
+  // Subscribe before the transfer to avoid a fire-before-listen race.
+  // We track every claimed transferId observed during the wait; once we
+  // know our own pendingTransferId we check the set + listen for further
+  // events. Doing it this way avoids the closure-ordering pitfall where
+  // the SDK could fire the claim event while transferToSpark() is still
+  // awaiting (the event would arrive before we've recorded the id).
+  const claimedIds = new Set<string>()
+  let claimResolve: (() => void) | null = null
+  let pendingTransferId = ''
+  const onClaim = (id: string) => {
+    claimedIds.add(id)
+    if (claimResolve && id === pendingTransferId) claimResolve()
+  }
+  walletInstance.on(SparkWalletEvent.TransferClaimed, onClaim)
+
+  try {
+    pendingTransferId = await transferToSpark(targetSats, sparkAddress)
+
+    // Wait for either the matching claim event (live OR previously
+    // captured into claimedIds during the transfer), a polled-success
+    // (defensive — event listener unwired or claimed before transferTo
+    // resolved), or a hard 30 s timeout. 30 s = 6× the SDK's 5 s
+    // claimTransfers interval — comfortably more than one tick's slack.
+    const TIMEOUT_MS = 30_000
+    const POLL_INTERVAL_MS = 500
+
+    if (claimedIds.has(pendingTransferId)) {
+      // Already claimed during the await.
+    } else {
+      const claimedPromise = new Promise<'claimed'>((resolve) => {
+        claimResolve = () => resolve('claimed')
+      })
+      const timeoutPromise = new Promise<'timeout'>((resolve) => {
+        setTimeout(() => resolve('timeout'), TIMEOUT_MS)
+      })
+      let pollResolve: (v: 'polled') => void = () => {}
+      const pollPromise = new Promise<'polled'>((resolve) => { pollResolve = resolve })
+      const pollTimer = setInterval(async () => {
+        try {
+          const leaves = await listSparkLeaves()
+          if (leaves.some((l) => l.value === targetSats && !beforeIds.has(l.id))) {
+            pollResolve('polled')
+          }
+        } catch { /* transient listLeaves error — keep polling */ }
+      }, POLL_INTERVAL_MS)
+
+      const outcome = await Promise.race([claimedPromise, pollPromise, timeoutPromise])
+      clearInterval(pollTimer)
+      if (outcome === 'timeout') {
+        throw new Error(
+          `transferToSpark(${targetSats}) sent (id=${pendingTransferId}) but no claim ` +
+          `event or matching leaf arrived after ${TIMEOUT_MS / 1000}s. The SDK's ` +
+          `claimTransfers tick may be stuck — retry the action, or reload the wallet.`,
+        )
+      }
+    }
+
+    // Re-fetch so we return a fresh row.
     const afterLeaves = await listSparkLeaves()
     const newExact = afterLeaves.find((l) => l.value === targetSats && !beforeIds.has(l.id))
     if (newExact) return newExact
-    // Fallback inside the loop: any exact-sized leaf (= the SDK may
-    // have shuffled ids in a way that confuses our before-snapshot).
     const anyExact = afterLeaves.find((l) => l.value === targetSats)
     if (anyExact) return anyExact
-    await new Promise<void>((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
+    throw new Error(
+      `transferToSpark(${targetSats}) claimed (id=${pendingTransferId}) but no leaf ` +
+      `of size ${targetSats} present in getLeaves() — coordinator state is inconsistent.`,
+    )
+  } finally {
+    walletInstance.off(SparkWalletEvent.TransferClaimed, onClaim)
   }
-
-  throw new Error(
-    `transferToSpark(${targetSats}) completed but no leaf of size ${targetSats} surfaced ` +
-    `after ${(POLL_INTERVAL_MS * POLL_MAX_TRIES) / 1000}s of polling. ` +
-    `The Spark coordinator state may need more time to sync — retry the action manually.`,
-  )
 }
 
 export async function transferToSpark(
