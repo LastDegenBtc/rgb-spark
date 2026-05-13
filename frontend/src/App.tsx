@@ -955,6 +955,35 @@ function OrderRow({
           ? allLeaves.find((l) => l.id === bound.id)
           : undefined
         const assetLeaf = (boundRaw ?? [...allLeaves].sort((a, b) => a.value - b.value)[0]) as unknown as Parameters<typeof lockUnderHash>[1]['leaves'][number]
+
+        // Phase 1C/clean session 8.3: capture the SettlementSnapshot
+        // BEFORE the HTLC consumes the source leaf. After runSellerFlow
+        // returns, the leaf is gone from listSparkLeaves() and
+        // captureSettlementSnapshot would fail. We grab everything we
+        // need (operator + verifyingKey + chain bytes) up front.
+        const assetLeafIdForSnapshot = (assetLeaf as { id: string }).id
+        let preSwapSnapshot: SettlementSnapshot | null = null
+        const snapResult = await captureSettlementSnapshot(assetLeafIdForSnapshot)
+        if (snapResult.ok) {
+          preSwapSnapshot = snapResult.snapshot
+        } else {
+          // Non-fatal — auto-emit will be skipped but the swap can still
+          // proceed. Surface in swapLog so the user knows the chain
+          // evidence won't be delivered automatically.
+          setSwapLog((p) => [
+            ...p,
+            {
+              phase: 'preparing',
+              paymentHashHex: '',
+              message:
+                `auto-emit unavailable: ${snapResult.reason} — ` +
+                'swap will run but no settlement consignment will be sent to the buyer.',
+              updatedAt: new Date().toISOString(),
+              ourExpiry: new Date(),
+            },
+          ])
+        }
+
         const sellerExpiry = new Date(Date.now() + 60 * 60_000)
         const result = await runSellerFlow(wallet, {
           assetLeaves: [assetLeaf],
@@ -968,6 +997,53 @@ function OrderRow({
         if (result.outcome === 'completed') {
           // Settlement done — preimage no longer needed; drop from local storage.
           removeOrderSecret(so.order.id)
+
+          // Phase 1C/clean session 8.3: settlement-coupled consignment
+          // auto-emit. The buyer's wallet sees this envelope on its inbox
+          // poller and auto-stashes the asset state. orderAmount comes
+          // from the COUNTERPARTY's order (= the bid amount = the actual
+          // transacted amount, since asks are consumed in full per session
+          // 8.1's partial-fill model).
+          if (preSwapSnapshot) {
+            let orderAmount: bigint
+            try {
+              orderAmount = BigInt(counterpart.order.amount)
+            } catch {
+              orderAmount = preSwapSnapshot.amount
+            }
+            const emitOutcome = await runAutoEmit({
+              snapshot: preSwapSnapshot,
+              myNpub,
+              myNostrPrivkeyHex,
+              mySparkIdentityPubkey,
+              buyerNpub: counterpart.order.posterNpub,
+              orderAmount,
+            })
+            const emitMessage =
+              emitOutcome.status === 'emitted'
+                ? `settlement consignment posted (envelope ${emitOutcome.envelopeId.slice(0, 8)}…` +
+                  (emitOutcome.outputCount > 1
+                    ? `, split ${orderAmount} → buyer / ${emitOutcome.changeAmount} → change`
+                    : '') +
+                  (emitOutcome.changeLeafId
+                    ? `, change leaf ${emitOutcome.changeLeafId.slice(0, 10)}…`
+                    : '') +
+                  (emitOutcome.postEmitWarning
+                    ? ` · ⚠ ${emitOutcome.postEmitWarning}`
+                    : '') +
+                  ')'
+                : `auto-emit failed: ${emitOutcome.reason}`
+            setSwapLog((p) => [
+              ...p,
+              {
+                phase: emitOutcome.status === 'emitted' ? 'completed' : 'failed',
+                paymentHashHex: '',
+                message: emitMessage,
+                updatedAt: new Date().toISOString(),
+                ourExpiry: new Date(),
+              },
+            ])
+          }
         }
       } else {
         // We're the buyer. Counterparty is the seller; their paymentHash
