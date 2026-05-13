@@ -1007,10 +1007,14 @@ function OrderRow({
         }
 
         const sellerExpiry = new Date(Date.now() + 60 * 60_000)
+        // sprk.12.1b: with partial fill the buyer locks only their bid's
+        // priceSats; the seller's validation must compare against THAT,
+        // not the seller's ask priceSats which would refuse every
+        // partial fill.
         const result = await runSellerFlow(wallet, {
           assetLeaves: [assetLeaf],
           counterpartyPubkey: counterpartyPubkeyBytes,
-          expectedSatsFromBuyer: so.order.priceSats,
+          expectedSatsFromBuyer: counterpart.order.priceSats,
           expiryTime: sellerExpiry,
           preimage,
           pollIntervalMs: 3_000,
