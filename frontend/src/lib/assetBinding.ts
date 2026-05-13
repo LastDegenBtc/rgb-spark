@@ -155,10 +155,25 @@ export async function lazyRebindIfNeeded(contractId: string): Promise<RebindOutc
     // anything yet — uncommon for the re-sale path, but valid) or has a
     // prior transition (the standard re-sale case).
     const genesisHex = scan.contract.consignmentHex;
-    const amount = BigInt(scan.contract.supply);
+    // For the genesis-only path, the full supply is the only valid
+    // input. For the transition path, the wallet's allocation lives at
+    // output 0 by convention (session 7.3: T_new[0] = recipient,
+    // T_new[1] = sender-as-change). Using contract.supply here was a
+    // bug — partial-fill buyers got T_new[0] < supply and the conserv-
+    // ation check in build_nia_transition_from_prev rejected the rebind
+    // with "amount != prev allocation".
+    let amount: bigint;
     let newCommitIdHex: string;
     let newTransitionHex: string;
     if (scan.latestTransition) {
+      const targetOutput = scan.latestTransition.outputs[0];
+      if (!targetOutput) {
+        return {
+          status: 'failed',
+          reason: `latest transition for ${contractId.slice(0, 12)}… has no outputs[0] entry`,
+        };
+      }
+      amount = BigInt(targetOutput.amount);
       const t = core.buildNiaTransitionFromPrev(
         scan.latestTransition.transitionHex,
         genesisHex,
@@ -174,6 +189,7 @@ export async function lazyRebindIfNeeded(contractId: string): Promise<RebindOutc
         t.free();
       }
     } else {
+      amount = BigInt(scan.contract.supply);
       const t = core.buildNiaTransition(genesisHex, 0, amount, dummyTxid, 0);
       try {
         newCommitIdHex = t.commitIdHex;
