@@ -385,6 +385,7 @@ function App() {
               <PathTweaksDebug />
               <HtlcProbe />
               <HtlcSelfSwap />
+              <SettlementAutoEmitProbe />
               <ConsignmentLab
                 myNpub={state.parsed.npub}
                 myIdentityPubkey={state.wallet.identityPubkey}
@@ -1556,6 +1557,228 @@ function HtlcSelfSwap() {
               outcome: <strong>{outcome}</strong>
             </div>
           )}
+        </div>
+      )}
+    </fieldset>
+  )
+}
+
+// ---- Settlement auto-emit probe (Phase 1C/clean session 5.1) ----------------
+//
+// Bridge-readiness probe for the upcoming "settlement-coupled consignment
+// auto-emit" path. Given a leafId the wallet still has a pathTweak entry
+// for + a buyer's npub, displays:
+//   - Whether the pathTweak entry carries the RGB payload we'd need to
+//     build T_2 over T_1 (transitionHex + prevGenesisHex) OR the genesis
+//     consignment for a depth-2 chain (consignmentHex).
+//   - The exact relay URL that would receive the auto-emitted envelope
+//     after `runSellerFlow` completes on a matched ask.
+// NO emission yet — this is read-only state inspection to confirm the
+// post-settlement lookup returns what session 5.2 needs to build T_2.
+//
+// Why a standalone panel instead of hooking into OrderRow's `runMySwap`:
+// the post-settlement window in a real swap is brief and depends on a live
+// matched order. A standalone probe lets us validate the lookup in isolation
+// against the persisted pathTweaks, including across reloads.
+
+function SettlementAutoEmitProbe() {
+  const [allTweaks, setAllTweaks] = useState(() => listPathTweaks())
+  const [selectedLeafId, setSelectedLeafId] = useState<string>('')
+  const [buyerNpub, setBuyerNpub] = useState<string>('')
+  const [npubError, setNpubError] = useState<string | null>(null)
+
+  useEffect(() => {
+    // Same polling cadence as PathTweaksDebug — pathTweaks is module-level
+    // state with no subscription exposed.
+    const t = setInterval(() => setAllTweaks(listPathTweaks()), 2_000)
+    return () => clearInterval(t)
+  }, [])
+
+  // Only entries with an RGB payload are emit-ready. A pathTweak with neither
+  // transitionHex nor consignmentHex means the leaf was bound to some msg the
+  // wallet doesn't know how to forward as a stash mutation.
+  const emitReady = allTweaks.filter(
+    (t) => t.transitionHex !== undefined || t.consignmentHex !== undefined,
+  )
+
+  function bytesToHex(b: Uint8Array): string {
+    let s = ''
+    for (let i = 0; i < b.length; i++) s += b[i].toString(16).padStart(2, '0')
+    return s
+  }
+
+  function validateNpub(s: string): { ok: true; npub: string } | { ok: false; err: string } {
+    try {
+      const decoded = nip19.decode(s.trim())
+      if (decoded.type !== 'npub') {
+        return { ok: false, err: `expected npub-prefixed key, got ${decoded.type}` }
+      }
+      return { ok: true, npub: s.trim() }
+    } catch (e) {
+      return { ok: false, err: e instanceof Error ? e.message : String(e) }
+    }
+  }
+
+  function onNpubChange(s: string) {
+    setBuyerNpub(s)
+    if (s.trim() === '') {
+      setNpubError(null)
+      return
+    }
+    const v = validateNpub(s)
+    setNpubError(v.ok ? null : v.err)
+  }
+
+  const selected = selectedLeafId
+    ? (getPathTweak(selectedLeafId) ?? null)
+    : null
+
+  // Compute the relay base URL the same way consignmentRelay.ts does, so what
+  // the probe displays matches what a future emitter would actually POST to.
+  const relayBase =
+    typeof window !== 'undefined' && window.location.hostname === 'localhost'
+      ? 'http://localhost:5180'
+      : '/relay'
+  const buyerNpubOk = buyerNpub.trim() !== '' && npubError === null
+  const wouldPostUrl = buyerNpubOk
+    ? `${relayBase}/consignment/${buyerNpub.trim()}`
+    : null
+
+  const payloadKind: 'transition' | 'genesis' | 'none' = selected
+    ? selected.transitionHex
+      ? 'transition'
+      : selected.consignmentHex
+        ? 'genesis'
+        : 'none'
+    : 'none'
+
+  return (
+    <fieldset style={{ marginTop: 10, border: '1px solid #ddd', padding: '8px 12px' }}>
+      <legend style={{ fontSize: 12, color: '#666' }}>
+        Settlement auto-emit probe · Phase 1C/clean session 5.1
+      </legend>
+      <div style={{ fontSize: 12, color: '#666', marginBottom: 8 }}>
+        Read-only check: given a leaf still bound by pathTweaks, confirm we
+        recover the RGB payload (transition/genesis bytes) we'd need to emit
+        T_2 over T_1 to the buyer at swap settlement. No POST, no
+        emission — just inspection of the post-settlement lookup.
+      </div>
+
+      <div style={{ fontSize: 11, color: '#555', marginBottom: 6 }}>
+        Bound leaves with emit-ready payload: <strong>{emitReady.length}</strong>{' '}
+        / {allTweaks.length} pathTweak entries.
+      </div>
+
+      <label style={{ display: 'block', fontSize: 12, marginTop: 6 }}>
+        leafId (pick a bound leaf to inspect)
+      </label>
+      <select
+        value={selectedLeafId}
+        onChange={(e) => setSelectedLeafId(e.target.value)}
+        style={{ width: '100%', fontFamily: 'monospace', fontSize: 11, padding: 4 }}
+      >
+        <option value=''>— select —</option>
+        {emitReady.map((t) => {
+          const payload = t.transitionHex ? 'transition' : 'genesis'
+          return (
+            <option key={t.currentLeafId} value={t.currentLeafId}>
+              {t.currentLeafId.slice(0, 12)}…{t.currentLeafId.slice(-6)} · {payload} · msg={bytesToHex(t.msg).slice(0, 12)}…
+            </option>
+          )
+        })}
+        {allTweaks.length > emitReady.length && (
+          <optgroup label='entries without RGB payload (not emit-ready)'>
+            {allTweaks
+              .filter((t) => !t.transitionHex && !t.consignmentHex)
+              .map((t) => (
+                <option key={t.currentLeafId} value={t.currentLeafId}>
+                  {t.currentLeafId.slice(0, 12)}…{t.currentLeafId.slice(-6)} · no payload
+                </option>
+              ))}
+          </optgroup>
+        )}
+      </select>
+
+      <label style={{ display: 'block', fontSize: 12, marginTop: 8 }}>
+        buyer npub (paste from a matched order's counterparty)
+      </label>
+      <input
+        value={buyerNpub}
+        onChange={(e) => onNpubChange(e.target.value)}
+        placeholder='npub1…'
+        style={{
+          width: '100%',
+          fontFamily: 'monospace',
+          fontSize: 11,
+          padding: 4,
+          boxSizing: 'border-box',
+          borderColor: npubError ? 'crimson' : undefined,
+        }}
+      />
+      {npubError && (
+        <div style={{ fontSize: 11, color: 'crimson', marginTop: 2 }}>{npubError}</div>
+      )}
+
+      {selected && (
+        <div
+          style={{
+            marginTop: 10,
+            padding: 8,
+            background:
+              payloadKind === 'none' ? '#fff8e1' : '#e8f5e9',
+            border:
+              payloadKind === 'none'
+                ? '1px solid #ffe082'
+                : '1px solid #a5d6a7',
+            fontSize: 11,
+            fontFamily: 'monospace',
+            wordBreak: 'break-all',
+          }}
+        >
+          <div style={{ marginBottom: 4, fontWeight: 'bold' }}>
+            {payloadKind === 'none'
+              ? '⚠ pathTweak found but no RGB payload — bridge NOT ready'
+              : '🟢 bridge ready · payload kind: ' + payloadKind}
+          </div>
+          <div>sourcePath: {selected.sourcePath.slice(0, 16)}…{selected.sourcePath.slice(-6)}</div>
+          <div>msg ({selected.msg.length}B): {bytesToHex(selected.msg)}</div>
+          <div>uBase ({selected.uBase.length}B): {bytesToHex(selected.uBase).slice(0, 32)}…{bytesToHex(selected.uBase).slice(-8)}</div>
+          {selected.transitionHex && (
+            <div>
+              transitionHex: {selected.transitionHex.length / 2} bytes (hex
+              len {selected.transitionHex.length})
+            </div>
+          )}
+          {selected.prevGenesisHex && (
+            <div>
+              prevGenesisHex: {selected.prevGenesisHex.length / 2} bytes (hex
+              len {selected.prevGenesisHex.length})
+            </div>
+          )}
+          {selected.consignmentHex && (
+            <div>
+              consignmentHex: {selected.consignmentHex.length / 2} bytes (hex
+              len {selected.consignmentHex.length})
+            </div>
+          )}
+        </div>
+      )}
+
+      {wouldPostUrl && selected && payloadKind !== 'none' && (
+        <div
+          style={{
+            marginTop: 8,
+            padding: 6,
+            background: '#f5f5f5',
+            border: '1px dashed #bbb',
+            fontSize: 11,
+            fontFamily: 'monospace',
+            color: '#444',
+            wordBreak: 'break-all',
+          }}
+        >
+          <div style={{ marginBottom: 2, color: '#666' }}>session 5.2 would POST here:</div>
+          {wouldPostUrl}
         </div>
       )}
     </fieldset>
