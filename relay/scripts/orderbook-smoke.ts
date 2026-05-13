@@ -400,6 +400,45 @@ async function main() {
     overbidResp.body,
   )
 
+
+  // ---- Registry phases (Phase 1C/clean session 9) ----
+  console.log('Phase 15: registry surfaces the asset we just touched.')
+  const statsResp = await fetch(`${RELAY}/asset/${assetId3}/stats`)
+  const stats: {
+    contractId: string
+    firstSeenAt: string
+    lastActivityAt: string
+    openOrdersCount: number
+    matchedOrdersCount: number
+    cancelledOrdersCount: number
+    expiredOrdersCount: number
+  } = await statsResp.json()
+  await expect('asset stats 200', statsResp.status === 200, stats)
+  await expect(
+    'matched > 0 (saw the partial-fill matches)',
+    stats.matchedOrdersCount > 0,
+    stats,
+  )
+  await expect(
+    'open count includes the still-open ask5 + mispriced bid + overbid',
+    stats.openOrdersCount >= 3,
+    stats,
+  )
+
+  console.log('Phase 16: /registry/assets lists assetId3 in active markets.')
+  const listResp = await fetch(`${RELAY}/registry/assets?limit=50`)
+  const assets: Array<{ contractId: string }> = await listResp.json()
+  await expect('registry list 200', listResp.status === 200, assets)
+  await expect(
+    'registry contains assetId3',
+    assets.some((a) => a.contractId === assetId3.toLowerCase()),
+    assets.map((a) => a.contractId),
+  )
+
+  console.log('Phase 17: unknown asset stats returns 404.')
+  const unknownResp = await fetch(`${RELAY}/asset/${'aa'.repeat(32)}/stats`)
+  await expect('unknown asset 404', unknownResp.status === 404)
+
   console.log('\nAll orderbook smoke tests passed.')
 }
 

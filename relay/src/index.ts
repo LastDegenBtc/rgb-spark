@@ -20,6 +20,12 @@ import {
   healthCounts as orderbookHealth,
   type SignedOrder,
 } from './orderbook.js'
+import {
+  listAssets,
+  getAssetStats,
+  registryHealth,
+  type RegistrySortKey,
+} from './registry.js'
 
 const PORT = Number(process.env.PORT ?? 5180)
 const HOST = process.env.HOST ?? '0.0.0.0'
@@ -101,7 +107,38 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       npubs: store.size,
       pending: [...store.values()].reduce((n, q) => n + q.length, 0),
       orderbook: orderbookHealth(),
+      registry: registryHealth(),
     })
+  }
+
+  // /registry/assets?limit=&offset=&sortBy=
+  if (method === 'GET' && url.startsWith('/registry/assets')) {
+    const qs = url.includes('?') ? url.slice(url.indexOf('?') + 1) : ''
+    const params = new URLSearchParams(qs)
+    const limit = params.get('limit') ? Number(params.get('limit')) : undefined
+    const offset = params.get('offset') ? Number(params.get('offset')) : undefined
+    const sortByRaw = params.get('sortBy')
+    let sortBy: RegistrySortKey | undefined
+    if (sortByRaw === 'lastActivityAt' || sortByRaw === 'firstSeenAt' || sortByRaw === 'matchedOrdersCount') {
+      sortBy = sortByRaw
+    }
+    if (limit !== undefined && (!Number.isInteger(limit) || limit < 0)) {
+      return send(res, 400, { error: 'limit must be a non-negative integer' })
+    }
+    if (offset !== undefined && (!Number.isInteger(offset) || offset < 0)) {
+      return send(res, 400, { error: 'offset must be a non-negative integer' })
+    }
+    const list = listAssets({ limit, offset, sortBy })
+    return send(res, 200, list)
+  }
+
+  // /asset/:contractId/stats
+  const statsMatch = url.match(/^\/asset\/([0-9a-fA-F]{64})\/stats\/?$/)
+  if (statsMatch && method === 'GET') {
+    const contractId = statsMatch[1]!
+    const entry = getAssetStats(contractId)
+    if (!entry) return send(res, 404, { error: 'asset not in registry' })
+    return send(res, 200, entry)
   }
 
   // /order/:assetId or /order/:assetId/:orderId

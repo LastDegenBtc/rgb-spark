@@ -16,6 +16,12 @@
 
 import { schnorr } from '@noble/curves/secp256k1.js'
 import { nip19 } from 'nostr-tools'
+import {
+  noteOrderCancelled,
+  noteOrderExpired,
+  noteOrderMatched,
+  noteOrderPlaced,
+} from './registry.js'
 
 // ----- Constants -------------------------------------------------------
 
@@ -248,6 +254,8 @@ function gcExpired(b: Map<string, StoredOrder>) {
     } else if (Date.parse(so.order.expiryTime) <= now) {
       so.status = 'expired'
       so.updatedAt = new Date().toISOString()
+      // Registry note: order moved from open → expired (session 9).
+      noteOrderExpired(so.order.assetId)
     }
   }
 }
@@ -345,6 +353,10 @@ export function placeOrder(assetId: string, signed: SignedOrder): PlaceResult {
     throw Object.assign(new Error('orderbook full for asset'), { http: 429 })
   }
 
+  // Session 9 registry: the incoming order enters the book briefly,
+  // regardless of whether it lands open or matches immediately.
+  noteOrderPlaced(signed.assetId)
+
   const match = findCompatibleMatch(b, signed)
   const now = new Date().toISOString()
   if (match) {
@@ -359,6 +371,9 @@ export function placeOrder(assetId: string, signed: SignedOrder): PlaceResult {
       updatedAt: now,
     }
     b.set(signed.id, stored)
+    // Both sides transition to matched.
+    noteOrderMatched(signed.assetId)
+    noteOrderMatched(match.order.assetId)
     // If incoming is a bid and match is an ask, propagate the ask's paymentHash
     // back to the bid so both sides agree on H.
     if (signed.side === 'bid' && !signed.paymentHash && match.order.paymentHash) {
@@ -419,6 +434,8 @@ export function cancelOrder(assetId: string, id: string, requesterNpub: string):
   if (so.status === 'cancelled' || so.status === 'expired') return
   so.status = 'cancelled'
   so.updatedAt = new Date().toISOString()
+  // Session 9 registry: open → cancelled.
+  noteOrderCancelled(so.order.assetId)
 }
 
 export function healthCounts(): { assets: number; openOrders: number; matchedOrders: number } {
