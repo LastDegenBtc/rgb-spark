@@ -206,6 +206,23 @@ export function issueNiaContract(ticker: string, name: string, supply: bigint, b
 export function niaGenesisMetadata(consignment_hex: string): NiaGenesisMetadata;
 
 /**
+ * Extract the per-output asset amounts from a strict-encoded NIA
+ * `Transition` (hex). Returns one decimal string per output,
+ * indexed by the output's position in `transition.assignments[OS_ASSET]`.
+ *
+ * Trustless replacement for "trust the sender's envelope claim about
+ * who got what": the receiver decodes the transition bytes themselves
+ * and reads the amounts the schema validator just signed off on.
+ *
+ * `transition_hex`: strict-encoded `Transition` (= what
+ * `buildNiaTransition*` produces).
+ *
+ * Decimal strings (not `u64` directly) for the same JS-Number-
+ * precision reason as `niaGenesisMetadata.supply`.
+ */
+export function niaTransitionOutputs(transition_hex: string): string[];
+
+/**
  * Decode + validate a strict-encoded NIA genesis consignment (hex).
  * Returns the contractId (32-byte hex) extracted from the validated
  * consignment, so the receiver can compare it against the `msgHex`
@@ -270,6 +287,7 @@ export interface InitOutput {
     readonly deriveVerifyingKey: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly issueNiaContract: (a: number, b: number, c: number, d: number, e: bigint, f: number, g: number, h: number, i: bigint) => [number, number, number];
     readonly niaGenesisMetadata: (a: number, b: number) => [number, number, number];
+    readonly niaTransitionOutputs: (a: number, b: number) => [number, number, number, number];
     readonly niagenesismetadata_contractId: (a: number) => [number, number];
     readonly niagenesismetadata_name: (a: number) => [number, number];
     readonly niagenesismetadata_supply: (a: number) => [number, number];
@@ -297,6 +315,7 @@ export interface InitOutput {
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __externref_table_dealloc: (a: number) => void;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
+    readonly __externref_drop_slice: (a: number, b: number) => void;
     readonly __wbindgen_start: () => void;
 }
 

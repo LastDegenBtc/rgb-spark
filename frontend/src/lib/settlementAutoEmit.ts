@@ -65,9 +65,15 @@ export interface SettlementSnapshot {
    *  between buildNiaTransition (no prev_transition) and
    *  buildNiaTransitionFromPrev (with prev_transition). */
   prevTransitionHex?: string;
-  /** The amount we'll allocate in T_new. Equals the prior allocation —
-   *  in v0 with no split/merge, that's the contract's full supply. */
+  /** The total amount the bound leaf represents (= pathTweak.amount).
+   *  When the order amount < this value, T_new is built as a multi-output
+   *  split (Phase 1C/clean session 7.3) — buyer's share + seller's change. */
   amount: bigint;
+  /** Output index within `msg`'s transition that this leaf maps to.
+   *  Passed as `consume_index` to buildNiaTransition* when building
+   *  T_new. Always 0 today; non-zero for change leaves minted from
+   *  multi-output transitions. */
+  consumeIndex: number;
   /** Recovered from the genesis consignment via validateNiaConsignment. */
   contractId: string;
   /** Convenience flag derived from prevTransitionHex presence. */
@@ -114,17 +120,14 @@ export async function captureSettlementSnapshot(
 
   const core = await ensureSparkCoreReady();
   const genesisHex = entry.transitionHex ? entry.prevGenesisHex! : entry.consignmentHex!;
-  // niaGenesisMetadata re-validates the consignment AND returns ticker/name/
-  // supply/contractId in one shot. Trustless: extracted from the schema-
-  // validated bytes themselves, not from a local stash that may be empty
-  // or stale (e.g. on a wallet that pre-dates rgbStash persistence).
+  // Re-validate the genesis client-side to recover the canonical
+  // contractId — trustless, even if the local stash was wiped or never
+  // had this contract.
   let contractId: string;
-  let supply: bigint;
   try {
     const meta = core.niaGenesisMetadata(genesisHex);
     try {
       contractId = meta.contractId;
-      supply = BigInt(meta.supply);
     } finally {
       meta.free();
     }
@@ -148,7 +151,11 @@ export async function captureSettlementSnapshot(
       msgHex: bytesToHex(entry.msg),
       genesisHex,
       prevTransitionHex: entry.transitionHex,
-      amount: supply,
+      // Phase 1C/clean session 7.3: the leaf's holding lives on the
+      // pathTweak entry now (was: contract.supply from rgbStash, which
+      // was correct only when the leaf carried the full supply).
+      amount: entry.amount,
+      consumeIndex: entry.consumeIndex,
       contractId,
       payloadKind: entry.transitionHex ? 'transition' : 'genesis',
     },
@@ -161,6 +168,13 @@ export interface AutoEmitContext {
   myNostrPrivkeyHex: string;
   mySparkIdentityPubkey: string;
   buyerNpub: string;
+  /** Phase 1C/clean session 7.3: amount of the asset being transferred
+   *  to the buyer. If equal to `snapshot.amount`, T_new has a single
+   *  output (full transfer — current behavior pre-7.3). If strictly
+   *  less, T_new is a 2-output split: outputs[0] is the buyer's share
+   *  (orderAmount), outputs[1] is the seller's change
+   *  (snapshot.amount − orderAmount). Must be > 0 and ≤ snapshot.amount. */
+  orderAmount: bigint;
 }
 
 export type AutoEmitOutcome =
@@ -171,6 +185,13 @@ export type AutoEmitOutcome =
       newCommitIdHex: string;
       newTransitionHex: string;
       payloadKind: 'transition' | 'genesis';
+      /** Number of outputs in T_new. 1 = full transfer, 2 = split. */
+      outputCount: number;
+      /** Output index the buyer's share is at (always 0 in v0). */
+      buyerOutputIndex: number;
+      /** Change amount that went back to the seller as T_new[outputCount-1].
+       *  Zero when full transfer. */
+      changeAmount: bigint;
     }
   | { status: 'failed'; reason: string };
 
@@ -178,46 +199,107 @@ export type AutoEmitOutcome =
  * Build T_new on top of the snapshot, compose & sign an envelope v4, POST
  * to the buyer's relay queue. Pure async — no throws on expected failure
  * paths, just `{status: 'failed'}` with a reason.
+ *
+ * Single-output vs multi-output dispatch is driven by `ctx.orderAmount`
+ * vs `ctx.snapshot.amount`. Equal → 1-output, less → 2-output split.
+ * Greater → rejected.
+ *
+ * The seller's change leaf is NOT minted here (deferred to session 7.3b).
+ * After a split emit, the caller is responsible for either (a) letting
+ * the seller manually rebind via `lazyRebindIfNeeded` later or (b)
+ * minting the change leaf directly. In the v0 probe flow neither is
+ * automatic — the probe surface in 7.3b will wire it.
  */
 export async function runAutoEmit(ctx: AutoEmitContext): Promise<AutoEmitOutcome> {
   try {
+    const sourceAmount = ctx.snapshot.amount;
+    const orderAmount = ctx.orderAmount;
+    if (orderAmount <= 0n) {
+      return { status: 'failed', reason: `orderAmount must be > 0, got ${orderAmount}` };
+    }
+    if (orderAmount > sourceAmount) {
+      return {
+        status: 'failed',
+        reason: `orderAmount (${orderAmount}) exceeds seller's holding (${sourceAmount})`,
+      };
+    }
+    const changeAmount = sourceAmount - orderAmount;
+    const isSplit = changeAmount > 0n;
+
     const core = await ensureSparkCoreReady();
-    // Placeholder beneficiary outpoint — never resolved on chain in the
+    // Placeholder beneficiary outpoints — never resolved on chain in the
     // Spark flow (see [[feedback_no_synthetic_l1_witness]]).
-    const dummyTxid = '00'.repeat(32);
+    const buyerTxid = '00'.repeat(32);
+    // Distinct dummy txid for the seller-change seal so the two outputs
+    // have distinct placeholder allocations (avoids any duplicate-seal
+    // ambiguity downstream).
+    const sellerTxid = '01' + '00'.repeat(31);
 
     let newCommitIdHex: string;
     let newTransitionHex: string;
     if (ctx.snapshot.prevTransitionHex) {
       // Depth-3 link: genesis → prev_transition → T_new.
-      const t = core.buildNiaTransitionFromPrev(
-        ctx.snapshot.prevTransitionHex,
-        ctx.snapshot.genesisHex,
-        0,
-        ctx.snapshot.amount,
-        dummyTxid,
-        0,
-      );
-      try {
-        newCommitIdHex = t.commitIdHex;
-        newTransitionHex = t.transitionHex;
-      } finally {
-        t.free();
+      if (isSplit) {
+        const t = core.buildNiaTransitionMultiOutputFromPrev(
+          ctx.snapshot.prevTransitionHex,
+          ctx.snapshot.genesisHex,
+          ctx.snapshot.consumeIndex,
+          [orderAmount.toString(), changeAmount.toString()],
+          [buyerTxid, sellerTxid],
+          new Uint32Array([0, 1]),
+        );
+        try {
+          newCommitIdHex = t.commitIdHex;
+          newTransitionHex = t.transitionHex;
+        } finally {
+          t.free();
+        }
+      } else {
+        const t = core.buildNiaTransitionFromPrev(
+          ctx.snapshot.prevTransitionHex,
+          ctx.snapshot.genesisHex,
+          ctx.snapshot.consumeIndex,
+          orderAmount,
+          buyerTxid,
+          0,
+        );
+        try {
+          newCommitIdHex = t.commitIdHex;
+          newTransitionHex = t.transitionHex;
+        } finally {
+          t.free();
+        }
       }
     } else {
       // Depth-2 link: genesis → T_new (no prev transition).
-      const t = core.buildNiaTransition(
-        ctx.snapshot.genesisHex,
-        0,
-        ctx.snapshot.amount,
-        dummyTxid,
-        0,
-      );
-      try {
-        newCommitIdHex = t.commitIdHex;
-        newTransitionHex = t.transitionHex;
-      } finally {
-        t.free();
+      if (isSplit) {
+        const t = core.buildNiaTransitionMultiOutput(
+          ctx.snapshot.genesisHex,
+          ctx.snapshot.consumeIndex,
+          [orderAmount.toString(), changeAmount.toString()],
+          [buyerTxid, sellerTxid],
+          new Uint32Array([0, 1]),
+        );
+        try {
+          newCommitIdHex = t.commitIdHex;
+          newTransitionHex = t.transitionHex;
+        } finally {
+          t.free();
+        }
+      } else {
+        const t = core.buildNiaTransition(
+          ctx.snapshot.genesisHex,
+          ctx.snapshot.consumeIndex,
+          orderAmount,
+          buyerTxid,
+          0,
+        );
+        try {
+          newCommitIdHex = t.commitIdHex;
+          newTransitionHex = t.transitionHex;
+        } finally {
+          t.free();
+        }
       }
     }
 
@@ -233,6 +315,7 @@ export async function runAutoEmit(ctx: AutoEmitContext): Promise<AutoEmitOutcome
       proof.free();
     }
 
+    const buyerOutputIndex = 0;
     const unsigned: UnsignedEnvelopeV4 = {
       v: 4,
       sender: ctx.myNpub,
@@ -252,6 +335,10 @@ export async function runAutoEmit(ctx: AutoEmitContext): Promise<AutoEmitOutcome
         ...(ctx.snapshot.prevTransitionHex
           ? { prevTransitionHex: ctx.snapshot.prevTransitionHex }
           : {}),
+        // Emit buyerOutputIndex only on multi-output transitions. For
+        // single-output (legacy) transitions, absence implies 0 — keeps
+        // wire compat with envelopes posted before 7.3.
+        ...(isSplit ? { buyerOutputIndex } : {}),
       },
     };
 
@@ -268,6 +355,9 @@ export async function runAutoEmit(ctx: AutoEmitContext): Promise<AutoEmitOutcome
       newCommitIdHex,
       newTransitionHex,
       payloadKind: ctx.snapshot.payloadKind,
+      outputCount: isSplit ? 2 : 1,
+      buyerOutputIndex,
+      changeAmount,
     };
   } catch (e) {
     return {

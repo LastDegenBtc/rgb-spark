@@ -42,15 +42,31 @@ export interface StashContract {
  * back-pointer to the contract whose assignment it consumes, so we can
  * present transition chains in the UI.
  */
+/**
+ * Per-output allocation inside a NIA transition. v0 single-output
+ * transitions have `outputs.length == 1`; partial-fill swaps from
+ * Phase 1C/clean session 7.3 produce `outputs.length == 2` (buyer +
+ * seller change).
+ */
+export interface StashTransitionOutput {
+  /** Decimal-encoded u64 — units of the asset at this output. */
+  amount: string;
+}
+
 export interface StashTransition {
   /** 32-byte hex — `transition.id()`, used as Spark-UTK msg of the leaf
    *  this transition is bound to. Primary key. */
   commitId: string;
   /** Back-pointer to the StashContract this transition consumes. */
   prevContractId: string;
-  /** Decimal string. Currently must equal the prev allocation (no split
-   *  yet — enforced by `core.buildNiaTransition`). */
-  amount: string;
+  /** Per-output asset allocations, in transition.assignments[OS_ASSET]
+   *  order. Length matches the number of outputs the transition
+   *  produced. Index is the `consume_index` to pass to
+   *  `buildNiaTransitionFromPrev` when consuming this transition next.
+   *  Added in Phase 1C/clean session 7.3 — supersedes the prior single
+   *  `amount` field. Legacy 1-output entries persisted before 7.3 are
+   *  migrated in-memory to `outputs: [{amount}]` at attach time. */
+  outputs: StashTransitionOutput[];
   /** Strict-encoded `Transition` bytes (hex). */
   transitionHex: string;
   createdAt: string;
@@ -125,7 +141,21 @@ export function attachStash(npub: string): void {
   const persisted = readRaw();
   if (persisted && persisted.npub === npub) {
     state.contracts = persisted.contracts.slice();
-    state.transitions = persisted.transitions.slice();
+    // Phase 1C/clean session 7.3 migration: legacy entries had a single
+    // `amount: string` field; new entries carry `outputs: [{amount}]`.
+    // Transparently convert legacy → new on load so the rest of the
+    // codebase only deals with the new shape.
+    state.transitions = persisted.transitions.map((t) => {
+      const legacy = t as unknown as { amount?: string; outputs?: StashTransitionOutput[] };
+      if (legacy.outputs && legacy.outputs.length > 0) return t;
+      if (typeof legacy.amount === 'string') {
+        return { ...t, outputs: [{ amount: legacy.amount }] };
+      }
+      // No usable amount info — drop. Shouldn't happen for any entry we
+      // ever wrote; this branch exists only to defend against hand-edited
+      // localStorage.
+      return null as unknown as StashTransition;
+    }).filter((t) => t !== null);
   } else {
     state.contracts = [];
     state.transitions = [];

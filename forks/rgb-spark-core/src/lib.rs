@@ -452,6 +452,46 @@ fn transition_asset_at(
     Ok(*value)
 }
 
+/// Extract the per-output asset amounts from a strict-encoded NIA
+/// `Transition` (hex). Returns one decimal string per output,
+/// indexed by the output's position in `transition.assignments[OS_ASSET]`.
+///
+/// Trustless replacement for "trust the sender's envelope claim about
+/// who got what": the receiver decodes the transition bytes themselves
+/// and reads the amounts the schema validator just signed off on.
+///
+/// `transition_hex`: strict-encoded `Transition` (= what
+/// `buildNiaTransition*` produces).
+///
+/// Decimal strings (not `u64` directly) for the same JS-Number-
+/// precision reason as `niaGenesisMetadata.supply`.
+#[wasm_bindgen(js_name = niaTransitionOutputs)]
+pub fn nia_transition_outputs(transition_hex: &str) -> Result<Vec<String>, JsError> {
+    let tr_bytes = hex::decode(transition_hex).map_err(map_err("transition hex decode"))?;
+    let tr_confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(tr_bytes)
+        .map_err(map_err("transition size limit"))?;
+    let transition = Transition::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(tr_confined)
+        .map_err(map_err("strict decode transition"))?;
+
+    let typed = transition
+        .assignments
+        .get(&OS_ASSET)
+        .ok_or_else(|| JsError::new("transition: missing OS_ASSET assignment"))?;
+    let fungibles = typed.as_fungible();
+
+    let mut out: Vec<String> = Vec::with_capacity(fungibles.len());
+    for (i, assign) in fungibles.iter().enumerate() {
+        let (_seal, value) = assign
+            .as_revealed()
+            .ok_or_else(|| JsError::new(&format!(
+                "transition: OS_ASSET assignment at index {i} is not revealed"
+            )))?;
+        let amount: Amount = (*value).into();
+        out.push(amount.value().to_string());
+    }
+    Ok(out)
+}
+
 /// Build a NIA `transfer` state transition consuming the `no`-th
 /// `assetOwner` assignment of a previously issued genesis, allocating
 /// `amount` units to a new beneficiary seal. Returns
@@ -1310,6 +1350,54 @@ mod tests {
     // sufficient evidence that the happy-path multi-output transitions
     // build and validate correctly; the error paths are simple guard
     // clauses that don't warrant wasm-only test infra.
+
+    #[test]
+    fn nia_transition_outputs_round_trips_multi_output() {
+        // Build a known 3-output split (500/300/200 out of 1000) and
+        // confirm `nia_transition_outputs` reads back the same per-output
+        // amounts byte-for-byte. This is the function the buyer-side
+        // inbox uses to populate its stash without trusting envelope
+        // metadata.
+        let issued =
+            issue_nia_contract("TO3", "Transition outputs 3", 1000, FIXTURE_TXID, 0, 1_700_000_400)
+                .expect("issuance");
+        let trn = build_nia_transition_multi_output(
+            &issued.consignment_hex,
+            0,
+            vec!["500".to_string(), "300".to_string(), "200".to_string()],
+            vec![
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+                "0000000000000000000000000000000000000000000000000000000000000002".to_string(),
+                "0000000000000000000000000000000000000000000000000000000000000003".to_string(),
+            ],
+            vec![0, 1, 2],
+        )
+        .expect("build 3-output");
+
+        let outputs = nia_transition_outputs(&trn.transition_hex)
+            .expect("extract outputs");
+        assert_eq!(outputs, vec!["500", "300", "200"]);
+    }
+
+    #[test]
+    fn nia_transition_outputs_single_output() {
+        // 1-output transitions (the v0 single-output path) must also be
+        // readable — same function handles both shapes.
+        let issued =
+            issue_nia_contract("TO1", "Transition outputs 1", 42, FIXTURE_TXID, 0, 1_700_000_401)
+                .expect("issuance");
+        let trn = build_nia_transition(
+            &issued.consignment_hex,
+            0,
+            42,
+            "0000000000000000000000000000000000000000000000000000000000000010",
+            0,
+        )
+        .expect("build 1-output");
+        let outputs = nia_transition_outputs(&trn.transition_hex)
+            .expect("extract outputs");
+        assert_eq!(outputs, vec!["42"]);
+    }
 
     #[test]
     fn build_multi_output_from_prev_two_outputs() {

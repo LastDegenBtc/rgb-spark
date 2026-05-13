@@ -629,6 +629,35 @@ export function niaGenesisMetadata(consignment_hex) {
 }
 
 /**
+ * Extract the per-output asset amounts from a strict-encoded NIA
+ * `Transition` (hex). Returns one decimal string per output,
+ * indexed by the output's position in `transition.assignments[OS_ASSET]`.
+ *
+ * Trustless replacement for "trust the sender's envelope claim about
+ * who got what": the receiver decodes the transition bytes themselves
+ * and reads the amounts the schema validator just signed off on.
+ *
+ * `transition_hex`: strict-encoded `Transition` (= what
+ * `buildNiaTransition*` produces).
+ *
+ * Decimal strings (not `u64` directly) for the same JS-Number-
+ * precision reason as `niaGenesisMetadata.supply`.
+ * @param {string} transition_hex
+ * @returns {string[]}
+ */
+export function niaTransitionOutputs(transition_hex) {
+    const ptr0 = passStringToWasm0(transition_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.niaTransitionOutputs(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayJsValueFromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+    return v2;
+}
+
+/**
  * Decode + validate a strict-encoded NIA genesis consignment (hex).
  * Returns the contractId (32-byte hex) extracted from the validated
  * consignment, so the receiver can compare it against the `msgHex`
@@ -768,6 +797,11 @@ function __wbg_get_imports() {
         __wbg_getRandomValues_3f44b700395062e5: function() { return handleError(function (arg0, arg1) {
             globalThis.crypto.getRandomValues(getArrayU8FromWasm0(arg0, arg1));
         }, arguments); },
+        __wbindgen_cast_0000000000000001: function(arg0, arg1) {
+            // Cast intrinsic for `Ref(String) -> Externref`.
+            const ret = getStringFromWasm0(arg0, arg1);
+            return ret;
+        },
         __wbindgen_init_externref_table: function() {
             const table = wasm.__wbindgen_externrefs;
             const offset = table.grow(4);
@@ -801,6 +835,17 @@ function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc();
     wasm.__wbindgen_externrefs.set(idx, obj);
     return idx;
+}
+
+function getArrayJsValueFromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    const mem = getDataViewMemory0();
+    const result = [];
+    for (let i = ptr; i < ptr + 4 * len; i += 4) {
+        result.push(wasm.__wbindgen_externrefs.get(mem.getUint32(i, true)));
+    }
+    wasm.__externref_drop_slice(ptr, len);
+    return result;
 }
 
 function getArrayU8FromWasm0(ptr, len) {

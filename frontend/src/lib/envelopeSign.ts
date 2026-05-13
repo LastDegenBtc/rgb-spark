@@ -36,6 +36,14 @@ export interface LeafReferenceField {
    *  prevGenesisHex)`; otherwise fall back to the existing two-input
    *  `validateNiaTransition(transitionHex, prevGenesisHex)` path. */
   prevTransitionHex?: string;
+  /** Output index within `transitionHex` that's assigned to the buyer
+   *  (Phase 1C/clean session 7.3). Absent or 0 = single-output
+   *  transitions (legacy single-recipient transfers). For partial-fill
+   *  swaps, the seller emits a 2-output T_new where output 0 is the
+   *  buyer's share and output 1 is seller-as-change; the buyer's stash
+   *  records `outputs[buyerOutputIndex].amount` as their holding for
+   *  this contract. */
+  buyerOutputIndex?: number;
 }
 
 /** Envelope fields that participate in the signature. Excludes senderSignature. */

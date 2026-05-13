@@ -1229,13 +1229,18 @@ function RgbStashPanel() {
                     {txns.length > 0 && (
                       <div style={{ marginTop: 4 }}>
                         <div style={{ color: '#888' }}>transitions:</div>
-                        {txns.map((t) => (
-                          <div key={t.commitId} style={{ paddingLeft: 8, wordBreak: 'break-all' }}>
-                            · {t.commitId.slice(0, 16)}… amount {t.amount}
-                            {' · '}{t.transitionHex.length / 2} B
-                            {' · '}{t.createdAt}
-                          </div>
-                        ))}
+                        {txns.map((t) => {
+                          const outputsLabel = t.outputs.length === 1
+                            ? `amount ${t.outputs[0].amount}`
+                            : `outputs [${t.outputs.map((o) => o.amount).join(', ')}]`
+                          return (
+                            <div key={t.commitId} style={{ paddingLeft: 8, wordBreak: 'break-all' }}>
+                              · {t.commitId.slice(0, 16)}… {outputsLabel}
+                              {' · '}{t.transitionHex.length / 2} B
+                              {' · '}{t.createdAt}
+                            </div>
+                          )
+                        })}
                       </div>
                     )}
                   </div>
@@ -2063,6 +2068,9 @@ function SettlementAutoEmitProbe({
                 myNostrPrivkeyHex,
                 mySparkIdentityPubkey,
                 buyerNpub: buyerNpub.trim(),
+                // Session 7.3a: default to full transfer (no split). The
+                // partial-fill UI input lands in 7.3b.
+                orderAmount: snapshot.amount,
               })
               setEmitResult(r)
               setEmitting(false)
@@ -2860,7 +2868,7 @@ function BuildTransitionInline({
       addTransition({
         commitId,
         prevContractId: lastIssuance.contractId,
-        amount: supplyTrim,
+        outputs: [{ amount: supplyTrim }],
         transitionHex,
         createdAt: new Date().toISOString(),
       })

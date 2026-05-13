@@ -328,13 +328,16 @@ export async function processInbox(
 
       // Persist the chain links we know about. addTransition is keyed by
       // commitId and idempotent, so re-arrival of the same envelope is safe.
+      // Per-output amounts come from niaTransitionOutputs — trustless, no
+      // envelope-supplied metadata involved. Multi-output transitions
+      // (session 7.3 split-merge) surface their full output array;
+      // legacy single-output transitions surface a 1-element array.
       if (leafRef.prevTransitionHex && leafRef.transitionHex) {
-        const supply = await readSupply(genesisHex);
         if (outcome.newCommitIdHex) {
           sink.addTransition({
             commitId: outcome.newCommitIdHex,
             prevContractId: outcome.contractId,
-            amount: supply,
+            outputs: await readTransitionOutputs(leafRef.transitionHex),
             transitionHex: leafRef.transitionHex,
             createdAt: env.createdAt,
           });
@@ -344,16 +347,15 @@ export async function processInbox(
         sink.addTransition({
           commitId: leafRef.msgHex!.toLowerCase(),
           prevContractId: outcome.contractId,
-          amount: supply,
+          outputs: await readTransitionOutputs(leafRef.prevTransitionHex),
           transitionHex: leafRef.prevTransitionHex,
           createdAt: env.createdAt,
         });
       } else if (leafRef.transitionHex && outcome.newCommitIdHex) {
-        const supply = await readSupply(genesisHex);
         sink.addTransition({
           commitId: outcome.newCommitIdHex,
           prevContractId: outcome.contractId,
-          amount: supply,
+          outputs: await readTransitionOutputs(leafRef.transitionHex),
           transitionHex: leafRef.transitionHex,
           createdAt: env.createdAt,
         });
@@ -399,6 +401,20 @@ async function readSupply(genesisHex: string): Promise<string> {
   } finally {
     meta.free();
   }
+}
+
+/**
+ * Decode a transition and return its per-output asset amounts as
+ * `{amount}` shapes ready for StashTransition.outputs. Trustless:
+ * amounts come from the schema-validated transition bytes themselves,
+ * not from envelope-supplied metadata.
+ */
+async function readTransitionOutputs(
+  transitionHex: string,
+): Promise<Array<{ amount: string }>> {
+  const core = await ensureSparkCoreReady();
+  const amounts = core.niaTransitionOutputs(transitionHex);
+  return amounts.map((amount) => ({ amount }));
 }
 
 // ------- Poller --------------------------------------------------------------
