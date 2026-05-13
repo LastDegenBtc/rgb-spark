@@ -519,6 +519,76 @@ async function main() {
   // Close the SSE connection so the smoke test process can exit cleanly.
   sseAbort.abort()
 
+  // ---- Metadata phases (Phase 1C/clean session 11) ----
+  console.log('Phase 19: Alice posts signed metadata for assetId3 (she was the first poster).')
+  const metaPayload = {
+    contractId: assetId3,
+    ticker: 'TEST',
+    name: 'Smoke Test Asset',
+    description: 'A scratch asset used by the relay smoke test.',
+    socials: { twitter: '@smoke' },
+    createdAt: new Date().toISOString(),
+    issuerNpub: alice.npub,
+  }
+  const canonical = canonicalize(metaPayload)
+  const digest = sha256(new TextEncoder().encode(canonical))
+  const sigBytes = schnorr.sign(digest, alice.priv)
+  const signedMeta = { ...metaPayload, signature: bytesToHex(sigBytes) }
+
+  const metaResp = await fetch(`${RELAY}/asset/${assetId3}/metadata`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(signedMeta),
+  })
+  await expect('metadata POST 201', metaResp.status === 201, await metaResp.json())
+
+  console.log('Phase 20: GET metadata round-trips.')
+  const fetchMeta = await fetch(`${RELAY}/asset/${assetId3}/metadata`)
+  const fetched = await fetchMeta.json() as typeof signedMeta
+  await expect('metadata GET 200', fetchMeta.status === 200)
+  await expect('metadata ticker preserved', fetched.ticker === 'TEST', fetched.ticker)
+  await expect('metadata signature preserved', fetched.signature === signedMeta.signature)
+
+  console.log('Phase 21: tampered signature rejected.')
+  const tamperedMeta = { ...signedMeta, signature: '00'.repeat(64) }
+  const tamperResp = await fetch(`${RELAY}/asset/${assetId3}/metadata`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(tamperedMeta),
+  })
+  await expect('tampered metadata rejected (400)', tamperResp.status === 400)
+
+  console.log('Phase 22: a different npub posting metadata for the same asset is rejected.')
+  const bobMetaPayload = { ...metaPayload, issuerNpub: bob.npub, createdAt: new Date().toISOString() }
+  const bobCanonical = canonicalize(bobMetaPayload)
+  const bobDigest = sha256(new TextEncoder().encode(bobCanonical))
+  const bobSig = schnorr.sign(bobDigest, bob.priv)
+  const bobMeta = { ...bobMetaPayload, signature: bytesToHex(bobSig) }
+  const bobMetaResp = await fetch(`${RELAY}/asset/${assetId3}/metadata`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(bobMeta),
+  })
+  await expect(
+    'wrong-issuer metadata rejected (400)',
+    bobMetaResp.status === 400,
+    await bobMetaResp.json(),
+  )
+
+  console.log('Phase 23: unknown contractId metadata POST is rejected.')
+  const orphanContractId = bytesToHex(randomBytes(32))
+  const orphanPayload = { ...metaPayload, contractId: orphanContractId, createdAt: new Date().toISOString() }
+  const orphanCanonical = canonicalize(orphanPayload)
+  const orphanDigest = sha256(new TextEncoder().encode(orphanCanonical))
+  const orphanSig = schnorr.sign(orphanDigest, alice.priv)
+  const orphanMeta = { ...orphanPayload, signature: bytesToHex(orphanSig) }
+  const orphanResp = await fetch(`${RELAY}/asset/${orphanContractId}/metadata`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(orphanMeta),
+  })
+  await expect('orphan-contract metadata rejected (400)', orphanResp.status === 400)
+
   console.log('\nAll orderbook smoke tests passed.')
 }
 

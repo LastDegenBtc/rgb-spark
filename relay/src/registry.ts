@@ -24,6 +24,16 @@ export interface RegistryEntry {
   matchedOrdersCount: number
   cancelledOrdersCount: number
   expiredOrdersCount: number
+  /** Bech32 npub of the FIRST poster who placed an order for this
+   *  contractId. The metadata endpoint (session 11) only accepts
+   *  signed posts whose sender matches this. First-seen-is-issuer is
+   *  a heuristic: a real issuer-binding scheme would put the issuer's
+   *  npub inside the genesis bytes themselves, but NIA 0.11 doesn't
+   *  have a slot for that and we're not extending the schema. The
+   *  trade-off is acceptable for v0 — the metadata is informational
+   *  (ticker / image / etc.); the cryptographic asset identity is
+   *  the contractId. */
+  issuerNpub?: string
 }
 
 const MAX_REGISTRY_SIZE = 10_000
@@ -61,13 +71,16 @@ function ensure(contractId: string): RegistryEntry | null {
 /**
  * Call when a new order is accepted onto the orderbook AND its initial
  * status is `open`. Creates the registry entry on first sight + bumps
- * the open counter.
+ * the open counter. `posterNpub` is captured as the asset's
+ * `issuerNpub` on FIRST sight only — subsequent posters don't displace
+ * the original issuer.
  */
-export function noteOrderPlaced(contractId: string): void {
+export function noteOrderPlaced(contractId: string, posterNpub: string): void {
   const entry = ensure(contractId)
   if (!entry) return
   entry.openOrdersCount++
   entry.lastActivityAt = nowIso()
+  if (!entry.issuerNpub) entry.issuerNpub = posterNpub
 }
 
 /**

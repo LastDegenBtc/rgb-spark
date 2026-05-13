@@ -27,6 +27,12 @@ import {
   type RegistrySortKey,
 } from './registry.js'
 import { subscribe as subscribeEvents, subscriberCount } from './events.js'
+import {
+  putMetadata,
+  getMetadata,
+  metadataHealth,
+  type SignedAssetMetadata,
+} from './metadata.js'
 
 const PORT = Number(process.env.PORT ?? 5180)
 const HOST = process.env.HOST ?? '0.0.0.0'
@@ -110,6 +116,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       orderbook: orderbookHealth(),
       registry: registryHealth(),
       events: { subscribers: subscriberCount() },
+      metadata: metadataHealth(),
     })
   }
 
@@ -152,6 +159,44 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     const entry = getAssetStats(contractId)
     if (!entry) return send(res, 404, { error: 'asset not in registry' })
     return send(res, 200, entry)
+  }
+
+  // /asset/:contractId/metadata — GET to fetch, POST signed blob.
+  const metaMatch = url.match(/^\/asset\/([0-9a-fA-F]{64})\/metadata\/?$/)
+  if (metaMatch) {
+    const contractId = metaMatch[1]!
+
+    if (method === 'GET') {
+      const m = getMetadata(contractId)
+      if (!m) return send(res, 404, { error: 'no metadata for this contractId' })
+      return send(res, 200, m)
+    }
+
+    if (method === 'POST') {
+      let body: Buffer
+      try {
+        body = await readBody(req, MAX_BYTES)
+      } catch (e) {
+        const status = (e as { http?: number }).http ?? 400
+        return send(res, status, { error: status === 413 ? 'payload too large' : 'read error' })
+      }
+      if (body.length === 0) return send(res, 400, { error: 'empty body' })
+      let signed: SignedAssetMetadata
+      try {
+        signed = JSON.parse(body.toString('utf8')) as SignedAssetMetadata
+      } catch {
+        return send(res, 400, { error: 'body is not JSON' })
+      }
+      try {
+        putMetadata(contractId, signed)
+        return send(res, 201, { ok: true, contractId: contractId.toLowerCase() })
+      } catch (e) {
+        const status = (e as { http?: number }).http ?? 400
+        return send(res, status, { error: (e as Error).message })
+      }
+    }
+
+    return send(res, 405, { error: 'method not allowed on /asset/:id/metadata' })
   }
 
   // /order/:assetId or /order/:assetId/:orderId

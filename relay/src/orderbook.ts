@@ -362,7 +362,9 @@ export function placeOrder(assetId: string, signed: SignedOrder): PlaceResult {
 
   // Session 9 registry: the incoming order enters the book briefly,
   // regardless of whether it lands open or matches immediately.
-  noteOrderPlaced(signed.assetId)
+  // posterNpub is captured by the registry as the asset's issuer on
+  // first sight only (session 11).
+  noteOrderPlaced(signed.assetId, signed.posterNpub)
   // Session 10 SSE: emit order_placed for the incoming order.
   emit({
     type: 'order_placed',
