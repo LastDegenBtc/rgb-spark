@@ -5,7 +5,7 @@
 // for the unified-seed rationale). Spark accepts a Uint8Array for
 // `mnemonicOrSeed` and runs its own HD derivation on top.
 
-import { SparkWallet, KeyDerivationType, SparkWalletEvent } from '@buildonspark/spark-sdk';
+import { SparkWallet, KeyDerivationType } from '@buildonspark/spark-sdk';
 import type { SparkSigner } from '@buildonspark/spark-sdk';
 import { setPathTweak, clearPathTweak, RgbAwareSparkSigner } from './rgbAwareSigner';
 
@@ -161,95 +161,82 @@ export async function ensureLeafOfExactSize(targetSats: number): Promise<SparkLe
   // Fast path: a leaf of exact size already exists.
   const beforeLeaves = await listSparkLeaves()
   const existingExact = beforeLeaves.find((l) => l.value === targetSats)
-  if (existingExact) return existingExact
+  if (existingExact) {
+    console.log('[ensureLeafOfExactSize] FAST PATH — exact-sized leaf already exists:',
+      { id: existingExact.id, value: existingExact.value })
+    return existingExact
+  }
 
-  // Slow path: ask Spark to split for us via a self-transfer. The SDK
-  // does coin selection so multiple small leaves can sum to targetSats.
+  // Slow path: ask Spark to split for us via a self-transfer.
   //
-  // Race we have to tolerate: `transferToSpark` returns after the sender
-  // side completes, but receiver-side materialization happens inside the
-  // SDK's `claimTransfers` interval (every 5 s — see
-  // spark-wallet.ts:5972). Until that tick fires, `getLeaves()` returns
-  // pre-claim state, so a value-based scan finds nothing.
+  // For self-transfers the SDK claims INLINE during the transfer call
+  // (spark-wallet.ts:3193-3203): it sends, queries the pending, and
+  // awaits claimTransfer in the same await chain. So when transferToSpark
+  // resolves, registerClaimedLeaves has already run and the new leaves
+  // are in the leaf manager's local cache. They should be visible in
+  // listSparkLeaves() immediately.
   //
-  // Strategy: subscribe to `SparkWalletEvent.TransferClaimed` BEFORE the
-  // transfer so we don't miss an event that fires between the transfer
-  // resolving and us starting to wait. Match on the transferId we got
-  // back. If the event hasn't arrived after ~30 s, give up (something
-  // is genuinely wrong — claimTransfers should fire every 5 s).
+  // The previous TransferClaimed-event wait was wrong: that event only
+  // fires for NON-self transfers (the inline claimTransfer call passes
+  // emit:undefined, so processClaimedTransferResults skips the emit at
+  // line 3263-3273). We waited for an event that never arrives.
+  //
+  // Diagnostic mode (sprk.11c): when no exact-sized leaf appears, dump
+  // a before/after diff to the console so we can see what the SDK
+  // actually produced (split shape, value distribution, missing leaves,
+  // …). The previous "timeout, retry manually" error message was
+  // unactionable — this one prints the data needed to fix it.
   const sparkAddress = await walletInstance.getSparkAddress()
   const beforeIds = new Set(beforeLeaves.map((l) => l.id))
+  console.log('[ensureLeafOfExactSize] target=' + targetSats, {
+    beforeLeaves: beforeLeaves.map((l) => ({ id: l.id, value: l.value, status: l.status })),
+    beforeCount: beforeLeaves.length,
+    sparkAddress,
+  })
 
-  // Subscribe before the transfer to avoid a fire-before-listen race.
-  // We track every claimed transferId observed during the wait; once we
-  // know our own pendingTransferId we check the set + listen for further
-  // events. Doing it this way avoids the closure-ordering pitfall where
-  // the SDK could fire the claim event while transferToSpark() is still
-  // awaiting (the event would arrive before we've recorded the id).
-  const claimedIds = new Set<string>()
-  let claimResolve: (() => void) | null = null
-  let pendingTransferId = ''
-  const onClaim = (id: string) => {
-    claimedIds.add(id)
-    if (claimResolve && id === pendingTransferId) claimResolve()
-  }
-  walletInstance.on(SparkWalletEvent.TransferClaimed, onClaim)
+  const transferId = await transferToSpark(targetSats, sparkAddress)
+  console.log('[ensureLeafOfExactSize] transferToSpark resolved', { transferId })
 
-  try {
-    pendingTransferId = await transferToSpark(targetSats, sparkAddress)
-
-    // Wait for either the matching claim event (live OR previously
-    // captured into claimedIds during the transfer), a polled-success
-    // (defensive — event listener unwired or claimed before transferTo
-    // resolved), or a hard 30 s timeout. 30 s = 6× the SDK's 5 s
-    // claimTransfers interval — comfortably more than one tick's slack.
-    const TIMEOUT_MS = 30_000
-    const POLL_INTERVAL_MS = 500
-
-    if (claimedIds.has(pendingTransferId)) {
-      // Already claimed during the await.
-    } else {
-      const claimedPromise = new Promise<'claimed'>((resolve) => {
-        claimResolve = () => resolve('claimed')
-      })
-      const timeoutPromise = new Promise<'timeout'>((resolve) => {
-        setTimeout(() => resolve('timeout'), TIMEOUT_MS)
-      })
-      let pollResolve: (v: 'polled') => void = () => {}
-      const pollPromise = new Promise<'polled'>((resolve) => { pollResolve = resolve })
-      const pollTimer = setInterval(async () => {
-        try {
-          const leaves = await listSparkLeaves()
-          if (leaves.some((l) => l.value === targetSats && !beforeIds.has(l.id))) {
-            pollResolve('polled')
-          }
-        } catch { /* transient listLeaves error — keep polling */ }
-      }, POLL_INTERVAL_MS)
-
-      const outcome = await Promise.race([claimedPromise, pollPromise, timeoutPromise])
-      clearInterval(pollTimer)
-      if (outcome === 'timeout') {
-        throw new Error(
-          `transferToSpark(${targetSats}) sent (id=${pendingTransferId}) but no claim ` +
-          `event or matching leaf arrived after ${TIMEOUT_MS / 1000}s. The SDK's ` +
-          `claimTransfers tick may be stuck — retry the action, or reload the wallet.`,
-        )
-      }
-    }
-
-    // Re-fetch so we return a fresh row.
+  // Quick poll loop (3 s, 6× 500 ms) — claim is inline so usually
+  // the very first read returns the new leaves, but Safari has been
+  // observed lagging by a few hundred ms on cache write.
+  const POLL_INTERVAL_MS = 500
+  const POLL_MAX_TRIES = 6
+  for (let i = 0; i < POLL_MAX_TRIES; i++) {
     const afterLeaves = await listSparkLeaves()
-    const newExact = afterLeaves.find((l) => l.value === targetSats && !beforeIds.has(l.id))
-    if (newExact) return newExact
-    const anyExact = afterLeaves.find((l) => l.value === targetSats)
-    if (anyExact) return anyExact
-    throw new Error(
-      `transferToSpark(${targetSats}) claimed (id=${pendingTransferId}) but no leaf ` +
-      `of size ${targetSats} present in getLeaves() — coordinator state is inconsistent.`,
-    )
-  } finally {
-    walletInstance.off(SparkWalletEvent.TransferClaimed, onClaim)
+    const newLeaves = afterLeaves.filter((l) => !beforeIds.has(l.id))
+    const exact = newLeaves.find((l) => l.value === targetSats)
+    if (exact) {
+      console.log('[ensureLeafOfExactSize] OK — new exact-sized leaf found', {
+        try: i,
+        leaf: { id: exact.id, value: exact.value },
+        newLeavesAll: newLeaves.map((l) => ({ id: l.id, value: l.value })),
+      })
+      return exact
+    }
+    if (i === POLL_MAX_TRIES - 1) {
+      console.error('[ensureLeafOfExactSize] FAIL — no exact-sized leaf after poll', {
+        transferId,
+        target: targetSats,
+        afterLeaves: afterLeaves.map((l) => ({ id: l.id, value: l.value, status: l.status })),
+        newLeaves: newLeaves.map((l) => ({ id: l.id, value: l.value })),
+        droppedLeaves: beforeLeaves
+          .filter((l) => !afterLeaves.some((a) => a.id === l.id))
+          .map((l) => ({ id: l.id, value: l.value })),
+        beforeCount: beforeLeaves.length,
+        afterCount: afterLeaves.length,
+      })
+      break
+    }
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS))
   }
+
+  throw new Error(
+    `transferToSpark(${targetSats}) sent (id=${transferId}) but no leaf of size ` +
+    `${targetSats} appeared in listSparkLeaves(). See console log above for the ` +
+    `full before/after leaf diff — paste it back so we can see how the SDK split ` +
+    `the source leaves.`,
+  )
 }
 
 export async function transferToSpark(
