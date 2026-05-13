@@ -74,6 +74,10 @@ import {
   flushInboxNow,
   type InboxStatus,
 } from './lib/settlementInbox'
+import {
+  findBoundLeaf,
+  lazyRebindIfNeeded,
+} from './lib/assetBinding'
 import { attachPathTweakStorage, detachPathTweakStorage } from './lib/pathTweakStorage'
 import {
   attachStash,
@@ -642,6 +646,10 @@ function PlaceOrderForms({
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [lastPlaced, setLastPlaced] = useState<PlaceResult | null>(null)
+  // Session 6: status of the lazy-rebind pre-step on ask side. Cleared at
+  // the start of each place() call. Surfaces to the user during the
+  // mintViaSelfTransfer call that can take a few seconds.
+  const [rebindStatus, setRebindStatus] = useState<string | null>(null)
 
   useEffect(() => {
     if (selectedContract && !amount) setAmount(selectedContract.supply)
@@ -651,6 +659,7 @@ function PlaceOrderForms({
     setBusy(true)
     setErr(null)
     setLastPlaced(null)
+    setRebindStatus(null)
     try {
       if (!assetId) throw new Error('select an asset first')
       if (!/^[0-9]+$/.test(amount.trim()) || BigInt(amount.trim()) <= 0n) {
@@ -666,6 +675,23 @@ function PlaceOrderForms({
       }
       const now = new Date()
       const expiry = new Date(now.getTime() + expMin * 60_000).toISOString()
+
+      // Ask side: rebind if needed (Phase 1C/clean session 6). The user
+      // might have received this asset via the inbox auto-stash, in which
+      // case their leaves are vanilla. Re-sell requires a leaf bound to
+      // a fresh T_n+1 over the latest known transition. Silent no-op when
+      // a binding already exists.
+      if (side === 'ask') {
+        setRebindStatus('checking asset binding…')
+        const outcome = await lazyRebindIfNeeded(assetId)
+        if (outcome.status === 'rebound') {
+          setRebindStatus(`auto-rebound · new leaf ${outcome.newLeafId.slice(0, 12)}…`)
+        } else if (outcome.status === 'already-bound') {
+          setRebindStatus(null)
+        } else {
+          throw new Error(`rebind ${outcome.status}: ${outcome.reason}`)
+        }
+      }
 
       // Ask side: generate paymentHash now (seller controls the preimage).
       // Preimage is persisted in orderPreimageStash so the seller can fire
@@ -756,6 +782,11 @@ function PlaceOrderForms({
           {busy ? '…' : `Place ${side}`}
         </button>
       </div>
+      {rebindStatus && (
+        <div style={{ fontSize: 11, color: '#666', marginTop: 4, fontStyle: 'italic' }}>
+          {rebindStatus}
+        </div>
+      )}
       {err && (
         <pre style={{ color: 'crimson', fontSize: 11, whiteSpace: 'pre-wrap', marginTop: 4 }}>
           {err}
@@ -861,11 +892,17 @@ function OrderRow({
           getLeaves: (b?: boolean) => Promise<Array<{ id: string; value: number }>>
         }).getLeaves(true)
         if (allLeaves.length === 0) throw new Error('no leaves to commit as asset')
-        // v0 leaf selection: pick the smallest leaf in the wallet as the
-        // asset leg. Real UX should resolve which leaf binds to this
-        // contractId via pathTweaks lookup (msg == contractId or
-        // commitId chain). Future session.
-        const assetLeaf = ([...allLeaves].sort((a, b) => a.value - b.value)[0] as unknown) as Parameters<typeof lockUnderHash>[1]['leaves'][number]
+        // Session 6: resolve the leaf bound to this contractId via
+        // pathTweaks (msg ∈ {contractId} ∪ {transition.commitId}).
+        // Falls back to the smallest leaf only when no binding exists —
+        // shouldn't happen on the v1 flow since the ask was rebound at
+        // place() time, but the fallback keeps legacy / dev-lab paths
+        // unblocked.
+        const bound = await findBoundLeaf(so.order.assetId)
+        const boundRaw = bound
+          ? allLeaves.find((l) => l.id === bound.id)
+          : undefined
+        const assetLeaf = (boundRaw ?? [...allLeaves].sort((a, b) => a.value - b.value)[0]) as unknown as Parameters<typeof lockUnderHash>[1]['leaves'][number]
         const sellerExpiry = new Date(Date.now() + 60 * 60_000)
         const result = await runSellerFlow(wallet, {
           assetLeaves: [assetLeaf],
