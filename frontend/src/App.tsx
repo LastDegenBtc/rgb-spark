@@ -61,6 +61,7 @@ import {
   removeOrderSecret,
 } from './lib/orderPreimageStash'
 import { RgbAwareSparkSigner, clearRgbIntent, listPathTweaks, getPathTweak } from './lib/rgbAwareSigner'
+import { planSatsLock } from './lib/leafSelection'
 import {
   captureSettlementSnapshot,
   runAutoEmit,
@@ -1099,32 +1100,36 @@ function OrderRow({
             onState: (s) => setSwapLog((p) => [...p, s]),
           })
         } else {
-          // sprk.11c: priceSats exact-size lock is a known open issue
-          // (sprk.12). Pick the smallest covering vanilla leaf and warn
-          // about overpay. CRITICAL: lockUnderHash takes the SDK's
-          // native TreeNode shape (Uint8Array fields), so pull from
-          // wallet.getLeaves(true) directly — listSparkLeaves returns
-          // a hex-stringed projection that crashes the FROST signer.
-          const sdkLeaves = await (wallet as { getLeaves: (b?: boolean) => Promise<{ id: string; value: number }[]> }).getLeaves(true)
+          // sprk.12.2: subset-sum exact-lock; fall back to smallest
+          // covering with overpay log if no exact subset exists.
+          // wallet.getLeaves(true) returns native TreeNode (Uint8Array
+          // fields) — listSparkLeaves' hex projection breaks the FROST
+          // signer.
+          const sdkLeaves = await (wallet as { getLeaves: (b?: boolean) => Promise<Array<{ id: string; value: number }>> }).getLeaves(true)
           const boundLeafIds = new Set(listPathTweaks().map((t) => t.currentLeafId))
-          const candidates = (sdkLeaves as Array<{ id: string; value: number }>)
-            .filter((l) => !boundLeafIds.has(l.id) && l.value >= so.order.priceSats)
-            .sort((a, b) => a.value - b.value)
-          if (candidates.length === 0) {
+          const vanilla = sdkLeaves.filter((l) => !boundLeafIds.has(l.id))
+          const plan = planSatsLock(vanilla, so.order.priceSats)
+          if (plan.mode === 'insufficient') {
             throw new Error(
-              `no vanilla leaf in wallet covers priceSats ${so.order.priceSats}`,
+              `wallet's vanilla leaves total ${plan.totalAvailable} sats — ` +
+              `not enough to cover priceSats ${so.order.priceSats}.`,
             )
           }
-          const lockLeaf = candidates[0]
-          if (lockLeaf.value !== so.order.priceSats) {
+          if (plan.mode === 'exact') {
             setSwapLog((p) => [
               ...p,
-              { stage: 'warning', message:
-                `overpay: locking ${lockLeaf.value}-sat leaf for ${so.order.priceSats}-sat trade. ` +
-                `Exact-size lock not yet implemented (sprk.12).` } as never,
+              { stage: 'plan', message:
+                `lock plan: ${plan.leaves.length} leaf(es) summing to exactly ${plan.lockSats} sats — zero overpay.` } as never,
+            ])
+          } else {
+            setSwapLog((p) => [
+              ...p,
+              { stage: 'overpay', message:
+                `lock plan: ${plan.leaves.length} leaf(es) summing to ${plan.lockSats} sats for ${so.order.priceSats}-sat trade ` +
+                `(overpay ${plan.overpay} sats).` } as never,
             ])
           }
-          const satsLeaves = [lockLeaf] as unknown as Parameters<typeof lockUnderHash>[1]['leaves']
+          const satsLeaves = plan.leaves as unknown as Parameters<typeof lockUnderHash>[1]['leaves']
           await runBuyerFlow(wallet, {
             satsLeaves,
             counterpartyPubkey: counterpartyPubkeyBytes,
