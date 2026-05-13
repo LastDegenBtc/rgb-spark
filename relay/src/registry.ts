@@ -8,6 +8,8 @@
 // transport, not authoritative directory. A client that wants long-
 // term asset memory keeps its own rgbStash.
 
+import { emit } from './events.js'
+
 /**
  * Single asset's lifetime stats. All counters are monotonically
  * incremented across the asset's lifetime (= as long as the relay
@@ -51,6 +53,8 @@ function ensure(contractId: string): RegistryEntry | null {
     expiredOrdersCount: 0,
   }
   registry.set(id, fresh)
+  // First-sight broadcast — drives the issuance feed UX (RGB-SPK §4.4).
+  emit({ type: 'asset_registered', assetId: id, firstSeenAt: fresh.firstSeenAt })
   return fresh
 }
 

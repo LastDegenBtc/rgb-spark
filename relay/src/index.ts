@@ -26,6 +26,7 @@ import {
   registryHealth,
   type RegistrySortKey,
 } from './registry.js'
+import { subscribe as subscribeEvents, subscriberCount } from './events.js'
 
 const PORT = Number(process.env.PORT ?? 5180)
 const HOST = process.env.HOST ?? '0.0.0.0'
@@ -108,7 +109,19 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       pending: [...store.values()].reduce((n, q) => n + q.length, 0),
       orderbook: orderbookHealth(),
       registry: registryHealth(),
+      events: { subscribers: subscriberCount() },
     })
+  }
+
+  // /events — SSE stream (Phase 1C/clean session 10).
+  if (method === 'GET' && url === '/events') {
+    const unsubscribe = subscribeEvents(res)
+    // The SSE response stays open until the client disconnects. Hook
+    // request close to clean up; do NOT send a response from here.
+    req.on('close', () => {
+      unsubscribe()
+    })
+    return // intentional: SSE keeps the connection open
   }
 
   // /registry/assets?limit=&offset=&sortBy=

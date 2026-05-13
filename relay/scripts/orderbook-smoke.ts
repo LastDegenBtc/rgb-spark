@@ -439,6 +439,86 @@ async function main() {
   const unknownResp = await fetch(`${RELAY}/asset/${'aa'.repeat(32)}/stats`)
   await expect('unknown asset 404', unknownResp.status === 404)
 
+  // ---- SSE phases (Phase 1C/clean session 10) ----
+  // Node's global fetch supports streaming responses, so we use it
+  // directly rather than pulling in a polyfill for EventSource.
+  console.log('Phase 18: SSE stream emits order_placed when a new order is posted.')
+  const sseAbort = new AbortController()
+  const sseResp = await fetch(`${RELAY}/events`, { signal: sseAbort.signal })
+  await expect('SSE connect 200', sseResp.status === 200, sseResp.status)
+  await expect(
+    'SSE content-type text/event-stream',
+    (sseResp.headers.get('content-type') ?? '').includes('text/event-stream'),
+    sseResp.headers.get('content-type'),
+  )
+
+  // Tee a reader and collect events as text chunks until we either see
+  // our target event or timeout.
+  const sseEvents: string[] = []
+  const reader = sseResp.body!.getReader()
+  const decoder = new TextDecoder()
+  let buffered = ''
+  const collectUntil = (predicate: (e: string) => boolean, timeoutMs: number): Promise<boolean> =>
+    new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), timeoutMs)
+      const pump = async (): Promise<void> => {
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) {
+            clearTimeout(timer)
+            resolve(false)
+            return
+          }
+          buffered += decoder.decode(value, { stream: true })
+          // SSE messages are delimited by blank lines.
+          let idx: number
+          while ((idx = buffered.indexOf('\n\n')) >= 0) {
+            const block = buffered.slice(0, idx)
+            buffered = buffered.slice(idx + 2)
+            sseEvents.push(block)
+            if (predicate(block)) {
+              clearTimeout(timer)
+              resolve(true)
+              return
+            }
+          }
+        }
+      }
+      pump().catch(() => resolve(false))
+    })
+
+  // Post a new ask on a fresh asset and wait for the corresponding
+  // order_placed event.
+  const assetId4 = bytesToHex(randomBytes(32))
+  const sseAsk = signOrder(
+    {
+      id: uuidV7(),
+      side: 'ask' as const,
+      posterNpub: alice.npub,
+      posterSparkIdentityPubkey: alice.sparkCompressed,
+      assetId: assetId4,
+      amount: '500',
+      priceSats: 25_000,
+      paymentHash: bytesToHex(randomBytes(32)),
+      expiryTime: expiry,
+      createdAt: new Date().toISOString(),
+    },
+    alice.priv,
+  )
+  // Fire the POST AFTER attaching the listener, but don't await before
+  // we start collecting — race-free because the relay processes the
+  // POST synchronously and the SSE write goes into the same event loop.
+  const postPromise = postOrder(assetId4, sseAsk)
+  const sawPlaced = await collectUntil(
+    (block) => block.includes('"order_placed"') && block.includes(assetId4.toLowerCase()),
+    5_000,
+  )
+  await postPromise
+  await expect('SSE order_placed received within 5s', sawPlaced, sseEvents.slice(-3))
+
+  // Close the SSE connection so the smoke test process can exit cleanly.
+  sseAbort.abort()
+
   console.log('\nAll orderbook smoke tests passed.')
 }
 

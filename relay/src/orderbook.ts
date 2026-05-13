@@ -22,6 +22,7 @@ import {
   noteOrderMatched,
   noteOrderPlaced,
 } from './registry.js'
+import { emit } from './events.js'
 
 // ----- Constants -------------------------------------------------------
 
@@ -254,8 +255,14 @@ function gcExpired(b: Map<string, StoredOrder>) {
     } else if (Date.parse(so.order.expiryTime) <= now) {
       so.status = 'expired'
       so.updatedAt = new Date().toISOString()
-      // Registry note: order moved from open → expired (session 9).
+      // Registry + SSE: order moved from open → expired (sessions 9/10).
       noteOrderExpired(so.order.assetId)
+      emit({
+        type: 'order_expired',
+        assetId: so.order.assetId.toLowerCase(),
+        orderId: so.order.id,
+        expiredAt: so.updatedAt,
+      })
     }
   }
 }
@@ -356,6 +363,16 @@ export function placeOrder(assetId: string, signed: SignedOrder): PlaceResult {
   // Session 9 registry: the incoming order enters the book briefly,
   // regardless of whether it lands open or matches immediately.
   noteOrderPlaced(signed.assetId)
+  // Session 10 SSE: emit order_placed for the incoming order.
+  emit({
+    type: 'order_placed',
+    assetId: signed.assetId.toLowerCase(),
+    orderId: signed.id,
+    side: signed.side,
+    amount: signed.amount,
+    priceSats: signed.priceSats,
+    createdAt: signed.createdAt,
+  })
 
   const match = findCompatibleMatch(b, signed)
   const now = new Date().toISOString()
@@ -374,15 +391,33 @@ export function placeOrder(assetId: string, signed: SignedOrder): PlaceResult {
     // Both sides transition to matched.
     noteOrderMatched(signed.assetId)
     noteOrderMatched(match.order.assetId)
+    // Session 10 SSE: one event per matched order. matchedAmount =
+    // bid.amount (= the smaller side; asks consumed in full per
+    // session 8.1).
+    const bidAmt = signed.side === 'bid' ? signed.amount : match.order.amount
+    emit({
+      type: 'order_matched',
+      assetId: signed.assetId.toLowerCase(),
+      orderId: signed.id,
+      counterpartyOrderId: match.order.id,
+      matchedAmount: bidAmt,
+      matchedAt: now,
+    })
+    emit({
+      type: 'order_matched',
+      assetId: signed.assetId.toLowerCase(),
+      orderId: match.order.id,
+      counterpartyOrderId: signed.id,
+      matchedAmount: bidAmt,
+      matchedAt: now,
+    })
     // If incoming is a bid and match is an ask, propagate the ask's paymentHash
     // back to the bid so both sides agree on H.
     if (signed.side === 'bid' && !signed.paymentHash && match.order.paymentHash) {
       // We do NOT mutate the signed payload (signature would break). The
       // matched paymentHash is conveyed via the result, not via mutation.
     }
-    // Matched amount = min(bid.amount, ask.amount) = the bid's amount
-    // because findCompatibleMatch rejects bid > ask.
-    const bidAmt = signed.side === 'bid' ? signed.amount : match.order.amount
+    // `bidAmt` already computed above for the SSE emits.
     return {
       status: 'matched',
       id: signed.id,
@@ -434,8 +469,14 @@ export function cancelOrder(assetId: string, id: string, requesterNpub: string):
   if (so.status === 'cancelled' || so.status === 'expired') return
   so.status = 'cancelled'
   so.updatedAt = new Date().toISOString()
-  // Session 9 registry: open → cancelled.
+  // Session 9 registry + session 10 SSE.
   noteOrderCancelled(so.order.assetId)
+  emit({
+    type: 'order_cancelled',
+    assetId: so.order.assetId.toLowerCase(),
+    orderId: so.order.id,
+    cancelledAt: so.updatedAt,
+  })
 }
 
 export function healthCounts(): { assets: number; openOrders: number; matchedOrders: number } {
