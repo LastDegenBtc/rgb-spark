@@ -31,6 +31,7 @@ import {
 } from './consignmentRelay';
 import { addContract, addTransition, getContractById } from './rgbStash';
 import { verifyEnvelope, type SignedEnvelopeV4 } from './envelopeSign';
+import { lazyRebindIfNeeded, type RebindOutcome } from './assetBinding';
 
 const SETTLEMENT_KIND = 'settlement-consignment-v1';
 
@@ -43,6 +44,12 @@ export type AcceptResult = {
   /** Whether this envelope mutated the local stash (false on idempotent
    *  re-process where nothing new was added). */
   mutated: boolean;
+  /** Outcome of the post-accept auto-rebind. The buyer's leaf received
+   *  via HTLC is invisible to the SDK's verifyKey filter — the buyer
+   *  must mint a fresh self-bound leaf at the new chain head to surface
+   *  the post-trade allocation. Best-effort: failures (no vanilla source
+   *  leaf, etc.) surface here but don't block envelope acceptance. */
+  rebind?: RebindOutcome;
 };
 
 export type EnvelopeOutcome =
@@ -361,6 +368,21 @@ export async function processInbox(
         });
       }
 
+      // Auto-rebind so the buyer's wallet surfaces the post-trade
+      // allocation. Best-effort: if the wallet has no vanilla source
+      // leaf, the rebind fails and the contract shows "unbound" with a
+      // Claim button in PortfolioView — the user can fund and retry
+      // manually. Failures here never block envelope acceptance.
+      let rebind: RebindOutcome | undefined;
+      try {
+        rebind = await lazyRebindIfNeeded(outcome.contractId);
+      } catch (e) {
+        rebind = {
+          status: 'failed',
+          reason: `auto-rebind threw: ${e instanceof Error ? e.message : String(e)}`,
+        };
+      }
+
       const acceptResult: AcceptResult = {
         status: 'accepted',
         contractId: outcome.contractId,
@@ -368,6 +390,7 @@ export async function processInbox(
         name: outcome.name,
         newCommitIdHex: outcome.newCommitIdHex,
         mutated: !preexisting,
+        rebind,
       };
       outcomes.push({ id: meta.id, outcome: acceptResult });
 

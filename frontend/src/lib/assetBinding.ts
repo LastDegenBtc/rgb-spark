@@ -13,11 +13,18 @@
 // an ask when a re-sale path is detected.
 //
 // What "having a live binding" means: a pathTweak entry exists whose
-// `msg` matches either the contractId itself OR any transition's
-// commitId for that contract. We don't try to enforce "the latest"
-// here — the place() flow can resell against an older bound leaf if
-// the user explicitly picks one, and a future split/merge layer will
-// need a different model anyway.
+// `msg` matches the CHAIN HEAD commitId for this asset — either the
+// most-recently-added transition's commitId, or the contractId itself
+// if no transitions are recorded yet. PathTweaks pointing at older
+// transitions are considered STALE and excluded from `boundEntries`
+// (they remain in storage so the user keeps signing access for legacy
+// recovery, just aren't surfaced as the current allocation).
+//
+// Why head-only: every trade adds a transition; the buyer's actual
+// post-trade allocation is at the new chain head, not the older binding
+// they had pre-trade. Summing all bindings would either double-count
+// (buyer's old + new) or show stale state (buyer's old, no new) — both
+// wrong. Filtering to head matches what the chain actually says.
 
 import { ensureSparkCoreReady } from './sparkCore';
 import { listPathTweaks, type PathTweakEntry } from './rgbAwareSigner';
@@ -51,26 +58,34 @@ function hexToBytes(hex: string): Uint8Array {
 }
 
 /**
- * Set of 32-byte commit ids for an asset: the contractId itself plus
- * every known transition's commitId. A pathTweak whose `msg` is in this
- * set is bound to this asset.
+ * The chain-head commitId for an asset: the most-recently-added
+ * transition's commitId, or the contractId itself if no transitions
+ * are recorded. A pathTweak whose `msg` equals this is "active"; any
+ * other matching the asset is stale.
  */
-function bindingCommitIds(contract: StashContract, transitions: StashTransition[]): Set<string> {
-  const ids = new Set<string>();
-  ids.add(contract.contractId.toLowerCase());
-  for (const t of transitions) ids.add(t.commitId.toLowerCase());
-  return ids;
+function headCommitId(
+  contract: StashContract,
+  latestTransition: StashTransition | null,
+): string {
+  return (latestTransition ? latestTransition.commitId : contract.contractId).toLowerCase();
 }
 
 export interface BindingScan {
   contract: StashContract;
   transitions: StashTransition[];
-  /** Most-recently-added transition. Heuristic for "chain head" in the
-   *  v0 linear-chain world. Null if the asset is still at genesis. */
+  /** Most-recently-added transition. Chain head in the v0 linear-chain
+   *  world. Null if the asset is still at genesis. */
   latestTransition: StashTransition | null;
-  /** PathTweak entries whose msg is bindable to this asset. Multiple
-   *  entries can coexist if the user minted several leaves over time. */
+  /** PathTweak entries currently bound at the chain head. In single-
+   *  output flows there's at most one; multi-output flows (split-merge)
+   *  may surface several. Older bindings are excluded — see module
+   *  comment for the rationale. */
   boundEntries: Array<{ currentLeafId: string; entry: PathTweakEntry }>;
+  /** Stale pathTweaks for this asset — `msg` matches the contract or a
+   *  prior transition but NOT the chain head. Surfaced so a future UI
+   *  can offer recovery (sweep the underlying sats) instead of leaving
+   *  them silently filtered out. */
+  staleEntries: Array<{ currentLeafId: string; entry: PathTweakEntry }>;
 }
 
 /**
@@ -87,12 +102,27 @@ export function scanBinding(contractId: string): BindingScan | null {
     : [...transitions].sort(
         (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt),
       )[0];
-  const commitIds = bindingCommitIds(contract, transitions);
+  const head = headCommitId(contract, latestTransition);
+  // All commitIds for this asset (contract + every transition) so we
+  // can sort entries into bound-at-head vs stale.
+  const allCommitIds = new Set<string>();
+  allCommitIds.add(contract.contractId.toLowerCase());
+  for (const t of transitions) allCommitIds.add(t.commitId.toLowerCase());
+
   const all = listPathTweaks();
-  const boundEntries = all
-    .filter((t) => commitIds.has(bytesToHex(t.msg).toLowerCase()))
-    .map(({ currentLeafId, ...rest }) => ({ currentLeafId, entry: rest }));
-  return { contract, transitions, latestTransition, boundEntries };
+  const boundEntries: BindingScan['boundEntries'] = [];
+  const staleEntries: BindingScan['staleEntries'] = [];
+  for (const t of all) {
+    const msgHex = bytesToHex(t.msg).toLowerCase();
+    if (!allCommitIds.has(msgHex)) continue;
+    const { currentLeafId, ...rest } = t;
+    if (msgHex === head) {
+      boundEntries.push({ currentLeafId, entry: rest });
+    } else {
+      staleEntries.push({ currentLeafId, entry: rest });
+    }
+  }
+  return { contract, transitions, latestTransition, boundEntries, staleEntries };
 }
 
 /**
