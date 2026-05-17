@@ -9,6 +9,7 @@
     "info": "tsx src/cli/info.ts",
     "claim": "tsx src/cli/claim-deposits.ts",
     "scenario:smoke": "tsx src/cli/run-scenario.ts smoke",
+    "scenario:wasm": "tsx src/cli/run-scenario.ts wasm-smoke",
     "scenario:happy": "tsx src/cli/run-scenario.ts happy-path-trade",
     "test": "vitest run",
     "test:watch": "vitest",

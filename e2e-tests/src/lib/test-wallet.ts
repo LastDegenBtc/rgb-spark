@@ -120,8 +120,21 @@ export async function createTestWallet(init: TestWalletInit): Promise<TestWallet
       await wallet.cleanupConnections().catch(() => undefined)
     },
     async getAvailableBalance() {
-      const { balance } = await wallet.getBalance()
-      return balance
+      // SDK 0.7.x: `balance` is marked @deprecated and returns 0 in
+      // some boot states even though leaves are actually available.
+      // The current source of truth is `satsBalance.available`.
+      // Belt-and-suspenders: if the SDK also short-changes that
+      // field, fall back to summing live leaves.
+      const r = (await wallet.getBalance()) as unknown as {
+        satsBalance?: { available?: bigint }
+        balance?: bigint
+      }
+      const sdkAvailable = r.satsBalance?.available ?? r.balance ?? 0n
+      if (sdkAvailable > 0n) return sdkAvailable
+      const leaves = await wallet.getLeaves(true)
+      return leaves
+        .filter((l) => String(l.status ?? '') === 'AVAILABLE')
+        .reduce((acc, l) => acc + BigInt(Number(l.value ?? 0)), 0n)
     },
     async getLeaves() {
       const leaves = await wallet.getLeaves(true)
