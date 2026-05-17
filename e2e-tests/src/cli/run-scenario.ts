@@ -5,10 +5,11 @@
 // formats it for console output and exits with the right code.
 
 import { loadEnv } from '../env.ts'
-import { attachGlobalLocalStorage } from '../lib/storage-polyfill.ts'
+import { attachGlobalLocalStorage, patchBigIntToJson } from '../lib/storage-polyfill.ts'
 import { createTestWallet, type TestWallet } from '../lib/test-wallet.ts'
 
 attachGlobalLocalStorage()
+patchBigIntToJson()
 
 export interface ScenarioContext {
   funding: TestWallet

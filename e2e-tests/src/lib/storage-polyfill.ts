@@ -59,3 +59,26 @@ export function attachGlobalLocalStorage(): void {
     configurable: false,
   })
 }
+
+/** Node + JSON.stringify don't know how to serialize a BigInt — the
+ *  Spark SDK's gRPC event-stream payloads include them (transfer
+ *  amounts, balances, timestamps). Without this monkey-patch the SDK's
+ *  internal event handler throws "Do not know how to serialize a
+ *  BigInt" on EVERY event, silently dropping every claim signal —
+ *  which is precisely why mainnet HTLC swaps timeout at the claim
+ *  step inside this harness. The browser side doesn't hit this
+ *  because the SDK uses a different serializer there.
+ *
+ *  Call once at process boot, before importing any SDK module. */
+export function patchBigIntToJson(): void {
+  if (typeof (BigInt.prototype as unknown as { toJSON?: unknown }).toJSON === 'function') {
+    return
+  }
+  Object.defineProperty(BigInt.prototype, 'toJSON', {
+    value: function () {
+      return this.toString()
+    },
+    writable: true,
+    configurable: true,
+  })
+}

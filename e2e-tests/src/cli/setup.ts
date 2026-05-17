@@ -11,10 +11,11 @@
 
 import { randomBytes } from 'node:crypto'
 import { loadEnv, patchEnv } from '../env.ts'
-import { attachGlobalLocalStorage } from '../lib/storage-polyfill.ts'
+import { attachGlobalLocalStorage, patchBigIntToJson } from '../lib/storage-polyfill.ts'
 import { createTestWallet } from '../lib/test-wallet.ts'
 
 attachGlobalLocalStorage()
+patchBigIntToJson()
 
 async function main() {
   let env = loadEnv()

@@ -9,10 +9,11 @@
 // claim everything we can.
 
 import { loadEnv } from '../env.ts'
-import { attachGlobalLocalStorage } from '../lib/storage-polyfill.ts'
+import { attachGlobalLocalStorage, patchBigIntToJson } from '../lib/storage-polyfill.ts'
 import { createTestWallet } from '../lib/test-wallet.ts'
 
 attachGlobalLocalStorage()
+patchBigIntToJson()
 
 interface SparkWithDeposit {
   getUnusedDepositAddresses: () => Promise<string[]>
