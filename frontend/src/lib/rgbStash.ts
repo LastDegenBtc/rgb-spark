@@ -226,6 +226,11 @@ export function getContractById(contractId: string): StashContract | undefined {
   return state.contracts.find((c) => c.contractId === contractId);
 }
 
+export function getTransitionByCommitId(commitId: string): StashTransition | undefined {
+  const k = commitId.toLowerCase();
+  return state.transitions.find((t) => t.commitId.toLowerCase() === k);
+}
+
 /** Subscribe to in-memory changes. Returns an unsubscribe function. */
 export function subscribeStash(l: Listener): () => void {
   listeners.add(l);

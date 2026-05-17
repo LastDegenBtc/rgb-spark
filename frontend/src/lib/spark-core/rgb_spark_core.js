@@ -658,6 +658,75 @@ export function niaTransitionOutputs(transition_hex) {
 }
 
 /**
+ * Return the distinct opids (32-byte hex) that a transition consumes
+ * — one entry per unique `input.op`, stable insertion order. For a
+ * linear single-input transition this returns a 1-element vec; for
+ * a multi-input merge it returns N. The caller (typically the
+ * settlement inbox in the wallet frontend) uses these to walk a chain
+ * backwards through local stash entries until reaching the genesis
+ * opid, then hands the ordered chain to `validateNiaChain`.
+ * @param {string} transition_hex
+ * @returns {string[]}
+ */
+export function niaTransitionPrevOpids(transition_hex) {
+    const ptr0 = passStringToWasm0(transition_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.niaTransitionPrevOpids(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayJsValueFromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+    return v2;
+}
+
+/**
+ * Validate an arbitrary-depth NIA chain: genesis → T_1 → T_2 → … → T_n.
+ *
+ * `chain_transitions_hex` is the ordered list of transitions starting
+ * from the one that consumes from the genesis (T_1) and ending with
+ * the newest (T_n). The validator re-runs the rgb-consensus schema
+ * check on every link AND verifies each link consumes from the prior
+ * op in the chain (genesis for T_1, T_{i-1} for T_i). Returns
+ * `T_n.id()` if everything validates.
+ *
+ * Supports only linear chains: every input of T_i must point at the
+ * same prior opid (T_{i-1}). Multi-input merges and DAG branches are
+ * rejected with an explicit error so the caller can fall back. For a
+ * single-link chain this is equivalent to `validateNiaTransition`;
+ * for a two-link chain it matches `validateNiaTransitionFromPrev`.
+ *
+ * Same trust posture as the other validators: no L1 witness, no
+ * `ResolveWitness` — Spark replaces the transport layer (see
+ * `feedback_no_synthetic_l1_witness`).
+ * @param {string[]} chain_transitions_hex
+ * @param {string} prev_genesis_hex
+ * @returns {string}
+ */
+export function validateNiaChain(chain_transitions_hex, prev_genesis_hex) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const ptr0 = passArrayJsValueToWasm0(chain_transitions_hex, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(prev_genesis_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.validateNiaChain(ptr0, len0, ptr1, len1);
+        var ptr3 = ret[0];
+        var len3 = ret[1];
+        if (ret[3]) {
+            ptr3 = 0; len3 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+    }
+}
+
+/**
  * Decode + validate a strict-encoded NIA genesis consignment (hex).
  * Returns the contractId (32-byte hex) extracted from the validated
  * consignment, so the receiver can compare it against the `msgHex`

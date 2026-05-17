@@ -1131,6 +1131,171 @@ pub fn validate_nia_transition_from_prev(
     Ok(hex::encode(transition.id().to_byte_array()))
 }
 
+/// Validate an arbitrary-depth NIA chain: genesis → T_1 → T_2 → … → T_n.
+///
+/// `chain_transitions_hex` is the ordered list of transitions starting
+/// from the one that consumes from the genesis (T_1) and ending with
+/// the newest (T_n). The validator re-runs the rgb-consensus schema
+/// check on every link AND verifies each link consumes from the prior
+/// op in the chain (genesis for T_1, T_{i-1} for T_i). Returns
+/// `T_n.id()` if everything validates.
+///
+/// Supports only linear chains: every input of T_i must point at the
+/// same prior opid (T_{i-1}). Multi-input merges and DAG branches are
+/// rejected with an explicit error so the caller can fall back. For a
+/// single-link chain this is equivalent to `validateNiaTransition`;
+/// for a two-link chain it matches `validateNiaTransitionFromPrev`.
+///
+/// Same trust posture as the other validators: no L1 witness, no
+/// `ResolveWitness` — Spark replaces the transport layer (see
+/// `feedback_no_synthetic_l1_witness`).
+#[wasm_bindgen(js_name = validateNiaChain)]
+pub fn validate_nia_chain(
+    chain_transitions_hex: Vec<String>,
+    prev_genesis_hex: &str,
+) -> Result<String, JsError> {
+    if chain_transitions_hex.is_empty() {
+        return Err(JsError::new("validate_nia_chain: empty chain"));
+    }
+
+    let g_bytes = hex::decode(prev_genesis_hex).map_err(map_err("prev_genesis hex decode"))?;
+    let g_confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(g_bytes)
+        .map_err(map_err("prev_genesis size limit"))?;
+    let genesis_consignment =
+        Consignment::<false>::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(g_confined)
+            .map_err(map_err("strict decode prev_genesis"))?;
+
+    let genesis = genesis_consignment.genesis();
+    let contract_id = genesis_consignment.contract_id();
+    let genesis_opid = genesis.id();
+
+    let mut transitions: Vec<Transition> = Vec::with_capacity(chain_transitions_hex.len());
+    for (idx, hex_str) in chain_transitions_hex.iter().enumerate() {
+        let bytes = hex::decode(hex_str).map_err(|e| {
+            JsError::new(&format!("transition[{idx}] hex decode: {e}"))
+        })?;
+        let confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(bytes)
+            .map_err(|e| JsError::new(&format!("transition[{idx}] size limit: {e}")))?;
+        let t = Transition::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(confined)
+            .map_err(|e| JsError::new(&format!("transition[{idx}] strict decode: {e}")))?;
+        if t.contract_id != contract_id {
+            return Err(JsError::new(&format!(
+                "transition[{idx}].contract_id {} != prev_genesis.contract_id {}",
+                t.contract_id, contract_id
+            )));
+        }
+        transitions.push(t);
+    }
+
+    let schema = NonInflatableAsset::schema();
+    let types = NonInflatableAsset::types();
+    let scripts = NonInflatableAsset::scripts();
+    let contract_state = Rc::new(RefCell::new(MemContract::init((&schema, contract_id))));
+
+    let witness_txid = Txid::strict_dumb();
+    let witness_ord = WitnessOrd::strict_dumb();
+    let bundle_id = BundleId::strict_dumb();
+
+    schema
+        .validate_state(
+            &types,
+            &scripts,
+            genesis,
+            OrdOpRef::Genesis(genesis),
+            contract_state.clone(),
+            &BTreeMap::new(),
+        )
+        .map_err(|e| JsError::new(&format!("genesis re-validation: {e:?}")))?;
+
+    for i in 0..transitions.len() {
+        let prev_opid = if i == 0 { genesis_opid } else { transitions[i - 1].id() };
+
+        let mut prev_state: BTreeMap<AssignmentType, Vec<RevealedState>> = BTreeMap::new();
+        // Collect inputs by value so the loop body can also borrow
+        // `transitions[i - 1]` immutably. `Opout` is a small POD
+        // (32-byte opid + ty + index) — cheap to clone.
+        let inputs: Vec<_> = transitions[i].inputs.iter().cloned().collect();
+        for input in &inputs {
+            if input.op != prev_opid {
+                return Err(JsError::new(&format!(
+                    "transition[{i}] input opid {} does not match expected prev_opid {} \
+                     (linear chains only — multi-input merges not supported)",
+                    input.op, prev_opid
+                )));
+            }
+            let state = if i == 0 {
+                let typed = genesis.assignments.get(&input.ty).ok_or_else(|| {
+                    JsError::new(&format!(
+                        "transition[{i}] genesis missing assignment type {}",
+                        input.ty
+                    ))
+                })?;
+                let revealed = typed.to_revealed_assign_at(input.no, None).map_err(|_| {
+                    JsError::new(&format!("transition[{i}] input out of range: {input}"))
+                })?;
+                let (_seal, st) = revealed.into_revealed().ok_or_else(|| {
+                    JsError::new(&format!("transition[{i}] input not revealed: {input}"))
+                })?;
+                st
+            } else {
+                let typed = transitions[i - 1].assignments.get(&input.ty).ok_or_else(|| {
+                    JsError::new(&format!(
+                        "transition[{i}] prev_transition missing assignment type {}",
+                        input.ty
+                    ))
+                })?;
+                let revealed = typed.to_revealed_assign_at(input.no, None).map_err(|_| {
+                    JsError::new(&format!("transition[{i}] input out of range: {input}"))
+                })?;
+                let (_seal, st) = revealed.into_revealed().ok_or_else(|| {
+                    JsError::new(&format!("transition[{i}] input not revealed: {input}"))
+                })?;
+                st
+            };
+            prev_state.entry(input.ty).or_default().push(state);
+        }
+
+        schema
+            .validate_state(
+                &types,
+                &scripts,
+                genesis,
+                OrdOpRef::Transition(&transitions[i], witness_txid, witness_ord, bundle_id),
+                contract_state.clone(),
+                &prev_state,
+            )
+            .map_err(|e| JsError::new(&format!("transition[{i}] validation: {e:?}")))?;
+    }
+
+    let last = transitions.last().expect("non-empty checked above");
+    Ok(hex::encode(last.id().to_byte_array()))
+}
+
+/// Return the distinct opids (32-byte hex) that a transition consumes
+/// — one entry per unique `input.op`, stable insertion order. For a
+/// linear single-input transition this returns a 1-element vec; for
+/// a multi-input merge it returns N. The caller (typically the
+/// settlement inbox in the wallet frontend) uses these to walk a chain
+/// backwards through local stash entries until reaching the genesis
+/// opid, then hands the ordered chain to `validateNiaChain`.
+#[wasm_bindgen(js_name = niaTransitionPrevOpids)]
+pub fn nia_transition_prev_opids(transition_hex: &str) -> Result<Vec<String>, JsError> {
+    let bytes = hex::decode(transition_hex).map_err(map_err("transition hex decode"))?;
+    let confined = Confined::<Vec<u8>, 0, CONSIGNMENT_MAX_LEN>::try_from(bytes)
+        .map_err(map_err("transition size limit"))?;
+    let transition = Transition::from_strict_serialized::<CONSIGNMENT_MAX_LEN>(confined)
+        .map_err(map_err("strict decode transition"))?;
+
+    let mut out: Vec<String> = Vec::new();
+    for input in &transition.inputs {
+        let h = hex::encode(input.op.to_byte_array());
+        if !out.contains(&h) {
+            out.push(h);
+        }
+    }
+    Ok(out)
+}
+
 // ---- helpers ----
 
 fn parse_pk(s: &str, field: &str) -> Result<CompressedPk, JsError> {
@@ -1487,6 +1652,204 @@ mod tests {
         .expect("validate T_2 on T_1");
         assert_eq!(validated, t2.commit_id_hex,
             "validator-returned commit_id must equal T_2.id()");
+    }
+
+    #[test]
+    fn validate_nia_chain_length_one_matches_validate_nia_transition() {
+        // n=1: single transition consuming directly from genesis. Must
+        // return T_1.id() identically to the legacy validateNiaTransition.
+        let issued = issue_nia_contract("CH1", "Chain-1", 500, FIXTURE_TXID, 0, 1_700_000_500)
+            .expect("issuance");
+        let t1 = build_nia_transition(
+            &issued.consignment_hex,
+            0,
+            500,
+            "1f29d0a35d36e3f9f44b94be77ba3f7e74e2b97ee8f57edf6f111d2d6f8a4c10",
+            1,
+        )
+        .expect("build T_1");
+
+        let via_chain = validate_nia_chain(
+            vec![t1.transition_hex.clone()],
+            &issued.consignment_hex,
+        )
+        .expect("chain length 1");
+        let via_legacy = validate_nia_transition(&t1.transition_hex, &issued.consignment_hex)
+            .expect("legacy validate");
+        assert_eq!(via_chain, via_legacy);
+        assert_eq!(via_chain, t1.commit_id_hex);
+    }
+
+    #[test]
+    fn validate_nia_chain_length_two_matches_validate_from_prev() {
+        // n=2: genesis → T_1 → T_2. Equivalent to validate_nia_transition_from_prev.
+        let issued = issue_nia_contract("CH2", "Chain-2", 500, FIXTURE_TXID, 0, 1_700_000_501)
+            .expect("issuance");
+        let t1 = build_nia_transition(
+            &issued.consignment_hex,
+            0,
+            500,
+            "1f29d0a35d36e3f9f44b94be77ba3f7e74e2b97ee8f57edf6f111d2d6f8a4c10",
+            1,
+        )
+        .expect("build T_1");
+        let t2 = build_nia_transition_from_prev(
+            &t1.transition_hex,
+            &issued.consignment_hex,
+            0,
+            500,
+            "2f29d0a35d36e3f9f44b94be77ba3f7e74e2b97ee8f57edf6f111d2d6f8a4c10",
+            2,
+        )
+        .expect("build T_2");
+
+        let via_chain = validate_nia_chain(
+            vec![t1.transition_hex.clone(), t2.transition_hex.clone()],
+            &issued.consignment_hex,
+        )
+        .expect("chain length 2");
+        let via_legacy = validate_nia_transition_from_prev(
+            &t2.transition_hex,
+            &t1.transition_hex,
+            &issued.consignment_hex,
+        )
+        .expect("legacy from_prev");
+        assert_eq!(via_chain, via_legacy);
+        assert_eq!(via_chain, t2.commit_id_hex);
+    }
+
+    #[test]
+    fn validate_nia_chain_length_three_validates_genesis_t1_t2_t3() {
+        // n=3: the case the legacy from_prev validator EXPLICITLY rejects
+        // (line 1071-1072 "chain longer than … not yet supported"). This is
+        // the load-bearing test for the WASM wrapper chain-depth limit fix
+        // documented in [[project_rgb_consensus_chain_depth_limit]].
+        let issued = issue_nia_contract("CH3", "Chain-3", 500, FIXTURE_TXID, 0, 1_700_000_502)
+            .expect("issuance");
+        let t1 = build_nia_transition(
+            &issued.consignment_hex,
+            0,
+            500,
+            "1f29d0a35d36e3f9f44b94be77ba3f7e74e2b97ee8f57edf6f111d2d6f8a4c10",
+            1,
+        )
+        .expect("build T_1");
+        let t2 = build_nia_transition_from_prev(
+            &t1.transition_hex,
+            &issued.consignment_hex,
+            0,
+            500,
+            "2f29d0a35d36e3f9f44b94be77ba3f7e74e2b97ee8f57edf6f111d2d6f8a4c10",
+            2,
+        )
+        .expect("build T_2");
+        // T_3 consumes T_2 — the third hop. Built via the same from_prev
+        // helper since the builder API doesn't care about chain depth
+        // (only the validator does).
+        let t3 = build_nia_transition_from_prev(
+            &t2.transition_hex,
+            &issued.consignment_hex,
+            0,
+            500,
+            "3f29d0a35d36e3f9f44b94be77ba3f7e74e2b97ee8f57edf6f111d2d6f8a4c10",
+            3,
+        )
+        .expect("build T_3");
+
+        let validated = validate_nia_chain(
+            vec![
+                t1.transition_hex.clone(),
+                t2.transition_hex.clone(),
+                t3.transition_hex.clone(),
+            ],
+            &issued.consignment_hex,
+        )
+        .expect("chain length 3");
+        assert_eq!(validated, t3.commit_id_hex,
+            "validator-returned id must equal T_n.id()");
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn validate_nia_chain_rejects_broken_chain() {
+        // Two valid transitions but in the wrong order (T_2 before T_1)
+        // must be rejected: T_2 consumes T_1, not the genesis.
+        let issued = issue_nia_contract("BRK", "Broken chain", 500, FIXTURE_TXID, 0, 1_700_000_503)
+            .expect("issuance");
+        let t1 = build_nia_transition(
+            &issued.consignment_hex,
+            0,
+            500,
+            "1f29d0a35d36e3f9f44b94be77ba3f7e74e2b97ee8f57edf6f111d2d6f8a4c10",
+            1,
+        )
+        .expect("build T_1");
+        let t2 = build_nia_transition_from_prev(
+            &t1.transition_hex,
+            &issued.consignment_hex,
+            0,
+            500,
+            "2f29d0a35d36e3f9f44b94be77ba3f7e74e2b97ee8f57edf6f111d2d6f8a4c10",
+            2,
+        )
+        .expect("build T_2");
+        let r = validate_nia_chain(
+            vec![t2.transition_hex, t1.transition_hex],
+            &issued.consignment_hex,
+        );
+        assert!(r.is_err(), "out-of-order chain must be rejected");
+    }
+
+    #[test]
+    fn nia_transition_prev_opids_points_at_genesis_for_t1() {
+        // T_1 consumes from the genesis → prev_opids must be exactly
+        // [genesisOpId]. The TS-side stash walker uses this to know when
+        // it has reached the root of the chain.
+        let issued =
+            issue_nia_contract("PRV", "Prev opids", 500, FIXTURE_TXID, 0, 1_700_000_504)
+                .expect("issuance");
+        let t1 = build_nia_transition(
+            &issued.consignment_hex,
+            0,
+            500,
+            "1f29d0a35d36e3f9f44b94be77ba3f7e74e2b97ee8f57edf6f111d2d6f8a4c10",
+            1,
+        )
+        .expect("build T_1");
+        let prev_opids = nia_transition_prev_opids(&t1.transition_hex).expect("prev opids");
+        assert_eq!(prev_opids.len(), 1);
+        assert_eq!(
+            prev_opids[0], issued.contract_id_hex,
+            "T_1's only prev opid is the contract / genesis opid"
+        );
+    }
+
+    #[test]
+    fn nia_transition_prev_opids_points_at_t1_for_t2() {
+        // T_2 consumes from T_1 → prev_opids must be exactly [T_1.id()].
+        // This is the recursive step the TS walker uses for depth > 1.
+        let issued =
+            issue_nia_contract("PR2", "Prev opids 2", 500, FIXTURE_TXID, 0, 1_700_000_505)
+                .expect("issuance");
+        let t1 = build_nia_transition(
+            &issued.consignment_hex,
+            0,
+            500,
+            "1f29d0a35d36e3f9f44b94be77ba3f7e74e2b97ee8f57edf6f111d2d6f8a4c10",
+            1,
+        )
+        .expect("build T_1");
+        let t2 = build_nia_transition_from_prev(
+            &t1.transition_hex,
+            &issued.consignment_hex,
+            0,
+            500,
+            "2f29d0a35d36e3f9f44b94be77ba3f7e74e2b97ee8f57edf6f111d2d6f8a4c10",
+            2,
+        )
+        .expect("build T_2");
+        let prev_opids = nia_transition_prev_opids(&t2.transition_hex).expect("prev opids");
+        assert_eq!(prev_opids, vec![t1.commit_id_hex]);
     }
 
     #[cfg(target_arch = "wasm32")]

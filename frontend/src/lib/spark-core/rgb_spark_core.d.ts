@@ -223,6 +223,39 @@ export function niaGenesisMetadata(consignment_hex: string): NiaGenesisMetadata;
 export function niaTransitionOutputs(transition_hex: string): string[];
 
 /**
+ * Return the distinct opids (32-byte hex) that a transition consumes
+ * — one entry per unique `input.op`, stable insertion order. For a
+ * linear single-input transition this returns a 1-element vec; for
+ * a multi-input merge it returns N. The caller (typically the
+ * settlement inbox in the wallet frontend) uses these to walk a chain
+ * backwards through local stash entries until reaching the genesis
+ * opid, then hands the ordered chain to `validateNiaChain`.
+ */
+export function niaTransitionPrevOpids(transition_hex: string): string[];
+
+/**
+ * Validate an arbitrary-depth NIA chain: genesis → T_1 → T_2 → … → T_n.
+ *
+ * `chain_transitions_hex` is the ordered list of transitions starting
+ * from the one that consumes from the genesis (T_1) and ending with
+ * the newest (T_n). The validator re-runs the rgb-consensus schema
+ * check on every link AND verifies each link consumes from the prior
+ * op in the chain (genesis for T_1, T_{i-1} for T_i). Returns
+ * `T_n.id()` if everything validates.
+ *
+ * Supports only linear chains: every input of T_i must point at the
+ * same prior opid (T_{i-1}). Multi-input merges and DAG branches are
+ * rejected with an explicit error so the caller can fall back. For a
+ * single-link chain this is equivalent to `validateNiaTransition`;
+ * for a two-link chain it matches `validateNiaTransitionFromPrev`.
+ *
+ * Same trust posture as the other validators: no L1 witness, no
+ * `ResolveWitness` — Spark replaces the transport layer (see
+ * `feedback_no_synthetic_l1_witness`).
+ */
+export function validateNiaChain(chain_transitions_hex: string[], prev_genesis_hex: string): string;
+
+/**
  * Decode + validate a strict-encoded NIA genesis consignment (hex).
  * Returns the contractId (32-byte hex) extracted from the validated
  * consignment, so the receiver can compare it against the `msgHex`
@@ -288,6 +321,7 @@ export interface InitOutput {
     readonly issueNiaContract: (a: number, b: number, c: number, d: number, e: bigint, f: number, g: number, h: number, i: bigint) => [number, number, number];
     readonly niaGenesisMetadata: (a: number, b: number) => [number, number, number];
     readonly niaTransitionOutputs: (a: number, b: number) => [number, number, number, number];
+    readonly niaTransitionPrevOpids: (a: number, b: number) => [number, number, number, number];
     readonly niagenesismetadata_contractId: (a: number) => [number, number];
     readonly niagenesismetadata_name: (a: number) => [number, number];
     readonly niagenesismetadata_supply: (a: number) => [number, number];
@@ -301,6 +335,7 @@ export interface InitOutput {
     readonly sparkutkproofjs_new: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly sparkutkproofjs_operator: (a: number) => [number, number];
     readonly sparkutkproofjs_uBase: (a: number) => [number, number];
+    readonly validateNiaChain: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly validateNiaConsignment: (a: number, b: number) => [number, number, number, number];
     readonly validateNiaTransition: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly validateNiaTransitionFromPrev: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];

@@ -15,6 +15,7 @@ export const deriveVerifyingKey: (a: number, b: number, c: number, d: number, e:
 export const issueNiaContract: (a: number, b: number, c: number, d: number, e: bigint, f: number, g: number, h: number, i: bigint) => [number, number, number];
 export const niaGenesisMetadata: (a: number, b: number) => [number, number, number];
 export const niaTransitionOutputs: (a: number, b: number) => [number, number, number, number];
+export const niaTransitionPrevOpids: (a: number, b: number) => [number, number, number, number];
 export const niagenesismetadata_contractId: (a: number) => [number, number];
 export const niagenesismetadata_name: (a: number) => [number, number];
 export const niagenesismetadata_supply: (a: number) => [number, number];
@@ -28,6 +29,7 @@ export const sparkutkproofjs_encode: (a: number) => [number, number, number, num
 export const sparkutkproofjs_new: (a: number, b: number, c: number, d: number) => [number, number, number];
 export const sparkutkproofjs_operator: (a: number) => [number, number];
 export const sparkutkproofjs_uBase: (a: number) => [number, number];
+export const validateNiaChain: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const validateNiaConsignment: (a: number, b: number) => [number, number, number, number];
 export const validateNiaTransition: (a: number, b: number, c: number, d: number) => [number, number, number, number];
 export const validateNiaTransitionFromPrev: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];

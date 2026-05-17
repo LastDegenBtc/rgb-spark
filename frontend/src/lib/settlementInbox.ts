@@ -22,14 +22,14 @@
 //     buyer atomically received that leaf — that's a separate
 //     out-of-band confirmation (the buyer's own HTLC settlement log).
 
-import { ensureSparkCoreReady } from './sparkCore';
+import { ensureSparkCoreReady, type SparkCore } from './sparkCore';
 import {
   listConsignments,
   fetchConsignment,
   ackConsignment,
   type ConsignmentMeta,
 } from './consignmentRelay';
-import { addContract, addTransition, getContractById } from './rgbStash';
+import { addContract, addTransition, getContractById, getTransitionByCommitId } from './rgbStash';
 import { verifyEnvelope, type SignedEnvelopeV4 } from './envelopeSign';
 import { lazyRebindIfNeeded, type RebindOutcome } from './assetBinding';
 
@@ -101,6 +101,45 @@ function isSettlementEnvelope(env: unknown): env is ParsedSettlementEnvelope {
   );
 }
 
+/** Hard cap on chain depth we'll attempt to reconstruct via stash. A
+ *  64-hop chain is multi-day trade-flow territory — well past anything
+ *  Phase 1C produces — and protects against pathological stash data. */
+const MAX_CHAIN_WALK_HOPS = 64;
+
+/**
+ * Walk backwards from `tipTransitionHex` through the local stash using
+ * `niaTransitionPrevOpids`, stopping when the next prev_opid equals the
+ * genesis opid (i.e. `contractId`). Returns the ordered chain
+ * `[T_1, T_2, …, tipTransitionHex]` if every hop is present in stash,
+ * or `null` if a hop is missing — in which case the caller falls back
+ * to a shallower validator. Only linear chains (1 prev_opid per
+ * transition) are supported; multi-input merges return `null`.
+ */
+function walkChainBackToGenesis(
+  core: SparkCore,
+  tipTransitionHex: string,
+  genesisOpidLower: string,
+): string[] | null {
+  const chain: string[] = [tipTransitionHex];
+  let current = tipTransitionHex;
+  for (let hop = 0; hop < MAX_CHAIN_WALK_HOPS; hop++) {
+    let opids: string[];
+    try {
+      opids = core.niaTransitionPrevOpids(current);
+    } catch {
+      return null;
+    }
+    if (opids.length !== 1) return null;
+    const prev = opids[0].toLowerCase();
+    if (prev === genesisOpidLower) return chain;
+    const prevEntry = getTransitionByCommitId(prev);
+    if (!prevEntry) return null;
+    chain.unshift(prevEntry.transitionHex);
+    current = prevEntry.transitionHex;
+  }
+  return null;
+}
+
 /**
  * Pure validator: takes raw bytes off the relay, runs every check, and
  * returns a structured outcome. No side effects — `processInbox` is the
@@ -167,8 +206,14 @@ export async function validateSettlementEnvelope(
   }
 
   // 3. Schema chain validation. Three modes by what the leafReference carries:
-  //    - depth-3 (prevTransitionHex + transitionHex + prevGenesisHex):
-  //      validate chain genesis → prev → new; msgHex must == prev.id().
+  //    - chain (prevTransitionHex + transitionHex + prevGenesisHex):
+  //      validate arbitrary-depth chain genesis → T_1 → … → T_{n-1} → T_n;
+  //      msgHex must == T_{n-1}.id() (the seller's pre-swap binding).
+  //      The chain is reconstructed by walking back from prevTransitionHex
+  //      through the local stash via niaTransitionPrevOpids until we reach
+  //      the genesis opid (== contractId). Stash misses fall back to the
+  //      legacy 3-op validator so single-hop trades still settle cleanly
+  //      even when the buyer hasn't seen the seller's earlier transitions.
   //    - depth-2 (transitionHex + prevGenesisHex): validate genesis → new;
   //      msgHex must == new.id().
   //    - depth-1 (consignmentHex only): genesis is the binding target;
@@ -177,15 +222,24 @@ export async function validateSettlementEnvelope(
   let prevCommitIdHex: string | undefined;
   try {
     if (leafRef.prevTransitionHex && leafRef.transitionHex && leafRef.prevGenesisHex) {
+      // Walk back from prevTransitionHex through stash to genesis. The
+      // walker stops when the next prev_opid equals the contractId (==
+      // genesis opid). If a hop is missing from stash it returns null
+      // and we fall back to the legacy 2-link validator.
+      const walked = walkChainBackToGenesis(
+        core,
+        leafRef.prevTransitionHex,
+        contractId.toLowerCase(),
+      );
+      const chain =
+        walked !== null
+          ? [...walked, leafRef.transitionHex]
+          : [leafRef.prevTransitionHex, leafRef.transitionHex];
       newCommitIdHex = core
-        .validateNiaTransitionFromPrev(
-          leafRef.transitionHex,
-          leafRef.prevTransitionHex,
-          leafRef.prevGenesisHex,
-        )
+        .validateNiaChain(chain, leafRef.prevGenesisHex)
         .toLowerCase();
       prevCommitIdHex = core
-        .validateNiaTransition(leafRef.prevTransitionHex, leafRef.prevGenesisHex)
+        .validateNiaChain(chain.slice(0, -1), leafRef.prevGenesisHex)
         .toLowerCase();
       if (leafRef.msgHex.toLowerCase() !== prevCommitIdHex) {
         return {
