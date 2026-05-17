@@ -1,0 +1,30 @@
+{
+  "name": "rgb-spark-e2e",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "End-to-end test harness for rgb-spark libs against mainnet Spark + the local consignment relay.",
+  "scripts": {
+    "setup": "tsx src/cli/setup.ts",
+    "info": "tsx src/cli/info.ts",
+    "claim": "tsx src/cli/claim-deposits.ts",
+    "scenario:smoke": "tsx src/cli/run-scenario.ts smoke",
+    "scenario:happy": "tsx src/cli/run-scenario.ts happy-path-trade",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@buildonspark/spark-sdk": "^0.7.17",
+    "@noble/curves": "^2.0.1",
+    "@scure/bip32": "^2.2.0",
+    "@scure/bip39": "^2.2.0",
+    "nostr-tools": "^2.23.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.3",
+    "tsx": "^4.20.0",
+    "typescript": "~6.0.2",
+    "vitest": "^4.1.6"
+  }
+}
