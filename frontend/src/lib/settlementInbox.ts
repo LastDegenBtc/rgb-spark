@@ -32,6 +32,7 @@ import {
 import { addContract, addTransition, getContractById, getTransitionByCommitId } from './rgbStash';
 import { verifyEnvelope, type SignedEnvelopeV4 } from './envelopeSign';
 import { lazyRebindIfNeeded, type RebindOutcome } from './assetBinding';
+import { listSparkLeaves } from './sparkWallet';
 
 const SETTLEMENT_KIND = 'settlement-consignment-v1';
 
@@ -44,6 +45,12 @@ export type AcceptResult = {
   /** Whether this envelope mutated the local stash (false on idempotent
    *  re-process where nothing new was added). */
   mutated: boolean;
+  /** The Spark leaf id in this wallet whose `verifyingPublicKey` matches
+   *  the envelope's `leafReference.verifyingPublicKey`. The rebind uses
+   *  it as the self-transfer source so the new bound leaf's u_base
+   *  traces back to the leaf the seller actually transferred to us via
+   *  HTLC — not a random vanilla one. The atomicity guarantee. */
+  claimedLeafId: string;
   /** Outcome of the post-accept auto-rebind. The buyer's leaf received
    *  via HTLC is invisible to the SDK's verifyKey filter — the buyer
    *  must mint a fresh self-bound leaf at the new chain head to surface
@@ -296,6 +303,35 @@ export async function validateSettlementEnvelope(
     };
   }
 
+  // 5. Atomicity check (F2 trustless gate): we must hold a Spark leaf
+  //    whose verifyingPublicKey matches the envelope's claim. If we
+  //    don't, we never actually received the seller's leaf via HTLC —
+  //    the trade didn't settle on Spark, and accepting the consignment
+  //    would let us claim RGB ownership of an asset we never paid for.
+  //    Reject. Pre-F2 wallets that rebind on a random vanilla leaf are
+  //    the exact bug this gate closes.
+  let claimedLeafId: string;
+  try {
+    const leaves = await listSparkLeaves();
+    const expected = leafRef.verifyingPublicKey.toLowerCase();
+    const match = leaves.find((l) => l.verifyingPublicKey.toLowerCase() === expected);
+    if (!match) {
+      return {
+        status: 'rejected',
+        reason:
+          `no leaf with verifyingPublicKey=${expected.slice(0, 12)}… in this wallet — ` +
+          `the HTLC swap that should have transferred the seller's leaf here never settled. ` +
+          `Refusing to bind RGB allocation to a leaf we don't actually hold.`,
+      };
+    }
+    claimedLeafId = match.id;
+  } catch (err) {
+    return {
+      status: 'rejected',
+      reason: `listSparkLeaves for atomicity check failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
   // All checks passed — stash population happens in processInbox (which
   // owns the side effects). Surface the data the caller needs.
   return {
@@ -304,6 +340,7 @@ export async function validateSettlementEnvelope(
     ticker,
     name,
     newCommitIdHex,
+    claimedLeafId,
     // `mutated` is filled in by processInbox after addContract/addTransition;
     // the validator can't know whether the entries pre-exist in stash.
     mutated: false,
@@ -423,13 +460,17 @@ export async function processInbox(
       }
 
       // Auto-rebind so the buyer's wallet surfaces the post-trade
-      // allocation. Best-effort: if the wallet has no vanilla source
-      // leaf, the rebind fails and the contract shows "unbound" with a
-      // Claim button in PortfolioView — the user can fund and retry
-      // manually. Failures here never block envelope acceptance.
+      // allocation. Pin the source to the claimed leaf (the one we
+      // received from the seller via HTLC, identified by matching
+      // verifyingPublicKey) — that's the F2 trustless guarantee. Falls
+      // back to the legacy vanilla-leaf picker only when no override
+      // is supplied (shouldn't happen post-F2 since the inbox rejects
+      // envelopes whose claimed leaf isn't in the wallet).
       let rebind: RebindOutcome | undefined;
       try {
-        rebind = await lazyRebindIfNeeded(outcome.contractId);
+        rebind = await lazyRebindIfNeeded(outcome.contractId, {
+          sourceLeafIdOverride: outcome.claimedLeafId,
+        });
       } catch (e) {
         rebind = {
           status: 'failed',
@@ -443,6 +484,7 @@ export async function processInbox(
         ticker: outcome.ticker,
         name: outcome.name,
         newCommitIdHex: outcome.newCommitIdHex,
+        claimedLeafId: outcome.claimedLeafId,
         mutated: !preexisting,
         rebind,
       };

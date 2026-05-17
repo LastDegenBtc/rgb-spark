@@ -195,7 +195,22 @@ export type RebindOutcome =
  * Returns a structured outcome so the caller can render status without
  * exception-driven control flow.
  */
-export async function lazyRebindIfNeeded(contractId: string): Promise<RebindOutcome> {
+export interface LazyRebindOptions {
+  /** F2 trustless gate: pin the self-transfer source to the specific
+   *  Spark leaf the buyer just received via HTLC (identified by
+   *  verifyingPublicKey match in the settlement inbox). The rebind
+   *  carries that leaf's u_base into the new bound leaf, so the
+   *  Spark-UTK chain across the trade traces back to actual ownership.
+   *  Without this override the picker falls back to "smallest vanilla
+   *  leaf", which lets a non-paying buyer fake binding to any leaf —
+   *  the bug surfaced 2026-05-17. */
+  sourceLeafIdOverride?: string;
+}
+
+export async function lazyRebindIfNeeded(
+  contractId: string,
+  opts?: LazyRebindOptions,
+): Promise<RebindOutcome> {
   try {
     const scan = scanBinding(contractId);
     if (!scan) {
@@ -332,12 +347,11 @@ export async function lazyRebindIfNeeded(contractId: string): Promise<RebindOutc
       }
     }
 
-    // Source leaf for the self-transfer. sprk.11c: pick the smallest
-    // vanilla leaf available — splitting via transferToSpark to an
-    // exact size isn't reliably triggered on mainnet (see
-    // [[reference-spark-leaf-denominations]]), so we accept whatever
-    // small leaf we have. The bound leaf will carry those sats as
-    // the per-swap handover; small = less overpay at HTLC time.
+    // Source leaf for the self-transfer. The trustless path is to
+    // CARRY OVER the leaf actually received from the seller via HTLC —
+    // the inbox passes its id as `sourceLeafIdOverride`. Falling back
+    // to "any vanilla leaf" lets non-paying buyers fake binding (the
+    // 2026-05-17 atomicity hole); the override is the load-bearing fix.
     const leaves = await listSparkLeaves();
     if (leaves.length === 0) {
       return {
@@ -345,21 +359,36 @@ export async function lazyRebindIfNeeded(contractId: string): Promise<RebindOutc
         reason: 'wallet has no Spark leaves to act as transfer carrier — fund first',
       };
     }
-    // Exclude leaves that ALREADY carry a binding — those are someone
-    // else's bound asset (or a stale binding for this same asset that
-    // would be lost by the transfer).
-    const all = listPathTweaks();
-    const boundLeafIds = new Set(all.map((t) => t.currentLeafId));
-    const vanillaLeaves = leaves.filter((l) => !boundLeafIds.has(l.id));
-    if (vanillaLeaves.length === 0) {
-      return {
-        status: 'no-source-leaf',
-        reason: 'every leaf in the wallet is already bound — nothing left to use as a vanilla carrier',
-      };
+    let sourceLeaf: SparkLeafRow;
+    if (opts?.sourceLeafIdOverride) {
+      const found = leaves.find((l) => l.id === opts.sourceLeafIdOverride);
+      if (!found) {
+        return {
+          status: 'no-source-leaf',
+          reason:
+            `sourceLeafIdOverride=${opts.sourceLeafIdOverride.slice(0, 12)}… not present in ` +
+            `current leaves — claimed leaf went missing between inbox accept and rebind. ` +
+            `Refusing to fall back to a random vanilla leaf (atomicity gate).`,
+        };
+      }
+      sourceLeaf = found;
+    } else {
+      // Legacy path: smallest vanilla leaf. Used only by direct UI
+      // triggers (PortfolioView Claim button when manually called),
+      // NOT by the settlement inbox post-F2.
+      const all = listPathTweaks();
+      const boundLeafIds = new Set(all.map((t) => t.currentLeafId));
+      const vanillaLeaves = leaves.filter((l) => !boundLeafIds.has(l.id));
+      if (vanillaLeaves.length === 0) {
+        return {
+          status: 'no-source-leaf',
+          reason: 'every leaf in the wallet is already bound — nothing left to use as a vanilla carrier',
+        };
+      }
+      sourceLeaf = vanillaLeaves.reduce(
+        (min, l) => (l.value < min.value ? l : min),
+      );
     }
-    const sourceLeaf: SparkLeafRow = vanillaLeaves.reduce(
-      (min, l) => (l.value < min.value ? l : min),
-    );
 
     const msgBytes = hexToBytes(newCommitIdHex);
     // v0 rebind uses single-output T_n+1, so consumeIndex is always 0.

@@ -442,8 +442,10 @@ export type SwapPhase =
   | 'locked'           // our lock is in; waiting for the other side
   | 'awaiting-counterparty'  // (seller) polling for buyer's lock; (buyer) polling for reveal
   | 'revealing'        // calling revealAndClaim
+  | 'awaiting-claim'   // (seller) preimage revealed, polling for claim to manifest
   | 'completed'        // swap settled on our side
   | 'expired'          // our lock returned to us (counterparty stalled)
+  | 'reveal-without-claim'  // (seller) preimage public but claim never landed — atomicity broken
   | 'failed';          // error state — see message + cause
 
 export interface SwapState {
@@ -465,9 +467,22 @@ export interface SwapState {
 export type StateCallback = (state: Readonly<SwapState>) => void;
 
 interface FlowResult {
-  outcome: 'completed' | 'expired' | 'failed';
+  outcome: 'completed' | 'expired' | 'failed' | 'reveal-without-claim';
   state: SwapState;
+  /** Buyer-side only: the leaf id that arrived in our wallet as a
+   *  result of the claim. Caller uses this to pin the RGB rebind to
+   *  the leaf actually received from the seller, instead of any
+   *  vanilla leaf — the load-bearing trustlessness guarantee. */
+  claimedLeafId?: string;
 }
+
+/** Default timeout for the post-reveal claim verification window.
+ *  3 minutes is well within the seller's 1-hour lock expiry but long
+ *  enough that the SDK's eventual-consistency claim of the buyer's leaf
+ *  has time to manifest under normal network conditions. Beyond this we
+ *  declare the swap broken (preimage public, claim unlanded) so the
+ *  caller never emits a settlement consignment for an unsettled trade. */
+const DEFAULT_CLAIM_VERIFY_MS = 3 * 60_000;
 
 const DEFAULT_POLL_MS = 3_000;
 
@@ -650,7 +665,30 @@ export async function runSellerFlow(
     }
   }
 
-  // Phase 3: reveal preimage, claim counterparty's payment.
+  // Phase 3: reveal preimage. `revealAndClaim` only BROADCASTS the
+  // preimage to the coordinator — the actual leaf claim is async on the
+  // SDK side. We need to verify it lands before declaring the swap
+  // completed; otherwise the caller (swapRunner) would fire the
+  // settlement auto-emit on an unfinished trade and the seller would
+  // give the asset away without receiving sats.
+  //
+  // Snapshot the available balance just before the reveal so the
+  // post-reveal poll can detect the delta arriving. Use the freshness-
+  // guaranteed `getBalance` (not the in-memory cache).
+  const sdkWallet = wallet as { getBalance: () => Promise<{ balance: bigint }> };
+  let balanceBefore: bigint;
+  try {
+    const r = await sdkWallet.getBalance();
+    balanceBefore = r.balance;
+  } catch (e) {
+    state.phase = 'failed';
+    state.cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+    state.message = `pre-reveal balance snapshot failed: ${state.cause}`;
+    state.updatedAt = nowIso();
+    params.onState({ ...state });
+    return { outcome: 'failed', state };
+  }
+
   state.phase = 'revealing';
   state.message = `revealing preimage to claim counterparty's ${params.expectedSatsFromBuyer} sat(s)`;
   state.updatedAt = nowIso();
@@ -667,9 +705,51 @@ export async function runSellerFlow(
     return { outcome: 'failed', state };
   }
 
-  state.phase = 'completed';
-  state.message = `swap completed — preimage revealed, counterparty's payment claimed`;
   state.revealedPreimageHex = bytesToHex(preimage);
+
+  // Phase 3.5: poll until the claim actually lands (our balance increases
+  // by expectedSatsFromBuyer) or the verify window elapses. The SDK
+  // documents `getBalance().balance` as the fresh-from-coordinator value,
+  // so each poll is authoritative.
+  state.phase = 'awaiting-claim';
+  state.message = `preimage revealed; awaiting claim of buyer's ${params.expectedSatsFromBuyer} sat(s) to land`;
+  state.updatedAt = nowIso();
+  params.onState({ ...state });
+
+  const claimDeadline = Date.now() + DEFAULT_CLAIM_VERIFY_MS;
+  const expectedSatsBig = BigInt(params.expectedSatsFromBuyer);
+  let claimVerified = false;
+  while (Date.now() < claimDeadline) {
+    let balanceNow: bigint;
+    try {
+      const r = await sdkWallet.getBalance();
+      balanceNow = r.balance;
+    } catch {
+      // Transient balance query failure; keep polling.
+      await sleep(pollInterval);
+      continue;
+    }
+    if (balanceNow >= balanceBefore + expectedSatsBig) {
+      claimVerified = true;
+      break;
+    }
+    await sleep(pollInterval);
+  }
+
+  if (!claimVerified) {
+    state.phase = 'reveal-without-claim';
+    state.cause =
+      `preimage public but claim of ${params.expectedSatsFromBuyer} sat(s) did not land within ` +
+      `${Math.round(DEFAULT_CLAIM_VERIFY_MS / 1000)}s. Buyer can still claim our asset off the public ` +
+      `preimage; the trade is atomically broken on our side. NOT emitting a settlement consignment.`;
+    state.message = state.cause;
+    state.updatedAt = nowIso();
+    params.onState({ ...state });
+    return { outcome: 'reveal-without-claim', state };
+  }
+
+  state.phase = 'completed';
+  state.message = `swap completed — preimage revealed, ${params.expectedSatsFromBuyer} sat(s) claimed`;
   state.updatedAt = nowIso();
   params.onState({ ...state });
   return { outcome: 'completed', state };
@@ -740,10 +820,40 @@ export async function resumeBuyerFlow(
     return { outcome: 'expired', state };
   }
 
+  return claimAndVerifyLeaf(wallet, revealed, state, params.onState, pollInterval);
+}
+
+/** Shared post-reveal helper for buyer flows (runBuyerFlow + resumeBuyerFlow).
+ *  Snapshots the wallet's leaf-id set, calls revealAndClaim, then polls
+ *  for a new leaf to materialize. Returns the new leaf's id so the
+ *  caller can pin the RGB rebind to it. */
+async function claimAndVerifyLeaf(
+  wallet: unknown,
+  revealed: Uint8Array,
+  state: SwapState,
+  onState: StateCallback,
+  pollInterval: number,
+): Promise<FlowResult> {
+  const sdkWallet = wallet as {
+    getLeaves: (b?: boolean) => Promise<Array<{ id: string }>>;
+  };
+  let leafIdsBefore: Set<string>;
+  try {
+    const before = await sdkWallet.getLeaves(true);
+    leafIdsBefore = new Set(before.map((l) => l.id));
+  } catch (e) {
+    state.phase = 'failed';
+    state.cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+    state.message = `pre-claim leaves snapshot failed: ${state.cause}`;
+    state.updatedAt = nowIso();
+    onState({ ...state });
+    return { outcome: 'failed', state };
+  }
+
   state.phase = 'revealing';
   state.message = `claiming asset with discovered preimage`;
   state.updatedAt = nowIso();
-  params.onState({ ...state });
+  onState({ ...state });
 
   try {
     await revealAndClaim(wallet, revealed);
@@ -752,16 +862,52 @@ export async function resumeBuyerFlow(
     state.cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
     state.message = `revealAndClaim failed: ${state.cause}`;
     state.updatedAt = nowIso();
-    params.onState({ ...state });
+    onState({ ...state });
+    return { outcome: 'failed', state };
+  }
+
+  state.revealedPreimageHex = bytesToHex(revealed);
+  state.phase = 'awaiting-claim';
+  state.message = `preimage applied; awaiting claimed leaf to land`;
+  state.updatedAt = nowIso();
+  onState({ ...state });
+
+  const claimDeadline = Date.now() + DEFAULT_CLAIM_VERIFY_MS;
+  let claimedLeafId: string | undefined;
+  while (Date.now() < claimDeadline) {
+    let after: Array<{ id: string }>;
+    try {
+      after = await sdkWallet.getLeaves(true);
+    } catch {
+      await sleep(pollInterval);
+      continue;
+    }
+    const newOnes = after.filter((l) => !leafIdsBefore.has(l.id));
+    if (newOnes.length > 0) {
+      claimedLeafId = newOnes[0].id;
+      break;
+    }
+    await sleep(pollInterval);
+  }
+
+  if (!claimedLeafId) {
+    state.phase = 'failed';
+    state.cause =
+      `preimage applied but no new leaf arrived within ` +
+      `${Math.round(DEFAULT_CLAIM_VERIFY_MS / 1000)}s. SDK may be stuck — ` +
+      `our sats lock will refund at expiry. Don't trust any RGB consignment ` +
+      `arriving for this trade since we have no leaf to bind it to.`;
+    state.message = state.cause;
+    state.updatedAt = nowIso();
+    onState({ ...state });
     return { outcome: 'failed', state };
   }
 
   state.phase = 'completed';
-  state.message = `swap completed — asset claimed from seller`;
-  state.revealedPreimageHex = bytesToHex(revealed);
+  state.message = `swap completed — asset claimed from seller (leaf ${claimedLeafId.slice(0, 8)}…)`;
   state.updatedAt = nowIso();
-  params.onState({ ...state });
-  return { outcome: 'completed', state };
+  onState({ ...state });
+  return { outcome: 'completed', state, claimedLeafId };
 }
 
 /**
@@ -868,29 +1014,7 @@ export async function runBuyerFlow(
     return { outcome: 'expired', state };
   }
 
-  // Phase 3: claim the seller's asset using the now-known preimage.
-  state.phase = 'revealing';
-  state.message = `claiming asset with discovered preimage`;
-  state.updatedAt = nowIso();
-  params.onState({ ...state });
-
-  try {
-    await revealAndClaim(wallet, revealed);
-  } catch (e) {
-    state.phase = 'failed';
-    state.cause = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
-    state.message = `revealAndClaim failed: ${state.cause}`;
-    state.updatedAt = nowIso();
-    params.onState({ ...state });
-    return { outcome: 'failed', state };
-  }
-
-  state.phase = 'completed';
-  state.message = `swap completed — asset claimed from seller`;
-  state.revealedPreimageHex = bytesToHex(revealed);
-  state.updatedAt = nowIso();
-  params.onState({ ...state });
-  return { outcome: 'completed', state };
+  return claimAndVerifyLeaf(wallet, revealed, state, params.onState, pollInterval);
 }
 
 // ----- Re-exported helpers -------------------------------------------------
