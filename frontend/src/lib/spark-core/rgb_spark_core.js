@@ -393,6 +393,54 @@ export function buildNiaTransitionFromPrev(prev_transition_hex, prev_genesis_hex
 }
 
 /**
+ * Build a NIA `transfer` transition that MERGES N inputs (from any
+ * number of distinct prior transitions) into a single output allocation
+ * equal to the sum of input amounts. Load-bearing primitive for the
+ * wallet's `lazyRebindIfNeeded` consolidation path: a buyer who
+ * accumulated two separate per-trade allocations (e.g. 1000 + 2000)
+ * fuses them into one fresh leaf carrying the total (3000).
+ *
+ * Parallel arrays `prev_transitions_hex` / `consume_indices` /
+ * `amounts_dec` MUST have equal length (== number of inputs). Each
+ * triple `(prev_transitions_hex[i], consume_indices[i], amounts_dec[i])`
+ * describes one input: the prior transition to consume from, the
+ * output index within it, and the amount allocated at that output.
+ * The function cross-checks `amounts_dec[i]` against the prior
+ * transition's actual stored value and fails fast on mismatch.
+ *
+ * `amounts_dec` are decimal-encoded u64 strings (dodge JS Number
+ * precision for amounts > 2^53). The output is `sum(amounts_dec)`.
+ *
+ * The schema validator independently enforces conservation
+ * (`sum(in) == sum(out)`) via AluVM. The pre-check here is a friendly
+ * error path for caller mistakes, not the trust boundary.
+ * @param {string} prev_genesis_hex
+ * @param {string[]} prev_transitions_hex
+ * @param {Uint32Array} consume_indices
+ * @param {string[]} amounts_dec
+ * @param {string} beneficiary_txid_hex
+ * @param {number} beneficiary_vout
+ * @returns {NiaTransition}
+ */
+export function buildNiaTransitionMerge(prev_genesis_hex, prev_transitions_hex, consume_indices, amounts_dec, beneficiary_txid_hex, beneficiary_vout) {
+    const ptr0 = passStringToWasm0(prev_genesis_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArrayJsValueToWasm0(prev_transitions_hex, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passArray32ToWasm0(consume_indices, wasm.__wbindgen_malloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passArrayJsValueToWasm0(amounts_dec, wasm.__wbindgen_malloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passStringToWasm0(beneficiary_txid_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ret = wasm.buildNiaTransitionMerge(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, beneficiary_vout);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return NiaTransition.__wrap(ret[0]);
+}
+
+/**
  * Multi-output sibling of `buildNiaTransition`. Builds a NIA
  * `transfer` transition consuming the `no`-th genesis assetOwner
  * assignment and allocating to N beneficiary seals with arbitrary
@@ -629,6 +677,35 @@ export function niaGenesisMetadata(consignment_hex) {
 }
 
 /**
+ * Return a transition's inputs as parallel `(op_hex, no)` arrays.
+ * `op_hex_out[i]` is the 32-byte hex opid the i-th input consumes;
+ * `no_out[i]` is the output index within that op. Insertion order
+ * matches the strict-encoded inputs set. Unlike `niaTransitionPrevOpids`
+ * this preserves per-input granularity (op AND no) so the caller can
+ * check whether a specific `(op, no)` was subsequently consumed — the
+ * load-bearing check for "is this allocation still live?" in the
+ * wallet's balance summation.
+ *
+ * Returns `[op_hex_array, no_strings_array]`: a 2-element wrapper so
+ * callers can zip the parallel arrays. `no` is stringified because
+ * wasm-bindgen's structured return types are heavyweight; the caller
+ * JS does `Number(s)`.
+ * @param {string} transition_hex
+ * @returns {string[]}
+ */
+export function niaTransitionInputs(transition_hex) {
+    const ptr0 = passStringToWasm0(transition_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.niaTransitionInputs(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayJsValueFromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+    return v2;
+}
+
+/**
  * Extract the per-output asset amounts from a strict-encoded NIA
  * `Transition` (hex). Returns one decimal string per output,
  * indexed by the output's position in `transition.assignments[OS_ASSET]`.
@@ -759,6 +836,56 @@ export function validateNiaConsignment(consignment_hex) {
         return getStringFromWasm0(ptr2, len2);
     } finally {
         wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * Validate an arbitrary-shape NIA DAG: a topologically-sorted set of
+ * transitions where each input may reference the genesis OR any
+ * earlier transition in the array. Supports both linear chains (every
+ * `T_i` consumes only `T_{i-1}`) and merges (a `T_i` consumes multiple
+ * earlier ops simultaneously) — superset of `validateNiaChain`. Returns
+ * `transitions[transitions.len() - 1].id()` if every link validates.
+ *
+ * Topo order is required: for every input `(op, no)` of `transitions[i]`,
+ * `op` must equal `genesis.id()` or `transitions[j].id()` for some
+ * `j < i`. Out-of-order inputs are rejected. Duplicate transitions in
+ * the array are not allowed.
+ *
+ * Use case: the wallet's `lazyRebindIfNeeded` produces a merge
+ * transition that consumes multiple earlier per-trade allocations
+ * (e.g. `1000` + `2000` → one fresh `3000` leaf at the new chain head).
+ * The buyer-side inbox accepts the resulting envelope by reconstructing
+ * every contributing chain from local stash, concatenating them into a
+ * single topologically-sorted array, appending the merge transition,
+ * and handing the result to this function.
+ *
+ * Same trust posture as the other validators: no L1 witness, no
+ * `ResolveWitness` — Spark replaces the transport layer.
+ * @param {string[]} transitions_hex
+ * @param {string} prev_genesis_hex
+ * @returns {string}
+ */
+export function validateNiaDag(transitions_hex, prev_genesis_hex) {
+    let deferred4_0;
+    let deferred4_1;
+    try {
+        const ptr0 = passArrayJsValueToWasm0(transitions_hex, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(prev_genesis_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.validateNiaDag(ptr0, len0, ptr1, len1);
+        var ptr3 = ret[0];
+        var len3 = ret[1];
+        if (ret[3]) {
+            ptr3 = 0; len3 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred4_0 = ptr3;
+        deferred4_1 = len3;
+        return getStringFromWasm0(ptr3, len3);
+    } finally {
+        wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
     }
 }
 

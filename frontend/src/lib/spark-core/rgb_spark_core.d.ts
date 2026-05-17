@@ -120,6 +120,31 @@ export function buildNiaTransition(genesis_hex: string, consume_index: number, a
 export function buildNiaTransitionFromPrev(prev_transition_hex: string, prev_genesis_hex: string, consume_index: number, amount: bigint, beneficiary_txid_hex: string, beneficiary_vout: number): NiaTransition;
 
 /**
+ * Build a NIA `transfer` transition that MERGES N inputs (from any
+ * number of distinct prior transitions) into a single output allocation
+ * equal to the sum of input amounts. Load-bearing primitive for the
+ * wallet's `lazyRebindIfNeeded` consolidation path: a buyer who
+ * accumulated two separate per-trade allocations (e.g. 1000 + 2000)
+ * fuses them into one fresh leaf carrying the total (3000).
+ *
+ * Parallel arrays `prev_transitions_hex` / `consume_indices` /
+ * `amounts_dec` MUST have equal length (== number of inputs). Each
+ * triple `(prev_transitions_hex[i], consume_indices[i], amounts_dec[i])`
+ * describes one input: the prior transition to consume from, the
+ * output index within it, and the amount allocated at that output.
+ * The function cross-checks `amounts_dec[i]` against the prior
+ * transition's actual stored value and fails fast on mismatch.
+ *
+ * `amounts_dec` are decimal-encoded u64 strings (dodge JS Number
+ * precision for amounts > 2^53). The output is `sum(amounts_dec)`.
+ *
+ * The schema validator independently enforces conservation
+ * (`sum(in) == sum(out)`) via AluVM. The pre-check here is a friendly
+ * error path for caller mistakes, not the trust boundary.
+ */
+export function buildNiaTransitionMerge(prev_genesis_hex: string, prev_transitions_hex: string[], consume_indices: Uint32Array, amounts_dec: string[], beneficiary_txid_hex: string, beneficiary_vout: number): NiaTransition;
+
+/**
  * Multi-output sibling of `buildNiaTransition`. Builds a NIA
  * `transfer` transition consuming the `no`-th genesis assetOwner
  * assignment and allocating to N beneficiary seals with arbitrary
@@ -206,6 +231,23 @@ export function issueNiaContract(ticker: string, name: string, supply: bigint, b
 export function niaGenesisMetadata(consignment_hex: string): NiaGenesisMetadata;
 
 /**
+ * Return a transition's inputs as parallel `(op_hex, no)` arrays.
+ * `op_hex_out[i]` is the 32-byte hex opid the i-th input consumes;
+ * `no_out[i]` is the output index within that op. Insertion order
+ * matches the strict-encoded inputs set. Unlike `niaTransitionPrevOpids`
+ * this preserves per-input granularity (op AND no) so the caller can
+ * check whether a specific `(op, no)` was subsequently consumed — the
+ * load-bearing check for "is this allocation still live?" in the
+ * wallet's balance summation.
+ *
+ * Returns `[op_hex_array, no_strings_array]`: a 2-element wrapper so
+ * callers can zip the parallel arrays. `no` is stringified because
+ * wasm-bindgen's structured return types are heavyweight; the caller
+ * JS does `Number(s)`.
+ */
+export function niaTransitionInputs(transition_hex: string): string[];
+
+/**
  * Extract the per-output asset amounts from a strict-encoded NIA
  * `Transition` (hex). Returns one decimal string per output,
  * indexed by the output's position in `transition.assignments[OS_ASSET]`.
@@ -271,6 +313,32 @@ export function validateNiaChain(chain_transitions_hex: string[], prev_genesis_h
 export function validateNiaConsignment(consignment_hex: string): string;
 
 /**
+ * Validate an arbitrary-shape NIA DAG: a topologically-sorted set of
+ * transitions where each input may reference the genesis OR any
+ * earlier transition in the array. Supports both linear chains (every
+ * `T_i` consumes only `T_{i-1}`) and merges (a `T_i` consumes multiple
+ * earlier ops simultaneously) — superset of `validateNiaChain`. Returns
+ * `transitions[transitions.len() - 1].id()` if every link validates.
+ *
+ * Topo order is required: for every input `(op, no)` of `transitions[i]`,
+ * `op` must equal `genesis.id()` or `transitions[j].id()` for some
+ * `j < i`. Out-of-order inputs are rejected. Duplicate transitions in
+ * the array are not allowed.
+ *
+ * Use case: the wallet's `lazyRebindIfNeeded` produces a merge
+ * transition that consumes multiple earlier per-trade allocations
+ * (e.g. `1000` + `2000` → one fresh `3000` leaf at the new chain head).
+ * The buyer-side inbox accepts the resulting envelope by reconstructing
+ * every contributing chain from local stash, concatenating them into a
+ * single topologically-sorted array, appending the merge transition,
+ * and handing the result to this function.
+ *
+ * Same trust posture as the other validators: no L1 witness, no
+ * `ResolveWitness` — Spark replaces the transport layer.
+ */
+export function validateNiaDag(transitions_hex: string[], prev_genesis_hex: string): string;
+
+/**
  * Validate a strict-encoded NIA `Transition` (hex) against its prior
  * `Consignment<false>` (genesis, hex). Returns `transition.id()` as
  * 32-byte hex — the value the receiver compares with `msgHex` to
@@ -313,6 +381,7 @@ export interface InitOutput {
     readonly __wbg_sparkutkproofjs_free: (a: number, b: number) => void;
     readonly buildNiaTransition: (a: number, b: number, c: number, d: bigint, e: number, f: number, g: number) => [number, number, number];
     readonly buildNiaTransitionFromPrev: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number) => [number, number, number];
+    readonly buildNiaTransitionMerge: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => [number, number, number];
     readonly buildNiaTransitionMultiOutput: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number, number];
     readonly buildNiaTransitionMultiOutputFromPrev: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => [number, number, number];
     readonly deriveOutputXonly: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
@@ -320,6 +389,7 @@ export interface InitOutput {
     readonly deriveVerifyingKey: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly issueNiaContract: (a: number, b: number, c: number, d: number, e: bigint, f: number, g: number, h: number, i: bigint) => [number, number, number];
     readonly niaGenesisMetadata: (a: number, b: number) => [number, number, number];
+    readonly niaTransitionInputs: (a: number, b: number) => [number, number, number, number];
     readonly niaTransitionOutputs: (a: number, b: number) => [number, number, number, number];
     readonly niaTransitionPrevOpids: (a: number, b: number) => [number, number, number, number];
     readonly niagenesismetadata_contractId: (a: number) => [number, number];
@@ -337,6 +407,7 @@ export interface InitOutput {
     readonly sparkutkproofjs_uBase: (a: number) => [number, number];
     readonly validateNiaChain: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly validateNiaConsignment: (a: number, b: number) => [number, number, number, number];
+    readonly validateNiaDag: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly validateNiaTransition: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly validateNiaTransitionFromPrev: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly rustsecp256k1_v0_10_0_context_create: (a: number) => number;
