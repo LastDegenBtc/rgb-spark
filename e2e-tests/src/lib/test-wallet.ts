@@ -12,7 +12,7 @@
 // AND through a small explicit surface so call sites in scenarios stay
 // readable.
 
-import { SparkWallet } from '@buildonspark/spark-sdk'
+import { SparkWallet, DefaultSparkSigner } from '@buildonspark/spark-sdk'
 import { nip19 } from 'nostr-tools'
 import { schnorr } from '@noble/curves/secp256k1.js'
 import { RgbAwareSparkSigner } from '@rgb-spark/lib/rgbAwareSigner'
@@ -27,6 +27,12 @@ export interface TestWalletInit {
   /** Human-readable label for log lines, e.g. 'alice', 'bob'. Not
    *  used for any cryptographic purpose. */
   label: string
+  /** Which signer to plug in. `'rgb-aware'` (default) instantiates
+   *  `RgbAwareSparkSigner` so RGB-binding scenarios can use the
+   *  pathTweak map. `'default'` uses the SDK's `DefaultSparkSigner`
+   *  unchanged — useful for isolating whether the rgb-aware signer
+   *  is responsible for a claim-hydration regression. */
+  signerKind?: 'rgb-aware' | 'default'
 }
 
 export interface TestWallet {
@@ -75,7 +81,7 @@ function bytesToHex(b: Uint8Array): string {
  *  rgb-binding path will populate it via the lib API. */
 export async function createTestWallet(init: TestWalletInit): Promise<TestWallet> {
   const seed = hexToBytes(init.seedHex)
-  const signer = new RgbAwareSparkSigner()
+  const signer = init.signerKind === 'default' ? new DefaultSparkSigner() : new RgbAwareSparkSigner()
   // SparkWallet.initialize is a generic static; pass through as
   // `unknown` to keep our import surface tight without exporting the
   // SDK's internal signer type from here.

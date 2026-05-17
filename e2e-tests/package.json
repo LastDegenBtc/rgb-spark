@@ -12,6 +12,7 @@
     "scenario:wasm": "tsx src/cli/run-scenario.ts wasm-smoke",
     "scenario:htlc": "tsx src/cli/run-scenario.ts htlc-only",
     "scenario:htlc-probe": "tsx src/cli/run-scenario.ts htlc-probe-sync",
+    "scenario:htlc-default": "tsx src/cli/run-scenario.ts htlc-default-signer",
     "scenario:happy": "tsx src/cli/run-scenario.ts happy-path-trade",
     "test": "vitest run",
     "test:watch": "vitest",
