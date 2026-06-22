@@ -26,14 +26,17 @@ use dbc::keytweak::{self, SparkUtkProof};
 use rgbstd::containers::{Consignment, ConsignmentExt};
 use rgbstd::contract::{AllocatedState, ContractBuilder, IssuerWrapper, TransitionBuilder};
 use rgbstd::persistence::MemContract;
-use rgbstd::stl::{AssetSpec, ContractTerms, RicardianContract};
+use rgbstd::stl::{AssetSpec, ContractTerms, Name, RicardianContract, TokenData};
 use rgbstd::validation::{ResolveWitness, ValidationConfig, WitnessResolverError, WitnessStatus};
 use rgbstd::vm::{ContractStateEvolve, OrdOpRef, WitnessOrd};
 use rgbstd::{
-    Amount, AssignmentType, BundleId, ChainNet, GenesisSeal, GraphSeal, Identity, Operation,
-    Opout, Precision, RevealedState, RevealedValue, Transition, Txid,
+    Allocation, Amount, AssignmentType, BundleId, ChainNet, GenesisSeal, GraphSeal, Identity,
+    Operation, Opout, OwnedFraction, Precision, RevealedState, RevealedValue, TokenIndex,
+    Transition, Txid,
 };
-use schemata::{NonInflatableAsset, GS_ISSUED_SUPPLY, GS_NOMINAL, OS_ASSET};
+use schemata::{
+    NonInflatableAsset, UniqueDigitalAsset, GS_ISSUED_SUPPLY, GS_NOMINAL, GS_TOKENS, OS_ASSET,
+};
 use strict_encoding::{StrictDeserialize, StrictDumb, StrictSerialize};
 use wasm_bindgen::prelude::*;
 
@@ -246,6 +249,97 @@ pub fn issue_nia_contract(
     let consignment_hex = hex::encode(bytes.release());
 
     Ok(NiaIssuance { contract_id_hex, consignment_hex })
+}
+
+/// JS handle around the result of a UDA issuance — same shape as
+/// `NiaIssuance`, but for a Unique Digital Asset (single indivisible
+/// token, `OwnedFraction` of 1) genesis.
+#[wasm_bindgen]
+pub struct UdaIssuance {
+    contract_id_hex: String,
+    consignment_hex: String,
+}
+
+#[wasm_bindgen]
+impl UdaIssuance {
+    #[wasm_bindgen(getter, js_name = contractId)]
+    pub fn contract_id(&self) -> String { self.contract_id_hex.clone() }
+
+    #[wasm_bindgen(getter, js_name = consignmentHex)]
+    pub fn consignment_hex(&self) -> String { self.consignment_hex.clone() }
+}
+
+/// Build a Unique Digital Asset (UDA) contract genesis programmatically.
+///
+/// Returns `{ contractId, consignmentHex }` — same usage as
+/// `issueNiaContract`: `contractId` is fed into the Spark-UTK mint as
+/// `msg`, `consignmentHex` lets the receiver validate the issuance
+/// client-side via `validateNiaConsignment` (shares `NonInflatableAsset`'s
+/// confined-bytes layout, but must be checked against
+/// `UniqueDigitalAsset::types()` instead).
+///
+/// `ticker` / `name`: human-readable asset metadata (UDA spec, not the
+/// per-token name). `token_index`: the UDA's `TokenIndex` — 0 for a
+/// single-token issuance. A UDA always mints exactly one indivisible
+/// unit (`OwnedFraction` of 1), so there is no `supply` parameter.
+/// `beneficiary_txid_hex` / `beneficiary_vout`: the L1 outpoint that
+/// will receive the token at issuance.
+/// `timestamp_secs`: unix timestamp for the genesis (caller-provided to
+/// avoid chrono's wasm time path).
+#[wasm_bindgen(js_name = issueUdaContract)]
+pub fn issue_uda_contract(
+    ticker: &str,
+    name: &str,
+    token_index: u32,
+    beneficiary_txid_hex: &str,
+    beneficiary_vout: u32,
+    timestamp_secs: i64,
+) -> Result<UdaIssuance, JsError> {
+    let txid = Txid::from_str(beneficiary_txid_hex)
+        .map_err(|e| JsError::new(&format!("beneficiary_txid parse: {e}")))?;
+    let beneficiary = GenesisSeal::new_random(txid, beneficiary_vout);
+
+    let spec = AssetSpec::with(ticker, name, Precision::Indivisible, None)
+        .map_err(map_err("AssetSpec::with"))?;
+    let terms = ContractTerms {
+        text: RicardianContract::default(),
+        media: None,
+    };
+
+    let index = TokenIndex::from(token_index);
+    let token_data = TokenData {
+        index,
+        name: Some(Name::try_from(name.to_owned()).map_err(map_err("Name::try_from"))?),
+        ..Default::default()
+    };
+    let allocation = Allocation::with(index, OwnedFraction::from(1u64));
+
+    let contract = ContractBuilder::with(
+        Identity::default(),
+        UniqueDigitalAsset::schema(),
+        UniqueDigitalAsset::types(),
+        UniqueDigitalAsset::scripts(),
+        ChainNet::BitcoinMainnet,
+    )
+    .add_global_state("spec", spec)
+    .map_err(map_err("add_global_state(spec)"))?
+    .add_global_state("terms", terms)
+    .map_err(map_err("add_global_state(terms)"))?
+    .add_global_state("tokens", token_data)
+    .map_err(map_err("add_global_state(tokens)"))?
+    .add_data("assetOwner", beneficiary, allocation)
+    .map_err(map_err("add_data(assetOwner)"))?
+    .issue_contract_raw(timestamp_secs)
+    .map_err(map_err("issue_contract_raw"))?;
+
+    let contract_id_hex = hex::encode(contract.contract_id().to_byte_array());
+
+    let bytes = contract
+        .to_strict_serialized::<CONSIGNMENT_MAX_LEN>()
+        .map_err(map_err("strict encode consignment"))?;
+    let consignment_hex = hex::encode(bytes.release());
+
+    Ok(UdaIssuance { contract_id_hex, consignment_hex })
 }
 
 /// Decode + validate a strict-encoded NIA genesis consignment (hex).

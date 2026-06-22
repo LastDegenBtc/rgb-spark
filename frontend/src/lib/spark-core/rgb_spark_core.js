@@ -309,6 +309,61 @@ export class SparkUtkProofJs {
 if (Symbol.dispose) SparkUtkProofJs.prototype[Symbol.dispose] = SparkUtkProofJs.prototype.free;
 
 /**
+ * JS handle around the result of a UDA issuance — same shape as
+ * `NiaIssuance`, but for a Unique Digital Asset (single indivisible
+ * token, `OwnedFraction` of 1) genesis.
+ */
+export class UdaIssuance {
+    static __wrap(ptr) {
+        const obj = Object.create(UdaIssuance.prototype);
+        obj.__wbg_ptr = ptr;
+        UdaIssuanceFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        UdaIssuanceFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_udaissuance_free(ptr, 0);
+    }
+    /**
+     * @returns {string}
+     */
+    get consignmentHex() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.udaissuance_consignmentHex(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {string}
+     */
+    get contractId() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.udaissuance_contractId(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+}
+if (Symbol.dispose) UdaIssuance.prototype[Symbol.dispose] = UdaIssuance.prototype.free;
+
+/**
  * Build a NIA `transfer` state transition consuming the `no`-th
  * `assetOwner` assignment of a previously issued genesis, allocating
  * `amount` units to a new beneficiary seal. Returns
@@ -652,6 +707,46 @@ export function issueNiaContract(ticker, name, supply, beneficiary_txid_hex, ben
         throw takeFromExternrefTable0(ret[1]);
     }
     return NiaIssuance.__wrap(ret[0]);
+}
+
+/**
+ * Build a Unique Digital Asset (UDA) contract genesis programmatically.
+ *
+ * Returns `{ contractId, consignmentHex }` — same usage as
+ * `issueNiaContract`: `contractId` is fed into the Spark-UTK mint as
+ * `msg`, `consignmentHex` lets the receiver validate the issuance
+ * client-side via `validateNiaConsignment` (shares `NonInflatableAsset`'s
+ * confined-bytes layout, but must be checked against
+ * `UniqueDigitalAsset::types()` instead).
+ *
+ * `ticker` / `name`: human-readable asset metadata (UDA spec, not the
+ * per-token name). `token_index`: the UDA's `TokenIndex` — 0 for a
+ * single-token issuance. A UDA always mints exactly one indivisible
+ * unit (`OwnedFraction` of 1), so there is no `supply` parameter.
+ * `beneficiary_txid_hex` / `beneficiary_vout`: the L1 outpoint that
+ * will receive the token at issuance.
+ * `timestamp_secs`: unix timestamp for the genesis (caller-provided to
+ * avoid chrono's wasm time path).
+ * @param {string} ticker
+ * @param {string} name
+ * @param {number} token_index
+ * @param {string} beneficiary_txid_hex
+ * @param {number} beneficiary_vout
+ * @param {bigint} timestamp_secs
+ * @returns {UdaIssuance}
+ */
+export function issueUdaContract(ticker, name, token_index, beneficiary_txid_hex, beneficiary_vout, timestamp_secs) {
+    const ptr0 = passStringToWasm0(ticker, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(beneficiary_txid_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.issueUdaContract(ptr0, len0, ptr1, len1, token_index, ptr2, len2, beneficiary_vout, timestamp_secs);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return UdaIssuance.__wrap(ret[0]);
 }
 
 /**
@@ -1026,6 +1121,9 @@ const NiaTransitionFinalization = (typeof FinalizationRegistry === 'undefined')
 const SparkUtkProofJsFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_sparkutkproofjs_free(ptr, 1));
+const UdaIssuanceFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_udaissuance_free(ptr, 1));
 
 function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc();

@@ -2807,7 +2807,7 @@ interface MintViaTransferResult {
 // consumed by the mint flow when stitching together the persistent
 // pathTweaks entry.
 type PendingRgbPayload =
-  | { kind: 'genesis'; consignmentHex: string }
+  | { kind: 'genesis'; consignmentHex: string; assetKind?: 'nia' | 'uda' }
   | { kind: 'transition'; transitionHex: string; prevGenesisHex: string }
 
 function SparkUtkMintViaTransfer() {
@@ -2903,7 +2903,11 @@ function SparkUtkMintViaTransfer() {
       // no meaningful asset amount — use 1 as a token placeholder so the
       // pathTweak entry is still valid.
       let mintAmount: bigint = 1n
-      if (pendingRgb?.kind === 'genesis') {
+      if (pendingRgb?.kind === 'genesis' && pendingRgb.assetKind === 'uda') {
+        // UDA genesis always carries exactly one indivisible token —
+        // no GS_ISSUED_SUPPLY to read back, unlike NIA.
+        mintAmount = 1n
+      } else if (pendingRgb?.kind === 'genesis') {
         const meta = core.niaGenesisMetadata(pendingRgb.consignmentHex)
         try {
           mintAmount = BigInt(meta.supply)
@@ -3041,8 +3045,17 @@ function SparkUtkMintViaTransfer() {
         disabled={busy}
         onIssuance={(contractId, consignmentHex, supply) => {
           setMsgHex(contractId)
-          setPendingRgb({ kind: 'genesis', consignmentHex })
+          setPendingRgb({ kind: 'genesis', consignmentHex, assetKind: 'nia' })
           setLastIssuance({ contractId, consignmentHex, supply })
+        }}
+      />
+
+      <IssueUdaInline
+        core={core}
+        disabled={busy}
+        onIssuance={(contractId, consignmentHex) => {
+          setMsgHex(contractId)
+          setPendingRgb({ kind: 'genesis', consignmentHex, assetKind: 'uda' })
         }}
       />
 
@@ -3217,6 +3230,123 @@ function IssueNiaInline({
           placeholder="1000000"
           inputMode="numeric"
           style={{ width: 100, fontSize: 12, padding: 4, fontFamily: 'monospace' }}
+          disabled={allDisabled}
+        />
+        <button onClick={() => void issue()} disabled={allDisabled}>
+          {busy ? 'issuing…' : 'issue & use as msg'}
+        </button>
+      </div>
+      {lastResult && (
+        <div style={{ marginTop: 6, fontSize: 11, color: '#666' }}>
+          <div style={{ fontFamily: 'monospace', wordBreak: 'break-all' }}>
+            contractId: {lastResult.contractId}
+          </div>
+          <div>consignment: {lastResult.consignmentSize} bytes (will be attached to the proof)</div>
+        </div>
+      )}
+      {err && (
+        <pre style={{ color: 'crimson', whiteSpace: 'pre-wrap', marginTop: 4, fontSize: 11 }}>
+          {err}
+        </pre>
+      )}
+    </fieldset>
+  )
+}
+
+// ---- Issue UDA inline -------------------------------------------------------
+//
+// Same pattern as IssueNiaInline, but for a Unique Digital Asset: a single
+// indivisible token (no supply field — always 1 unit) identified by a
+// `tokenIndex`. There's no transition support for UDA yet, so unlike NIA
+// this doesn't feed into BuildTransitionInline — it's mint-only.
+
+const UDA_PLACEHOLDER_TXID = 'ab'.repeat(32) // 32 bytes of 0xab, valid hex
+
+function IssueUdaInline({
+  core,
+  disabled,
+  onIssuance,
+}: {
+  core: SparkCore | null
+  disabled: boolean
+  /** Called when a UDA issuance succeeds. `contractId` is the 32-byte hex
+   *  to use as Spark-UTK msg; `consignmentHex` is the strict-encoded
+   *  Consignment<false> bytes that the receiver will validate. */
+  onIssuance: (contractId: string, consignmentHex: string) => void
+}) {
+  const [ticker, setTicker] = useState('TEST')
+  const [name, setName] = useState('Test UDA')
+  const [tokenIndex, setTokenIndex] = useState('0')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [lastResult, setLastResult] = useState<{
+    contractId: string
+    consignmentSize: number
+  } | null>(null)
+
+  async function issue() {
+    setErr(null)
+    setBusy(true)
+    try {
+      if (!core) throw new Error('WASM not ready')
+      const tokenIndexTrim = tokenIndex.trim()
+      if (!/^\d+$/.test(tokenIndexTrim)) throw new Error('token index must be a non-negative integer')
+
+      const tickerTrim = ticker.trim()
+      const nameTrim = name.trim()
+      if (!tickerTrim) throw new Error('ticker required')
+      if (!nameTrim) throw new Error('name required')
+
+      const nowSecs = BigInt(Math.floor(Date.now() / 1000))
+      const issuance = core.issueUdaContract(
+        tickerTrim,
+        nameTrim,
+        Number(tokenIndexTrim),
+        UDA_PLACEHOLDER_TXID,
+        0,
+        nowSecs,
+      )
+      const contractId = issuance.contractId
+      const consignmentHex = issuance.consignmentHex
+      issuance.free()
+      setLastResult({ contractId, consignmentSize: consignmentHex.length / 2 })
+      onIssuance(contractId, consignmentHex)
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const allDisabled = disabled || busy || !core
+
+  return (
+    <fieldset style={{ marginTop: 12, border: '1px solid #ddd', padding: '6px 10px' }}>
+      <legend style={{ fontSize: 12, color: '#666' }}>or issue a UDA contract & use its contractId as msg</legend>
+      <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginTop: 4 }}>
+        <label style={{ fontSize: 11, color: '#666' }}>ticker</label>
+        <input
+          value={ticker}
+          onChange={(e) => setTicker(e.target.value)}
+          placeholder="TEST"
+          style={{ width: 70, fontSize: 12, padding: 4, fontFamily: 'monospace' }}
+          disabled={allDisabled}
+        />
+        <label style={{ fontSize: 11, color: '#666' }}>name</label>
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Test UDA"
+          style={{ flex: 1, minWidth: 100, fontSize: 12, padding: 4 }}
+          disabled={allDisabled}
+        />
+        <label style={{ fontSize: 11, color: '#666' }}>token index</label>
+        <input
+          value={tokenIndex}
+          onChange={(e) => setTokenIndex(e.target.value)}
+          placeholder="0"
+          inputMode="numeric"
+          style={{ width: 60, fontSize: 12, padding: 4, fontFamily: 'monospace' }}
           disabled={allDisabled}
         />
         <button onClick={() => void issue()} disabled={allDisabled}>

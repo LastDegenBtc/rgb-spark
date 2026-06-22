@@ -71,6 +71,19 @@ export class SparkUtkProofJs {
 }
 
 /**
+ * JS handle around the result of a UDA issuance — same shape as
+ * `NiaIssuance`, but for a Unique Digital Asset (single indivisible
+ * token, `OwnedFraction` of 1) genesis.
+ */
+export class UdaIssuance {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    readonly consignmentHex: string;
+    readonly contractId: string;
+}
+
+/**
  * Build a NIA `transfer` state transition consuming the `no`-th
  * `assetOwner` assignment of a previously issued genesis, allocating
  * `amount` units to a new beneficiary seal. Returns
@@ -217,6 +230,27 @@ export function deriveVerifyingKey(u_base_hex: string, msg_hex: string, operator
  * avoid chrono's wasm time path).
  */
 export function issueNiaContract(ticker: string, name: string, supply: bigint, beneficiary_txid_hex: string, beneficiary_vout: number, timestamp_secs: bigint): NiaIssuance;
+
+/**
+ * Build a Unique Digital Asset (UDA) contract genesis programmatically.
+ *
+ * Returns `{ contractId, consignmentHex }` — same usage as
+ * `issueNiaContract`: `contractId` is fed into the Spark-UTK mint as
+ * `msg`, `consignmentHex` lets the receiver validate the issuance
+ * client-side via `validateNiaConsignment` (shares `NonInflatableAsset`'s
+ * confined-bytes layout, but must be checked against
+ * `UniqueDigitalAsset::types()` instead).
+ *
+ * `ticker` / `name`: human-readable asset metadata (UDA spec, not the
+ * per-token name). `token_index`: the UDA's `TokenIndex` — 0 for a
+ * single-token issuance. A UDA always mints exactly one indivisible
+ * unit (`OwnedFraction` of 1), so there is no `supply` parameter.
+ * `beneficiary_txid_hex` / `beneficiary_vout`: the L1 outpoint that
+ * will receive the token at issuance.
+ * `timestamp_secs`: unix timestamp for the genesis (caller-provided to
+ * avoid chrono's wasm time path).
+ */
+export function issueUdaContract(ticker: string, name: string, token_index: number, beneficiary_txid_hex: string, beneficiary_vout: number, timestamp_secs: bigint): UdaIssuance;
 
 /**
  * Decode a NIA genesis consignment and extract the metadata fields a
@@ -379,6 +413,7 @@ export interface InitOutput {
     readonly __wbg_niaissuance_free: (a: number, b: number) => void;
     readonly __wbg_niatransition_free: (a: number, b: number) => void;
     readonly __wbg_sparkutkproofjs_free: (a: number, b: number) => void;
+    readonly __wbg_udaissuance_free: (a: number, b: number) => void;
     readonly buildNiaTransition: (a: number, b: number, c: number, d: bigint, e: number, f: number, g: number) => [number, number, number];
     readonly buildNiaTransitionFromPrev: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number, h: number, i: number) => [number, number, number];
     readonly buildNiaTransitionMerge: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => [number, number, number];
@@ -388,6 +423,7 @@ export interface InitOutput {
     readonly deriveUTweaked: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly deriveVerifyingKey: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly issueNiaContract: (a: number, b: number, c: number, d: number, e: bigint, f: number, g: number, h: number, i: bigint) => [number, number, number];
+    readonly issueUdaContract: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: bigint) => [number, number, number];
     readonly niaGenesisMetadata: (a: number, b: number) => [number, number, number];
     readonly niaTransitionInputs: (a: number, b: number) => [number, number, number, number];
     readonly niaTransitionOutputs: (a: number, b: number) => [number, number, number, number];
@@ -405,6 +441,8 @@ export interface InitOutput {
     readonly sparkutkproofjs_new: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly sparkutkproofjs_operator: (a: number) => [number, number];
     readonly sparkutkproofjs_uBase: (a: number) => [number, number];
+    readonly udaissuance_consignmentHex: (a: number) => [number, number];
+    readonly udaissuance_contractId: (a: number) => [number, number];
     readonly validateNiaChain: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly validateNiaConsignment: (a: number, b: number) => [number, number, number, number];
     readonly validateNiaDag: (a: number, b: number, c: number, d: number) => [number, number, number, number];
