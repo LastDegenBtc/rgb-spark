@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, useCallback, type ReactNode } from 'react'
 import { generateSecretKey, nip19 } from 'nostr-tools'
 import { addPublicKeys } from '@buildonspark/spark-sdk'
 import { parseLoginSecret, type ParsedLogin } from './lib/nostrKey'
+import { deriveFamilierKey, type FamilierKey } from './lib/familierKey'
+import { pollDepositStatus, type DepositStatus, type FamilierNetwork } from './lib/utxoLookup'
 import {
   readVault,
   writeVault,
@@ -448,7 +450,7 @@ function App() {
                 myIdentityPubkey={state.wallet.identityPubkey}
                 myNostrPrivkeyHex={state.parsed.nostrPrivkeyHex}
               />
-              <SparkUtkMintViaTransfer />
+              <SparkUtkMintViaTransfer rootSeed={state.parsed.sparkSeed} />
             </div>
           </details>
         </div>
@@ -2810,7 +2812,7 @@ type PendingRgbPayload =
   | { kind: 'genesis'; consignmentHex: string; assetKind?: 'nia' | 'uda' }
   | { kind: 'transition'; transitionHex: string; prevGenesisHex: string }
 
-function SparkUtkMintViaTransfer() {
+function SparkUtkMintViaTransfer({ rootSeed }: { rootSeed: Uint8Array }) {
   const [core, setCore] = useState<SparkCore | null>(null)
   const [coreErr, setCoreErr] = useState<string | null>(null)
   const [leaves, setLeaves] = useState<SparkLeafRow[]>([])
@@ -2823,6 +2825,9 @@ function SparkUtkMintViaTransfer() {
   // Last successful NIA issuance kept here so the transition panel can chain
   // on top of it without the user having to paste the hex around. Hydrated
   // from the persisted stash on mount so the chain survives reloads.
+  // Real L1 UTXO funded via FamilierDepositInline, once confirmed. Feeds
+  // IssueUdaInline as the genesis-seal outpoint instead of a placeholder.
+  const [familierUtxo, setFamilierUtxo] = useState<{ txid: string; vout: number } | null>(null)
   const [lastIssuance, setLastIssuance] = useState<
     { contractId: string; consignmentHex: string; supply: bigint } | null
   >(() => {
@@ -3050,9 +3055,16 @@ function SparkUtkMintViaTransfer() {
         }}
       />
 
+      <FamilierDepositInline
+        rootSeed={rootSeed}
+        disabled={busy}
+        onUtxoReady={setFamilierUtxo}
+      />
+
       <IssueUdaInline
         core={core}
         disabled={busy}
+        utxo={familierUtxo}
         onIssuance={(contractId, consignmentHex) => {
           setMsgHex(contractId)
           setPendingRgb({ kind: 'genesis', consignmentHex, assetKind: 'uda' })
@@ -3253,6 +3265,136 @@ function IssueNiaInline({
   )
 }
 
+// ---- Familier deposit inline -----------------------------------------------
+//
+// The player funds their own UTXO instead of the game sponsoring one — see
+// FROGNESIS DESIGN.md section 4bis. Derives a dedicated L1 address (separate
+// from the Spark depositAddress, which gets swept into the Spark statechain
+// and wouldn't stay solo-resignable for a later RGB transfer), polls a
+// public Esplora until 1 confirmation, then hands the real txid:vout up to
+// IssueUdaInline. TESTNET only for now — see lib/utxoLookup.ts for why
+// REGTEST isn't supported here.
+
+const FAMILIER_MIN_SATS = 3000
+const FAMILIER_POLL_MS = 15000
+
+function FamilierDepositInline({
+  rootSeed,
+  disabled,
+  onUtxoReady,
+}: {
+  rootSeed: Uint8Array
+  disabled: boolean
+  onUtxoReady: (utxo: { txid: string; vout: number } | null) => void
+}) {
+  const [network, setNetwork] = useState<FamilierNetwork>('TESTNET')
+  const [status, setStatus] = useState<DepositStatus>({ utxo: null, confirmations: 0 })
+  const [err, setErr] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
+  const notifiedRef = useRef(false)
+
+  // Pure derivation from rootSeed+network — no effect needed, useMemo keeps
+  // it render-time instead of a setState-in-effect round trip.
+  const keyResult = useMemo<{ key: FamilierKey | null; err: string | null }>(() => {
+    try {
+      return { key: deriveFamilierKey(rootSeed, network), err: null }
+    } catch (e) {
+      return { key: null, err: e instanceof Error ? e.message : String(e) }
+    }
+  }, [rootSeed, network])
+  const key = keyResult.key
+
+  useEffect(() => {
+    notifiedRef.current = false
+    onUtxoReady(null)
+    setStatus({ utxo: null, confirmations: 0 })
+    setErr(null)
+    if (!key) return
+    let stopped = false
+    const tick = async () => {
+      try {
+        const s = await pollDepositStatus(key.address, network)
+        if (stopped) return
+        setStatus(s)
+        setErr(null)
+        if (s.utxo && s.confirmations >= 1 && !notifiedRef.current) {
+          notifiedRef.current = true
+          onUtxoReady({ txid: s.utxo.txid, vout: s.utxo.vout })
+        }
+      } catch (e) {
+        if (!stopped) setErr(e instanceof Error ? e.message : String(e))
+      }
+    }
+    void tick()
+    const id = setInterval(() => void tick(), FAMILIER_POLL_MS)
+    return () => {
+      stopped = true
+      clearInterval(id)
+    }
+    // onUtxoReady is a setState passed from the parent — stable enough not
+    // to belong in deps.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, network])
+
+  async function copyAddress() {
+    if (!key) return
+    await navigator.clipboard.writeText(key.address)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+
+  const ready = status.utxo !== null && status.confirmations >= 1
+
+  return (
+    <fieldset style={{ marginTop: 12, border: '1px solid #ddd', padding: '6px 10px' }}>
+      <legend style={{ fontSize: 12, color: '#666' }}>familier UTXO — deposit real BTC, player-funded</legend>
+
+      <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 4 }}>
+        <label style={{ fontSize: 11, color: '#666' }}>network</label>
+        {(['TESTNET', 'MAINNET'] as FamilierNetwork[]).map((n) => (
+          <label key={n} style={{ fontSize: 11 }}>
+            <input
+              type="radio"
+              name="familierNetwork"
+              checked={network === n}
+              onChange={() => setNetwork(n)}
+              disabled={disabled}
+            />{' '}
+            {n}
+          </label>
+        ))}
+      </div>
+
+      {key && (
+        <div style={{ marginTop: 6, fontSize: 11 }}>
+          <div style={{ color: '#666' }}>
+            send at least <strong>{FAMILIER_MIN_SATS} sats</strong> to (and only to — this address is single-use):
+          </div>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 2 }}>
+            <code style={{ wordBreak: 'break-all' }}>{key.address}</code>
+            <button onClick={() => void copyAddress()} disabled={disabled} style={{ fontSize: 10 }}>
+              {copied ? 'copied' : 'copy'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div style={{ marginTop: 6, fontSize: 11, color: ready ? '#2a6' : '#666' }}>
+        {status.utxo === null && 'waiting for deposit…'}
+        {status.utxo !== null && !ready && `seen, unconfirmed — waiting for 1 confirmation (${status.confirmations}/1)`}
+        {ready &&
+          `confirmed: ${status.utxo!.txid}:${status.utxo!.vout} (${status.utxo!.value} sats) — ready to mint below`}
+      </div>
+
+      {(keyResult.err ?? err) && (
+        <pre style={{ color: 'crimson', whiteSpace: 'pre-wrap', marginTop: 4, fontSize: 11 }}>
+          {keyResult.err ?? err}
+        </pre>
+      )}
+    </fieldset>
+  )
+}
+
 // ---- Issue UDA inline -------------------------------------------------------
 //
 // Same pattern as IssueNiaInline, but for a Unique Digital Asset: a single
@@ -3260,15 +3402,19 @@ function IssueNiaInline({
 // `tokenIndex`. There's no transition support for UDA yet, so unlike NIA
 // this doesn't feed into BuildTransitionInline — it's mint-only.
 
-const UDA_PLACEHOLDER_TXID = 'ab'.repeat(32) // 32 bytes of 0xab, valid hex
-
 function IssueUdaInline({
   core,
   disabled,
+  utxo,
   onIssuance,
 }: {
   core: SparkCore | null
   disabled: boolean
+  /** Real L1 outpoint to seal the genesis to, from FamilierDepositInline.
+   *  No placeholder fallback — minting without a real player-funded UTXO
+   *  would seal the familier to a make-believe outpoint, which is exactly
+   *  what the deposit flow exists to avoid. */
+  utxo: { txid: string; vout: number } | null
   /** Called when a UDA issuance succeeds. `contractId` is the 32-byte hex
    *  to use as Spark-UTK msg; `consignmentHex` is the strict-encoded
    *  Consignment<false> bytes that the receiver will validate. */
@@ -3289,6 +3435,7 @@ function IssueUdaInline({
     setBusy(true)
     try {
       if (!core) throw new Error('WASM not ready')
+      if (!utxo) throw new Error('deposit a real UTXO first (FamilierDepositInline above)')
       const tokenIndexTrim = tokenIndex.trim()
       if (!/^\d+$/.test(tokenIndexTrim)) throw new Error('token index must be a non-negative integer')
 
@@ -3302,8 +3449,8 @@ function IssueUdaInline({
         tickerTrim,
         nameTrim,
         Number(tokenIndexTrim),
-        UDA_PLACEHOLDER_TXID,
-        0,
+        utxo.txid,
+        utxo.vout,
         nowSecs,
       )
       const contractId = issuance.contractId
@@ -3318,11 +3465,14 @@ function IssueUdaInline({
     }
   }
 
-  const allDisabled = disabled || busy || !core
+  const allDisabled = disabled || busy || !core || !utxo
 
   return (
     <fieldset style={{ marginTop: 12, border: '1px solid #ddd', padding: '6px 10px' }}>
       <legend style={{ fontSize: 12, color: '#666' }}>or issue a UDA contract & use its contractId as msg</legend>
+      {!utxo && (
+        <div style={{ fontSize: 11, color: '#a66' }}>deposit a real UTXO above first — minting needs a real outpoint to seal to</div>
+      )}
       <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginTop: 4 }}>
         <label style={{ fontSize: 11, color: '#666' }}>ticker</label>
         <input
