@@ -3278,7 +3278,7 @@ function IssueNiaInline({
 const FAMILIER_MIN_SATS = 3000
 const FAMILIER_POLL_MS = 15000
 
-function FamilierDepositInline({
+export function FamilierDepositInline({
   rootSeed,
   disabled,
   onUtxoReady,
@@ -3402,7 +3402,7 @@ function FamilierDepositInline({
 // `tokenIndex`. There's no transition support for UDA yet, so unlike NIA
 // this doesn't feed into BuildTransitionInline — it's mint-only.
 
-function IssueUdaInline({
+export function IssueUdaInline({
   core,
   disabled,
   utxo,

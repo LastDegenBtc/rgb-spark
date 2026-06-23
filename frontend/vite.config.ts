@@ -1,9 +1,21 @@
+import { resolve } from 'path'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
+  build: {
+    rollupOptions: {
+      // Multi-page app: dev-lab at /, the standalone familier test at
+      // /familier.html. Only matters for `vite build` — the dev server
+      // serves any .html file it finds without this.
+      input: {
+        main: resolve(__dirname, 'index.html'),
+        familier: resolve(__dirname, 'familier.html'),
+      },
+    },
+  },
   server: {
     host: true,
     // lab.pprgb.app is our dev/preview HTTPS slot reverse-proxied by nginx;
