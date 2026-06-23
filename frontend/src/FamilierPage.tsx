@@ -2,14 +2,22 @@
 // The main dev-lab (App.tsx) accumulated a lot of unrelated probes (HTLC,
 // orderbook, NIA transitions...) that are no longer useful day-to-day —
 // this page exists so testing the familier flow doesn't require wading
-// through all of that. Reuses FamilierDepositInline/IssueUdaInline as-is
-// from App.tsx rather than duplicating them.
+// through all of that. Reuses FamilierDepositInline/IssueUdaInline/KV
+// as-is from App.tsx rather than duplicating them.
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { generateSecretKey, nip19 } from 'nostr-tools'
 import { parseLoginSecret } from './lib/nostrKey'
 import { ensureSparkCoreReady, type SparkCore } from './lib/sparkCore'
-import { FamilierDepositInline, IssueUdaInline } from './App'
+import {
+  loadFamiliers,
+  addFamilier,
+  downloadBackup,
+  parseBackup,
+  restoreFamiliers,
+  type FamilierEntry,
+} from './lib/familierStash'
+import { FamilierDepositInline, IssueUdaInline, KV } from './App'
 
 // Plain localStorage, no PIN vault — this is a disposable testnet dev
 // tool, not the real wallet. The point is just to survive an accidental
@@ -21,12 +29,15 @@ const STORAGE_KEY = 'frognesis_familier_nsec'
 export default function FamilierPage() {
   const [secret, setSecret] = useState('')
   const [seed, setSeed] = useState<Uint8Array | null>(null)
+  const [nsec, setNsec] = useState('')
   const [npub, setNpub] = useState('')
   const [loginErr, setLoginErr] = useState<string | null>(null)
   const [core, setCore] = useState<SparkCore | null>(null)
   const [coreErr, setCoreErr] = useState<string | null>(null)
   const [familierUtxo, setFamilierUtxo] = useState<{ txid: string; vout: number } | null>(null)
-  const [minted, setMinted] = useState<{ contractId: string; consignmentHex: string } | null>(null)
+  const [familiers, setFamiliers] = useState<FamilierEntry[]>([])
+  const [importErr, setImportErr] = useState<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => {
     ensureSparkCoreReady()
@@ -38,7 +49,6 @@ export default function FamilierPage() {
     const saved = localStorage.getItem(STORAGE_KEY)
     if (saved) boot(saved)
     // Only ever auto-boot once, on mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   function boot(input: string) {
@@ -46,8 +56,10 @@ export default function FamilierPage() {
     try {
       const parsed = parseLoginSecret(input)
       setSeed(parsed.sparkSeed)
+      setNsec(parsed.nsec)
       setNpub(parsed.npub)
       localStorage.setItem(STORAGE_KEY, parsed.nsec)
+      setFamiliers(loadFamiliers())
     } catch (e) {
       setLoginErr(e instanceof Error ? e.message : String(e))
     }
@@ -55,18 +67,36 @@ export default function FamilierPage() {
 
   function generateAndBoot() {
     const sk = generateSecretKey()
-    const nsec = nip19.nsecEncode(sk)
-    setSecret(nsec)
-    boot(nsec)
+    const generatedNsec = nip19.nsecEncode(sk)
+    setSecret(generatedNsec)
+    boot(generatedNsec)
   }
 
   function forget() {
     localStorage.removeItem(STORAGE_KEY)
     setSeed(null)
+    setNsec('')
     setNpub('')
     setSecret('')
     setFamilierUtxo(null)
-    setMinted(null)
+    setFamiliers([])
+  }
+
+  function onImportFile(e: React.ChangeEvent<HTMLInputElement>) {
+    setImportErr(null)
+    const file = e.target.files?.[0]
+    if (!file) return
+    file
+      .text()
+      .then((text) => {
+        const backup = parseBackup(text)
+        restoreFamiliers(backup.familiers)
+        boot(backup.nsec)
+      })
+      .catch((err) => setImportErr(err instanceof Error ? err.message : String(err)))
+      .finally(() => {
+        if (fileInputRef.current) fileInputRef.current.value = ''
+      })
   }
 
   return (
@@ -88,8 +118,17 @@ export default function FamilierPage() {
           <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
             <button onClick={() => boot(secret)} disabled={!secret.trim()}>Load</button>
             <button onClick={generateAndBoot}>Generate fresh</button>
+            <button onClick={() => fileInputRef.current?.click()}>Restore from backup file</button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/json"
+              onChange={onImportFile}
+              style={{ display: 'none' }}
+            />
           </div>
           {loginErr && <pre style={{ color: 'crimson', whiteSpace: 'pre-wrap' }}>{loginErr}</pre>}
+          {importErr && <pre style={{ color: 'crimson', whiteSpace: 'pre-wrap' }}>{importErr}</pre>}
         </>
       )}
 
@@ -99,9 +138,19 @@ export default function FamilierPage() {
             <p style={{ fontSize: 11, color: '#888', fontFamily: 'monospace', wordBreak: 'break-all', margin: 0 }}>npub: {npub}</p>
             <button onClick={forget} style={{ fontSize: 10 }}>forget / use different key</button>
           </div>
-          <p style={{ fontSize: 11, color: '#a66', marginTop: 4 }}>
-            Saved in this browser's localStorage so a reload doesn't lose it — but it's still only in this browser. Don't rely on it for anything real.
-          </p>
+
+          <fieldset style={{ marginTop: 8, border: '1px solid #ddd', padding: '6px 10px' }}>
+            <legend style={{ fontSize: 12, color: '#666' }}>backup — this is the only copy outside this browser</legend>
+            <KV label="nsec (backup)" value={nsec} mono masked />
+            <p style={{ fontSize: 11, color: '#a66', marginTop: 4 }}>
+              The nsec re-derives your deposit address and lets you sign a future transfer — losing it loses control of the UTXO.
+              The minted consignments below are NOT re-derivable from the nsec (re-minting gives a different contractId), so back up both.
+            </p>
+            <button onClick={() => downloadBackup(nsec)} style={{ fontSize: 11, marginTop: 4 }}>
+              download backup (nsec + minted familiers)
+            </button>
+          </fieldset>
+
           {coreErr && <pre style={{ color: 'crimson', whiteSpace: 'pre-wrap' }}>{coreErr}</pre>}
 
           <FamilierDepositInline rootSeed={seed} disabled={false} onUtxoReady={setFamilierUtxo} />
@@ -110,17 +159,38 @@ export default function FamilierPage() {
             core={core}
             disabled={false}
             utxo={familierUtxo}
-            onIssuance={(contractId, consignmentHex) => setMinted({ contractId, consignmentHex })}
+            onIssuance={(contractId, consignmentHex, ticker, name, tokenIndex) => {
+              if (!familierUtxo) return
+              const entry: FamilierEntry = {
+                contractId,
+                consignmentHex,
+                ticker,
+                name,
+                tokenIndex,
+                utxo: familierUtxo,
+                network: 'TESTNET',
+                mintedAt: new Date().toISOString(),
+              }
+              setFamiliers(addFamilier(entry))
+            }}
           />
 
-          {minted && (
-            <div style={{ marginTop: 12, padding: 8, background: '#e8f5e9', border: '1px solid #a5d6a7', fontSize: 12 }}>
-              <strong>Minted.</strong>
-              <div style={{ fontFamily: 'monospace', wordBreak: 'break-all', marginTop: 4 }}>
-                contractId: {minted.contractId}
-              </div>
-              <div>consignment: {minted.consignmentHex.length / 2} bytes</div>
-            </div>
+          {familiers.length > 0 && (
+            <fieldset style={{ marginTop: 12, border: '1px solid #ddd', padding: '6px 10px' }}>
+              <legend style={{ fontSize: 12, color: '#666' }}>minted familiers (this browser, backed up above)</legend>
+              {familiers.map((f) => (
+                <div
+                  key={f.contractId}
+                  style={{ marginTop: 6, padding: 6, background: '#e8f5e9', border: '1px solid #a5d6a7', fontSize: 12 }}
+                >
+                  <strong>{f.ticker} — {f.name}</strong>
+                  <div style={{ fontFamily: 'monospace', wordBreak: 'break-all', marginTop: 4 }}>
+                    contractId: {f.contractId}
+                  </div>
+                  <div>consignment: {f.consignmentHex.length / 2} bytes · minted {f.mintedAt}</div>
+                </div>
+              ))}
+            </fieldset>
           )}
         </>
       )}

@@ -3417,8 +3417,10 @@ export function IssueUdaInline({
   utxo: { txid: string; vout: number } | null
   /** Called when a UDA issuance succeeds. `contractId` is the 32-byte hex
    *  to use as Spark-UTK msg; `consignmentHex` is the strict-encoded
-   *  Consignment<false> bytes that the receiver will validate. */
-  onIssuance: (contractId: string, consignmentHex: string) => void
+   *  Consignment<false> bytes that the receiver will validate; `ticker`/
+   *  `name`/`tokenIndex` echo back what was actually minted, for callers
+   *  that want to persist a human-readable record (see FamilierPage). */
+  onIssuance: (contractId: string, consignmentHex: string, ticker: string, name: string, tokenIndex: number) => void
 }) {
   const [ticker, setTicker] = useState('TEST')
   const [name, setName] = useState('Test UDA')
@@ -3457,7 +3459,7 @@ export function IssueUdaInline({
       const consignmentHex = issuance.consignmentHex
       issuance.free()
       setLastResult({ contractId, consignmentSize: consignmentHex.length / 2 })
-      onIssuance(contractId, consignmentHex)
+      onIssuance(contractId, consignmentHex, tickerTrim, nameTrim, Number(tokenIndexTrim))
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -4653,7 +4655,7 @@ function SaveWithPin({ onSave }: { onSave: (pin: string) => Promise<void> }) {
 
 // ---- Small KV row -----------------------------------------------------------
 
-function KV({ label, value, mono, masked }: { label: string; value: string; mono?: boolean; masked?: boolean }) {
+export function KV({ label, value, mono, masked }: { label: string; value: string; mono?: boolean; masked?: boolean }) {
   const [revealed, setRevealed] = useState(false)
   const display = masked && !revealed ? '•'.repeat(Math.min(value.length, 40)) : value
   return (
